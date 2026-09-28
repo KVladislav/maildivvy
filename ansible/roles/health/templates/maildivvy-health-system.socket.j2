@@ -1,0 +1,16 @@
+# Managed by Ansible (roles/health). Install step 17.
+# The system helper's socket: maildivvy-health connects, systemd starts one helper as root
+# for the connection, and it answers with its readings (health/helper.py).
+[Unit]
+Description=Maildivvy: the health helper that reads the firewall, the ban, the milter and the scanner
+
+[Socket]
+ListenStream={{ maildivvy_health_system_socket }}
+SocketUser=root
+SocketGroup={{ maildivvy_health_user }}
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

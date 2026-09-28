@@ -1,0 +1,16 @@
+#!/usr/bin/python3
+"""Install Maildivvy on this machine: `sudo ./maildivvy-install` from the unpacked release.
+
+The installation guide says what it asks and what it does; `--help` lists its options.
+"""
+import os
+import sys
+
+sys.dont_write_bytecode = True   # the release tree stays exactly as its MANIFEST lists it
+ROOT = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from maildivvy.installer.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], root=ROOT))

@@ -1,0 +1,193 @@
+# Install step 3: ufw with SSH and the interface's port open to the administrator networks
+# only, incoming denied by default, the mail ports closed: only step 19 opens them,
+# and a re-run of this step keeps the rules step 19 wrote, as they are. Every change is made
+# under a self-reverting timer that puts the rules in force before it back unless a new
+# SSH session, opened through the new rules, cancels it; on a local run,
+# a new SSH login from the administrator's stated address, or the explicit console-only
+# choice. A firewall already in place is only read back.
+
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Plan the rules from the settings, against ufw's own rule files
+  maildivvy_ufw:
+    admin_networks: "{{ maildivvy_admin_networks }}"
+    ports: "{{ maildivvy_admin_ports }}"
+    published: "{{ maildivvy_mail_ports }}"
+  register: maildivvy_ufw
+
+- name: Change the firewall under the self-reverting timer
+  when: not maildivvy_ufw.in_place
+  block:
+    # An earlier run whose timer is still armed never proved its rules, so what is in
+    # force now is not what the timer should put back: the copy that run saved is kept.
+    - name: Read whether an earlier run left its timer armed
+      ansible.builtin.command: systemctl is-active {{ maildivvy_firewall_revert_unit }}.timer
+      register: maildivvy_firewall_pending
+      changed_when: false
+      failed_when: false
+
+    - name: Clear a revert unit an earlier run left behind
+      ansible.builtin.shell: |
+        systemctl stop {{ maildivvy_firewall_revert_unit }}.timer {{ maildivvy_firewall_revert_unit }}.service
+        systemctl reset-failed {{ maildivvy_firewall_revert_unit }}.timer {{ maildivvy_firewall_revert_unit }}.service
+        true
+      changed_when: false
+
+    # ⛔ What the timer puts back, taken before anything is changed: the
+    # revert RESTORES THESE AND LOADS THEM WITHOUT STOPPING THE FIREWALL, and never
+    # disables one that was enabled. Disabling was the predecessor's revert, and on an installed
+    # machine it opened 993, 465 and every other port the moment a re-run lost its session;
+    # `ufw reload` opens them too, for the moment between its stop and its start.
+    - name: Make the directory the rules in force are saved in
+      ansible.builtin.file:
+        path: "{{ maildivvy_firewall_saved }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Save the rules in force now, which the timer puts back
+      ansible.builtin.command:
+        argv: [cp, -p, "{{ item.src }}", "{{ maildivvy_firewall_saved }}/{{ item.dest }}"]
+      when: maildivvy_firewall_pending.stdout != 'active'
+      loop:
+        - {src: /etc/ufw/user.rules, dest: user.rules}
+        - {src: /etc/ufw/user6.rules, dest: user6.rules}
+        - {src: /etc/ufw/ufw.conf, dest: ufw.conf}
+        - {src: /etc/default/ufw, dest: default-ufw}
+      loop_control:
+        label: "{{ item.src }}"
+
+    - name: Install what the timer runs
+      ansible.builtin.copy:
+        src: maildivvy-firewall-revert
+        dest: "{{ maildivvy_firewall_revert_program }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Arm the self-reverting timer before the first rule
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - "--on-active={{ maildivvy_firewall_revert_seconds }}"
+          - "--unit={{ maildivvy_firewall_revert_unit }}"
+          - "{{ maildivvy_firewall_revert_program }}"
+
+    - name: Read the timer back before any rule is written
+      ansible.builtin.command: systemctl is-active {{ maildivvy_firewall_revert_unit }}.timer
+      changed_when: false
+
+    - name: Add the missing rules, SSH first
+      ansible.builtin.command:
+        argv: "{{ item }}"
+      loop: "{{ maildivvy_ufw.add }}"
+      loop_control:
+        label: "{{ item | join(' ') }}"
+
+    - name: Delete the rules the settings no longer name
+      ansible.builtin.command:
+        argv: "{{ item }}"
+      loop: "{{ maildivvy_ufw.delete }}"
+      loop_control:
+        label: "{{ item | join(' ') }}"
+
+    # ⚠️ Only when it is not denied already: on an enabled firewall `ufw default` stops and
+    # starts it, and every policy is ACCEPT in between (measured on the installed machine).
+    # Adding and deleting rules never does that.
+    - name: Deny incoming by default, only now that the SSH rules exist
+      ansible.builtin.command: ufw default deny incoming
+      when: maildivvy_ufw.input_policy != 'DROP'
+
+    - name: Enable ufw
+      ansible.builtin.command: ufw --force enable
+
+# The connection in use survives any rule set (conntrack), so it proves nothing: drop it,
+# and let the next task open a new one through the firewall. If it cannot, the play stops
+# here as unreachable and the timer puts the saved rules back.
+- name: Close the SSH connection in use
+  ansible.builtin.meta: reset_connection
+  when: maildivvy_firewall_confirmation == 'new-session'
+
+- name: Open a new session through the firewall
+  ansible.builtin.ping:
+  when: maildivvy_firewall_confirmation == 'new-session'
+
+- name: Read whether a revert timer is armed
+  ansible.builtin.command: systemctl is-active {{ maildivvy_firewall_revert_unit }}.timer
+  register: maildivvy_firewall_timer
+  changed_when: false
+  failed_when: false
+
+# A local run crosses no firewall of its own: the timer stays armed until sshd
+# accepts a new login from the administrator's address, or it fires and this fails with
+# the old rules back. The task's name is what the operator sees while it waits.
+- name: "Waiting for a new SSH login from {{ maildivvy_admin_ssh_source }} through the new rules"
+  maildivvy_ssh_login:
+    source: "{{ maildivvy_admin_ssh_source }}"
+    unit: "{{ maildivvy_firewall_revert_unit }}"
+    seconds: "{{ maildivvy_firewall_revert_seconds }}"
+  when: maildivvy_firewall_confirmation == 'ssh-login' and maildivvy_firewall_timer.stdout == 'active'
+
+- name: Say that no SSH login confirmed the firewall, by the administrator's console-only choice
+  ansible.builtin.debug:
+    msg: >-
+      console-only: the firewall change was not confirmed by any SSH login, as the settings
+      chose; SSH through the new rules is not proved
+  when: maildivvy_firewall_confirmation == 'console' and maildivvy_firewall_timer.stdout == 'active'
+
+# ⛔ Never on a local connection's own session, which proves nothing: step 1 refuses that
+# run, and this refuses it again for a run that skipped step 1.
+- name: Cancel the self-reverting timer, only after the new session
+  ansible.builtin.command: systemctl stop {{ maildivvy_firewall_revert_unit }}.timer
+  when:
+    - maildivvy_firewall_timer.stdout == 'active'
+    - maildivvy_firewall_confirmation != 'new-session'
+      or ansible_connection | default('ssh') not in ['local', 'ansible.builtin.local']
+
+# --- read back, from ufw.conf and the kernel, never `ufw status` ---
+
+- name: Read /etc/ufw/ufw.conf
+  ansible.builtin.slurp:
+    path: /etc/ufw/ufw.conf
+  register: maildivvy_ufw_conf
+
+- name: Read the kernel's INPUT policies
+  ansible.builtin.shell: |
+    set -e
+    iptables -w -S INPUT | head -n 1
+    ip6tables -w -S INPUT | head -n 1
+  register: maildivvy_input_policy
+  changed_when: false
+
+- name: ufw is enabled and incoming is dropped by default, over IPv4 and IPv6
+  ansible.builtin.assert:
+    that:
+      - maildivvy_ufw_conf.content | b64decode | regex_search('^ENABLED=yes$', multiline=True) is not none
+      - maildivvy_input_policy.stdout_lines == ['-P INPUT DROP', '-P INPUT DROP']
+    fail_msg: "ufw.conf or the kernel disagree: {{ maildivvy_input_policy.stdout_lines }}"
+    quiet: true
+
+- name: The IPv4 input chain holds exactly the administrator rules, and publication's
+  maildivvy_chains:
+    chains: [ufw-user-input]
+    rules: "{{ maildivvy_ufw.kernel4 }}"
+    ordered: false
+
+- name: The IPv6 input chain holds exactly the administrator rules, and publication's
+  maildivvy_chains:
+    chains: [ufw6-user-input]
+    rules: "{{ maildivvy_ufw.kernel6 }}"
+    ordered: false
+    family: 6
+
+- name: No revert timer is left armed
+  ansible.builtin.command: systemctl is-active {{ maildivvy_firewall_revert_unit }}.timer
+  register: maildivvy_firewall_timer_after
+  changed_when: false
+  failed_when: maildivvy_firewall_timer_after.stdout == 'active'

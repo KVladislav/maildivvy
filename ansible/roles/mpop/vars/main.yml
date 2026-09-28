@@ -1,0 +1,2 @@
+# Derived from the settings; not settings themselves.
+maildivvy_mpop_expected: mpop version {{ maildivvy_mpop_version }}

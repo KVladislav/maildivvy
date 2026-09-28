@@ -1,0 +1,113 @@
+# Maildivvy's installation: one role per step of docs/architecture.md § Installation,
+# in that order. Every step reads its own result back before the next starts, and a
+# re-run that finds a result in place proves it and changes nothing.
+#
+# Settings are ordinary `maildivvy_*` variables (ansible/README.md); none is committed.
+#
+#     ansible-playbook -i <inventory> -e @<settings file> ansible/site.yml
+#
+# Each step carries its role's name as a tag, and step 1 also `always`, so
+# `--tags <role>` re-runs one step of an installed machine with its settings still
+# checked. A run without `--tags` is unaffected.
+- name: Install Maildivvy
+  hosts: maildivvy
+  become: true
+  gather_facts: false
+  vars:
+    # the release's own version, beside this playbook
+    maildivvy_release_version: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../VERSION') | trim }}"
+  # maildivvy-install passes on its own proxy variables here; a control machine none
+  environment: "{{ maildivvy_run_environment | default({}) }}"
+  tasks:
+    - name: "1: preflight"
+      ansible.builtin.import_role: {name: preflight}
+      tags: [preflight, always]
+    - name: "2: data disks and vmail"
+      ansible.builtin.import_role: {name: disks}
+      tags: [disks]
+    - name: "3: firewall"
+      ansible.builtin.import_role: {name: firewall}
+      tags: [firewall]
+    - name: "4: container firewall block"
+      ansible.builtin.import_role: {name: docker_block}
+      tags: [docker_block]
+    - name: "5: certificate"
+      ansible.builtin.import_role: {name: certificate}
+      tags: [certificate]
+    # step 13's users, layout and code, brought forward: steps 6 and 10 need its users,
+    # and step 6 the applier and its migrations
+    - name: "13, first part: users, layout, code"
+      ansible.builtin.import_role: {name: programs}
+      tags: [programs]
+    - name: "6: PostgreSQL, the owner, the schema, the break-glass hash"
+      ansible.builtin.import_role: {name: postgresql}
+      tags: [postgresql]
+    - name: "7: the Postfix package, so the postfix account exists"
+      ansible.builtin.import_role: {name: postfix_package}
+      tags: [postfix_package]
+    - name: "8: Dovecot"
+      ansible.builtin.import_role: {name: dovecot}
+      tags: [dovecot]
+    - name: "9: Postfix's configuration: 465, the per-sender maps, both transports error"
+      ansible.builtin.import_role: {name: postfix}
+      tags: [postfix]
+    - name: "10: ClamAV from the distribution, its updaters and its socket"
+      ansible.builtin.import_role: {name: clamav}
+      tags: [clamav]
+    - name: "11: the container runtime, then rspamd pinned by digest"
+      ansible.builtin.import_role: {name: rspamd}
+      tags: [rspamd]
+    # before step 13, which renders the fetcher's configuration
+    - name: "12: mpop"
+      ansible.builtin.import_role: {name: mpop}
+      tags: [mpop]
+    - name: "13: the programs' units and configuration"
+      ansible.builtin.import_role: {name: programs, tasks_from: units}
+      tags: [programs]
+    - name: "14: the milter, proved to answer before it is bound to submission"
+      ansible.builtin.import_role: {name: milter}
+      tags: [milter]
+    - name: "15: the administration interface, behind the reverse proxy"
+      ansible.builtin.import_role: {name: interface}
+      tags: [interface]
+    - name: "16: the backup: the database and the fetch state together, collection paused"
+      ansible.builtin.import_role: {name: backup}
+      tags: [backup]
+    - name: "17: health: every subsystem checked, the report kept current"
+      ansible.builtin.import_role: {name: health}
+      tags: [health]
+    # after Dovecot and Postfix, so the jails read from the first failure
+    - name: "18: the login-failure ban, proved on the live jails"
+      ansible.builtin.import_role: {name: ban}
+      tags: [ban]
+    # last, and only once the ban is proved
+    - name: "19: publication: 993 and 465 opened"
+      ansible.builtin.import_role: {name: publish}
+      tags: [publish]
+  post_tasks:
+    # maildivvy-install records the version itself, once every step passed; a run
+    # from a control machine records it here. Untagged: a run with --tags records nothing.
+    - name: Record the version this run installed
+      ansible.builtin.copy:
+        content: "{{ maildivvy_release_version }}\n"
+        dest: /etc/maildivvy/version
+        owner: root
+        group: root
+        mode: "0644"
+      when: not maildivvy_installer_run | default(false)
+    # and, as maildivvy-install's own finished run does, the first install is finished and
+    # no failed upgrade's pause is left to read as one: step 13 started the timers
+    - name: Remove the unfinished install's and a failed upgrade's records
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/etc/maildivvy/installing, /etc/maildivvy/upgrade-paused.json, /etc/maildivvy/upgrade-held]
+      when: not maildivvy_installer_run | default(false)
+    # the last thing the install prints, so a self-signed machine is never mistaken for a real one
+    - name: "WARNING: THIS MACHINE HAS A SELF-SIGNED CERTIFICATE"
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: THIS MACHINE HAS A SELF-SIGNED CERTIFICATE for {{ maildivvy_cert_name }}."
+          - "cert_mode is self-signed: for a test machine only. Clients will refuse it."
+      when: maildivvy_cert_mode | default('acme') == 'self-signed'
+      tags: [always]

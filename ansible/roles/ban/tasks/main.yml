@@ -1,0 +1,129 @@
+# Install step 18: the login-failure ban.
+#
+# fail2ban with a jail per published service, the Dovecot 2.4 filter extending the stock
+# one, `ignoreip` under [DEFAULT]. It runs after Dovecot and Postfix, so the jails have
+# their input from the first failure, and before publication, so there is no
+# moment with the mail ports open and nothing banning; the predecessor's trade went the other
+# way.
+#
+# Proof: maildivvy-ban (files/maildivvy_ban.py) proves each jail on the running daemon -
+# its settings read back, the filter against real lines this machine's servers just wrote,
+# the live jail reading them, and `maxretry` failures for a documentation address banning
+# it with a firewall rule where one fewer does not, and the unban removing it.
+# ⛔ If anything here fails, 993 and 465 are closed before the install stops.
+
+- name: Install fail2ban, and nftables for its ban action
+  ansible.builtin.apt:
+    name: [fail2ban, nftables]
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: The Dovecot 2.4 filter, extending the stock one
+  ansible.builtin.copy:
+    src: dovecot.local
+    dest: "{{ maildivvy_ban_filter_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_ban_filter
+
+- name: The jails, with ignoreip under [DEFAULT]
+  ansible.builtin.template:
+    src: maildivvy.local.j2
+    dest: "{{ maildivvy_ban_jail_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_ban_jails
+
+- name: Install the proof
+  ansible.builtin.copy:
+    src: maildivvy_ban.py
+    dest: "{{ maildivvy_ban_program }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Prove the ban; unproved, the mail ports are closed and the install stops
+  block:
+    - name: Read whether fail2ban runs
+      ansible.builtin.command: systemctl is-active fail2ban
+      register: maildivvy_ban_active
+      changed_when: false
+      failed_when: false
+
+    # ⚠️ The package starts the daemon when it is installed, so `enable --now` applies the
+    # files to nothing: the jails would never appear while `is-active` reads active.
+    # A restart is what makes the running daemon read them.
+    - name: Restart fail2ban, so the running daemon has these files and not the package's
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: restarted
+        enabled: true
+      when: maildivvy_ban_filter is changed or maildivvy_ban_jails is changed
+            or maildivvy_ban_active.stdout != 'active'
+
+    - name: fail2ban starts at boot
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        state: started
+        enabled: true
+
+    - name: Wait until the running daemon lists both jails
+      ansible.builtin.command: fail2ban-client status
+      register: maildivvy_ban_status
+      changed_when: false
+      failed_when: >-
+        maildivvy_ban_status.rc != 0 or not (((maildivvy_ban_status.stdout | regex_findall('Jail list:(.*)')
+        + [''])[0].split(',') | map('trim') | list) is superset(['dovecot', 'postfix']))
+      until: >-
+        maildivvy_ban_status.rc == 0 and (((maildivvy_ban_status.stdout | regex_findall('Jail list:(.*)')
+        + [''])[0].split(',') | map('trim') | list) is superset(['dovecot', 'postfix']))
+      retries: 30
+      delay: 2
+
+    - name: Prove every jail on the running daemon
+      ansible.builtin.command:
+        argv: "{{ maildivvy_ban_prove_argv }}"
+      register: maildivvy_ban_proof
+      changed_when: false
+
+    # step 19 reads this: the proof has just passed in this play, so it need not run twice
+    - name: Remember that this run proved the ban
+      ansible.builtin.set_fact:
+        maildivvy_ban_proved: true
+
+    - name: What the proof read, jail by jail
+      ansible.builtin.debug:
+        msg: >-
+          {% set proof = maildivvy_ban_proof.stdout | from_json %}
+          {% for name, jail in proof.jails.items() %}{{ name }}: reads the {{ jail.daemon.backend }}
+          journal, maxretry {{ jail.daemon.maxretry }}; the filter matched
+          {{ jail.filter.failures.values() | list }} real failure line(s) and
+          {{ jail.filter.control.values() | list }} for the control; the live jail read the
+          failure; {{ jail.ban.address }} banned at {{ maildivvy_ban_maxretry }} and not at
+          {{ maildivvy_ban_maxretry - 1 }}, unbanned. {% endfor %}
+
+    - name: Health reads the ban as PASS
+      ansible.builtin.command:
+        argv: [runuser, -u, maildivvy-health, --, /opt/maildivvy/bin/maildivvy-health, --subsystem, ban]
+        chdir: /
+      register: maildivvy_ban_health
+      changed_when: false
+
+  rescue:
+    - name: Close 993 and 465, since the ban is not proved
+      ansible.builtin.include_role:
+        name: publish
+        tasks_from: close
+
+    - name: Stop the install
+      ansible.builtin.fail:
+        msg:
+          - "THE BAN IS NOT PROVED, SO 993 AND 465 ARE CLOSED."
+          - "{{ ansible_failed_task.name | default('') }}"
+          - "{{ ansible_failed_result.stderr_lines | default([]) }}"
+          - "{{ ansible_failed_result.stdout_lines | default([]) if ansible_failed_result.stderr_lines | default([]) == [] else [] }}"
+          - "{{ ansible_failed_result.msg | default('') }}"

@@ -1,0 +1,21 @@
+#!/usr/bin/python3
+"""Dump the database and the fetch state together, or restore one run. See backup/run.py.
+
+A daily timer runs this as root (install step 16); an operator runs it by hand the same way.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.backup.run import main  # noqa: E402
+
+sys.exit(main())

@@ -1,0 +1,50 @@
+# Install step 10: ClamAV from the distribution. The product fixes these paths;
+# none of them is a setting.
+
+maildivvy_clamav_packages: [clamav-daemon, clamav-freshclam, fangfrisch]
+
+maildivvy_clamav_conf: /etc/clamav/clamd.conf
+maildivvy_clamav_socket_dir: /run/clamav
+maildivvy_clamav_socket: /run/clamav/clamd.ctl
+maildivvy_clamav_tmpfiles: /etc/tmpfiles.d/maildivvy-clamav.conf
+maildivvy_clamav_database_dir: /var/lib/clamav
+maildivvy_clamav_user: clamav
+
+# fangfrisch, the community-signature updater, on the host: its configuration must be at
+# exactly this path, since the shipped timer carries ConditionPathExists for it,
+# and it writes into the packaged daemon's database directory.
+maildivvy_fangfrisch_conf: /etc/fangfrisch.conf
+maildivvy_fangfrisch_state: /var/lib/fangfrisch
+maildivvy_fangfrisch_db: /var/lib/fangfrisch/db.sqlite
+
+maildivvy_clamav_eicar: 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
+
+# A scan of a few clean bytes through the client: the daemon answers a verdict again
+# after a reload, which with concurrent reload off is a pause in scanning.
+maildivvy_clamav_ping: |
+  from maildivvy.lib import scan
+  print(scan.scan_virus(b'From: a@example.org\n\nplain words\n', timeout=30).verdict)
+
+# The step's proof, run as the mail owner through the product's own client, never
+# through host ClamAV tools: the EICAR detection, a clean message, our
+# own size gate, and one byte past the gate so that the running daemon's own stream
+# limit answers. The limits are read from the configuration by the same
+# code the delivery filter and the milter use.
+maildivvy_clamav_probe: |
+  import dataclasses, json, sys
+  from maildivvy.lib import scan
+  eicar, stream_max, file_max = sys.argv[1:4]
+  limit = scan.size_limit()
+  expected = min(scan.parse_size('StreamMaxLength', stream_max),
+                 scan.parse_size('MaxFileSize', file_max))
+  version = scan.clamd_version()
+  print(json.dumps({
+      'limit': limit,
+      'limit_matches': limit == expected,
+      'version': version.engine if version else None,
+      'signatures': version.signatures if version else None,
+      'eicar': dataclasses.asdict(scan.scan_virus(eicar.encode())),
+      'clean': dataclasses.asdict(scan.scan_virus(b'From: a@example.org\n\nplain words\n')),
+      'gated': dataclasses.asdict(scan.scan_virus(b'x' * (limit + 1))),
+      'over': dataclasses.asdict(scan.scan_virus(b'x' * (limit + 1), max_bytes=limit + 1)),
+  }))

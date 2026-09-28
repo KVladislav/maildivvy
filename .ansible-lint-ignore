@@ -1,0 +1,65 @@
+# Tasks a rule of ansible-lint does not fit, by file and rule, each group with its reason.
+# `skip` keeps them out of the report; any other file breaking the same rule still fails.
+
+# no-handler: these run in the role, right after the change, on purpose. Each step ends
+# with its proofs, which read the restarted daemon, the reloaded units or the edited
+# rules; a handler would run after the play, after the proofs had read the old state.
+ansible/roles/backup/tasks/main.yml no-handler skip
+ansible/roles/clamav/tasks/main.yml no-handler skip
+ansible/roles/disks/tasks/separate.yml no-handler skip
+ansible/roles/docker_block/tasks/main.yml no-handler skip
+ansible/roles/dovecot/tasks/main.yml no-handler skip
+ansible/roles/health/tasks/main.yml no-handler skip
+ansible/roles/interface/tasks/main.yml no-handler skip
+ansible/roles/milter/tasks/main.yml no-handler skip
+ansible/roles/postgresql/tasks/main.yml no-handler skip
+ansible/roles/programs/tasks/units.yml no-handler skip
+
+# no-changed-when: each of these commands runs only under a `when`, on the task or its
+# block, that read the state first (a blank disk, a mount point not mounted, a swap area
+# not on, firewall rules not in place, a timer still armed, no certificate yet, an image
+# missing, a changed pin), so when it runs it did change something.
+ansible/roles/certificate/tasks/main.yml no-changed-when skip
+ansible/roles/disks/tasks/separate.yml no-changed-when skip
+ansible/roles/docker_block/tasks/main.yml no-changed-when skip
+ansible/roles/firewall/tasks/main.yml no-changed-when skip
+ansible/roles/publish/tasks/close.yml no-changed-when skip
+ansible/roles/rspamd/tasks/main.yml no-changed-when skip
+
+# risky-shell-pipe: read-only reads whose output an assert right after compares exactly,
+# so a failing first command yields output the assert refuses. The database wait counts
+# files that may not exist yet and must not fail while it retries.
+ansible/roles/certificate/tasks/main.yml risky-shell-pipe skip
+ansible/roles/clamav/tasks/main.yml risky-shell-pipe skip
+ansible/roles/dovecot/tasks/main.yml risky-shell-pipe skip
+ansible/roles/firewall/tasks/main.yml risky-shell-pipe skip
+ansible/roles/postfix/tasks/main.yml risky-shell-pipe skip
+ansible/roles/postgresql/tasks/main.yml risky-shell-pipe skip
+
+# risky-file-permissions: the mount points are created before mounting; the mode that
+# counts is the mounted root's, which the task after the mount sets to 0700.
+ansible/roles/disks/tasks/separate.yml risky-file-permissions skip
+
+# command-instead-of-module: `systemctl is-active` and `systemctl show` are reads whose
+# words the tasks after them judge; the stops act on the transient revert units that
+# systemd-run made, which exist only while a change is unproved; the renewal is started
+# the way its timer starts it, and its result is read back after. Every unit the product
+# installs is changed with the systemd module.
+ansible/roles/ban/tasks/main.yml command-instead-of-module skip
+ansible/roles/certificate/tasks/main.yml command-instead-of-module skip
+ansible/roles/docker_block/tasks/main.yml command-instead-of-module skip
+ansible/roles/firewall/tasks/main.yml command-instead-of-module skip
+
+# name[casing]: these names begin with a program's, a file's, a group's or an account's
+# own lowercase name (fail2ban, lego, ufw, after.rules, maildivvy-rspamd, vmail).
+ansible/roles/ban/tasks/main.yml name[casing] skip
+ansible/roles/certificate/tasks/main.yml name[casing] skip
+ansible/roles/disks/tasks/main.yml name[casing] skip
+ansible/roles/docker_block/tasks/main.yml name[casing] skip
+ansible/roles/firewall/tasks/main.yml name[casing] skip
+ansible/roles/programs/tasks/main.yml name[casing] skip
+
+# name[template]: the installer shows this task's name while it waits for the
+# administrator's SSH login, and the address belongs in the middle of that sentence.
+ansible/roles/docker_block/tasks/main.yml name[template] skip
+ansible/roles/firewall/tasks/main.yml name[template] skip

@@ -1,0 +1,137 @@
+# Install step 17: health.
+#
+# What the step leaves: `maildivvy-health` and its timer, keeping the JSON report current
+# every five minutes, and with `maildivvy_health_textfile_dir` set, node_exporter's
+# `maildivvy.prom` beside it; the two helpers' sockets, through which the store (as vmail) and
+# what only root can read (as root) are handed to it. The product pushes nothing:
+# the operator's monitoring reads the report, or runs the command per subsystem.
+#
+# Proof: a full run taken through the unit itself - so its sandbox, its user and both
+# helpers are what is exercised - and its report read back: every subsystem PASS, or
+# UNKNOWN only where the machine holds no mail yet. `ban` and `network` are
+# read by the steps that make what they check (18, 19).
+
+- name: The report's directory, the health user's, readable by the operator's collector
+  ansible.builtin.file:
+    path: "{{ maildivvy_health_dir }}"
+    state: directory
+    owner: "{{ maildivvy_health_user }}"
+    group: "{{ maildivvy_health_user }}"
+    mode: "0755"
+
+# only when the operator names one. The file is written by the health user, so the
+# directory is that user's; node_exporter only reads it. Made only when it does not exist:
+# an existing directory is never re-owned (step 1 refuses one that is not the user's).
+- name: Read the textfile collector's directory
+  ansible.builtin.stat:
+    path: "{{ maildivvy_health_textfile_dir }}"
+  register: maildivvy_health_textfile
+  when: maildivvy_health_textfile_dir | length > 0
+
+- name: Make the textfile collector's directory, the health user's, readable by node_exporter
+  ansible.builtin.file:
+    path: "{{ maildivvy_health_textfile_dir }}"
+    state: directory
+    owner: "{{ maildivvy_health_user }}"
+    group: "{{ maildivvy_health_user }}"
+    mode: "0755"
+  when: maildivvy_health_textfile_dir | length > 0 and not maildivvy_health_textfile.stat.exists
+
+- name: The textfile collector's directory is a directory of the health user's
+  ansible.builtin.assert:
+    that:
+      - maildivvy_health_textfile.stat.isdir | default(true)
+      - maildivvy_health_textfile.stat.pw_name | default(maildivvy_health_user) == maildivvy_health_user
+    fail_msg: "{{ maildivvy_health_textfile_dir }} is not a directory of {{ maildivvy_health_user }}'s"
+    quiet: true
+  when: maildivvy_health_textfile_dir | length > 0
+
+- name: Install the units, the timer and the helpers' sockets
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - "{{ maildivvy_health_unit }}"
+    - "{{ maildivvy_health_timer }}"
+    - maildivvy-health-store.socket
+    - maildivvy-health-store@.service
+    - maildivvy-health-system.socket
+    - maildivvy-health-system@.service
+  register: maildivvy_health_units_written
+
+- name: Tell systemd the units changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: maildivvy_health_units_written is changed
+
+# a socket whose unit changed is restarted, so it listens as the file now says
+- name: The helpers' sockets listen, and come back at boot
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: "{{ 'restarted' if maildivvy_health_units_written is changed else 'started' }}"
+  loop: [maildivvy-health-store.socket, maildivvy-health-system.socket]
+
+- name: The timer runs and starts at boot; the service is started by it alone
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_health_timer }}"
+    enabled: true
+    state: started
+
+# `systemctl start` on a oneshot returns when the run has ended. The unit succeeds for
+# every report state; it fails only when the program could not run at all.
+- name: Take a full run, through the unit
+  ansible.builtin.command:
+    argv: [systemctl, start, "{{ maildivvy_health_unit }}"]
+  changed_when: false
+
+# --- read back --------------------------------------------------------------------------------
+
+- name: Read the report file's owner and mode
+  ansible.builtin.stat:
+    path: "{{ maildivvy_health_report }}"
+  register: maildivvy_health_report_file
+
+- name: The report is the health user's, and readable by a collector
+  ansible.builtin.assert:
+    that:
+      - maildivvy_health_report_file.stat.pw_name == maildivvy_health_user
+      - maildivvy_health_report_file.stat.mode == '0644'
+    quiet: true
+
+- name: Read the textfile's owner and mode
+  ansible.builtin.stat:
+    path: "{{ maildivvy_health_textfile_dir }}/maildivvy.prom"
+  register: maildivvy_health_textfile
+  when: maildivvy_health_textfile_dir | length > 0
+
+- name: The run wrote the textfile, the health user's, readable by node_exporter
+  ansible.builtin.assert:
+    that:
+      - maildivvy_health_textfile.stat.exists
+      - maildivvy_health_textfile.stat.pw_name == maildivvy_health_user
+      - maildivvy_health_textfile.stat.mode == '0644'
+    fail_msg: "the health run did not write {{ maildivvy_health_textfile_dir }}/maildivvy.prom"
+    quiet: true
+  when: maildivvy_health_textfile_dir | length > 0
+
+# Accepted: PASS; WARN, printed, since the install cannot act on it (a test machine's
+# certificate is `self-signed` and says so); and the checks of maildivvy_health_no_data_yet
+# as UNKNOWN. Every FAIL and every other UNKNOWN is printed with its sentence and stops
+# the install.
+- name: Every subsystem reads PASS or WARN, or UNKNOWN only where no data exists yet
+  ansible.builtin.command:
+    argv: [python3, -c, "{{ maildivvy_health_proof }}", "{{ maildivvy_health_report }}",
+           "{{ maildivvy_health_later_steps | join(',') }}",
+           "{{ maildivvy_health_no_data_yet | join(',') }}"]
+  register: maildivvy_health_proved
+  changed_when: false
+  failed_when: maildivvy_health_proved.rc != 0
+
+- name: What health warns about
+  ansible.builtin.debug:
+    msg: "{{ maildivvy_health_proved.stdout_lines }}"
+  when: "'WARN' in maildivvy_health_proved.stdout"

@@ -1,0 +1,303 @@
+# Install step 14: the submission milter, started and proved to answer, and only then
+# bound to submission. Step 9 deliberately left `smtpd_milters` unwritten
+# and set no `milter_*` at all: with Postfix's fail-closed default a milter bound before
+# it runs refuses every submission, so the order here is the whole point of the step.
+#
+# What the step leaves: pymilter from the distribution, its import proved as an
+# unprivileged user; the daemon under its own no-login user with its socket inside
+# Postfix's chroot; `milter_default_action = tempfail` and `milter_protocol = 6` in
+# main.cf with the global binding empty; and `smtpd_milters` on `submissions` alone,
+# written after the rollback against a nonexistent socket has been exercised.
+
+# --- the library, before anything binds a socket --------------------
+
+- name: Install pymilter, the distribution's
+  ansible.builtin.apt:
+    name: "{{ maildivvy_milter_packages }}"
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ⛔ it is a C extension, and its failure mode is a service that starts, binds and
+# cannot answer while Postfix is already handing it messages
+- name: The library imports as an unprivileged user
+  ansible.builtin.command:
+    argv: [runuser, -u, nobody, --, python3, -c, "import Milter; print(Milter.__file__)"]
+  register: maildivvy_milter_import
+  changed_when: false
+
+- name: It is the library the program will import, not something of ours
+  ansible.builtin.assert:
+    that: maildivvy_milter_import.stdout is search('/Milter/')
+    fail_msg: "import Milter answered {{ maildivvy_milter_import.stdout }}"
+    quiet: true
+
+# --- the daemon ----------------------------------------------
+
+- name: Install the milter's unit
+  ansible.builtin.template:
+    src: maildivvy-milter.service.j2
+    dest: "/etc/systemd/system/{{ maildivvy_milter_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_milter_unit_written
+
+- name: Tell systemd the unit changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: maildivvy_milter_unit_written is changed
+
+# ⚠️ THE ONLY LONG-RUNNING PROGRAM OF OURS SO FAR: the timers' programs pick up new
+# code at their next run, this one holds what it imported at start. Step 13 writes the
+# tree; if any of it is newer than the running daemon, the daemon is running code the
+# machine no longer has.
+- name: Is any of the code newer than the running daemon?
+  ansible.builtin.command:
+    argv: [sh, -c,
+           'started=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$1")" +%s 2>/dev/null || echo 0);
+            find "$2" "$3" -newermt "@${started:-0}" -print -quit', -,
+           "{{ maildivvy_milter_unit }}", "{{ maildivvy_milter_program }}",
+           "{{ maildivvy_milter_opt }}/lib/maildivvy"]
+  register: maildivvy_milter_stale
+  changed_when: false
+
+- name: Restart the daemon for a unit or code that changed
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_milter_unit }}"
+    state: restarted
+  when: maildivvy_milter_unit_written is changed or maildivvy_milter_stale.stdout != ''
+
+- name: The daemon runs and starts at boot
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_milter_unit }}"
+    enabled: true
+    state: started
+
+# ⚠️ `systemctl is-active` reads `active` for a daemon that started and could not open
+# its socket, so the socket itself is waited for and then asked
+- name: Wait for the socket to appear
+  ansible.builtin.wait_for:
+    path: "{{ maildivvy_milter_socket }}"
+    state: present
+    timeout: 30
+
+- name: Read the socket and its directory back
+  ansible.builtin.command:
+    argv: [stat, -c, "%F %U:%G %a", "{{ item }}"]
+  loop: ["{{ maildivvy_milter_socket_dir }}", "{{ maildivvy_milter_socket }}"]
+  register: maildivvy_milter_stat
+  changed_when: false
+
+# ⛔ 2750 <milter user>:postfix on the directory and a group-writable socket, or every
+# submission is deferred with a permission error naming nothing useful
+- name: The directory is 2750 and the socket is group-writable by postfix
+  ansible.builtin.assert:
+    that:
+      - maildivvy_milter_stat.results[0].stdout == 'directory ' ~ maildivvy_milter_user ~ ':postfix 2750'
+      - maildivvy_milter_stat.results[1].stdout == 'socket ' ~ maildivvy_milter_user ~ ':postfix 770'
+    fail_msg: "{{ maildivvy_milter_stat.results | map(attribute='stdout') | list }}"
+    quiet: true
+
+# ⛔ the proof the daemon ANSWERS, in the protocol's own words, before anything is bound
+# to it
+- name: Negotiate with the socket
+  ansible.builtin.command:
+    argv: ["{{ maildivvy_milter_program }}", --probe, --socket, "{{ maildivvy_milter_socket }}"]
+  register: maildivvy_milter_probe
+  changed_when: false
+
+- name: It negotiated the protocol version Postfix will speak
+  ansible.builtin.assert:
+    that: maildivvy_milter_probe.stdout is search('negotiated version ' ~ maildivvy_milter_main.milter_protocol)
+    fail_msg: "{{ maildivvy_milter_probe.stdout }}"
+    quiet: true
+
+# ⚠️ without an explicit `--db-conf` the program would fall back on another consumer's
+# connection file, which this user cannot read: it would fail closed at the lookup and
+# defer every submission, while its own files read exactly as expected
+# ⚠️ the RUNNING PROCESS's own lines, never the unit's whole history: a daemon that was
+# restarted for a test, or that failed once and came back, would otherwise be read
+# through what an earlier process said.
+- name: Read the running daemon's own log
+  ansible.builtin.command:
+    argv: [sh, -c, 'journalctl -u "$1" _PID="$(systemctl show -p MainPID --value "$1")" --no-pager', -,
+           "{{ maildivvy_milter_unit }}"]
+  register: maildivvy_milter_log
+  changed_when: false
+
+- name: It opened its own connection file and was refused nothing
+  ansible.builtin.assert:
+    that:
+      - maildivvy_milter_log.stdout is search('sender directory ' ~ (maildivvy_milter_db_conf | regex_escape))
+      - "'Permission denied' not in maildivvy_milter_log.stdout"
+      - "'Traceback' not in maildivvy_milter_log.stdout"
+    fail_msg: "{{ maildivvy_milter_log.stdout }}"
+    quiet: true
+
+# --- main.cf: fail closed, and no global binding -----------------------
+
+- name: Set the milter parameters the product owns
+  maildivvy_postconf:
+    main: "{{ maildivvy_milter_main }}"
+  register: maildivvy_milter_written
+
+- name: The whole configuration still parses
+  ansible.builtin.command:
+    argv: [postfix, check]
+  changed_when: false
+
+- name: Reload Postfix for the new parameters
+  ansible.builtin.command:
+    argv: [postfix, reload]
+  when: maildivvy_milter_written is changed
+  changed_when: true
+
+# --- what submission is bound to now, read before anything is touched -------
+#
+# ⚠️ what the machine holds is read from `postconf -M` and `postconf -P` WITHOUT
+# arguments: `-P` naming a service that does not exist prints `warning: unmatched
+# request` on stderr and exits 0, which is also what a correctly absent override
+# prints - indistinguishable without `-M`.
+#
+# ⛔ It is read HERE, before the rollback drill takes the binding away and puts it back:
+# what the run changed is the difference between this reading and the machine it leaves,
+# never the drill's own two moves.
+
+- name: Read the services and their overrides, whole
+  ansible.builtin.command:
+    argv: [postconf, "{{ item }}"]
+  loop: [-M, -P]
+  register: maildivvy_milter_machine
+  changed_when: false
+
+- name: Submission is a service of this machine, and this is what it is bound to
+  ansible.builtin.set_fact:
+    maildivvy_milter_service_exists: "{{ maildivvy_milter_machine.results[0].stdout_lines
+      | select('match', (maildivvy_milter_service | regex_replace('/', ' ')) ~ ' ') | list | length > 0 }}"
+    maildivvy_milter_bound_to: "{{ maildivvy_milter_machine.results[1].stdout_lines
+      | select('match', (maildivvy_milter_service ~ '/smtpd_milters') | regex_escape ~ ' *=')
+      | map('regex_replace', '^[^=]*= *', '') | list }}"
+
+- name: The service `postconf -P` is about exists
+  ansible.builtin.assert:
+    that: maildivvy_milter_service_exists
+    fail_msg: "{{ maildivvy_milter_service }} is not in postconf -M"
+    quiet: true
+
+# --- the rollback drill, before the real binding ----------------
+#
+# ⛔ A rollback first attempted during an incident is one nobody has run. It is exercised
+# on every run and leaves the machine as it found it, so none of its tasks reports a
+# change; the reading it produces is only meaningful beside the two controls around it.
+
+- name: Copy the submission probe onto the machine
+  ansible.builtin.copy:
+    src: submission-probe.py
+    dest: "{{ maildivvy_milter_probe_program }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+# ⛔ THE REAL BINDING IS WRITTEN WHATEVER HAPPENS IN THE DRILL. The drill takes
+# the binding away and reads 465 with nothing bound; a failure anywhere after that - a
+# probe that errors, an assert, a reload - used to stop the run there and leave 465
+# accepting mail with no From check and no scan. The binding is therefore the drill's
+# `always`: a failed drill still fails the run, and leaves submission bound.
+- name: The rollback drill, with the real binding written whatever happens in it
+  block:
+    - name: Bind submission to a socket nothing listens on
+      ansible.builtin.command:
+        argv: [postconf, -P, "{{ maildivvy_milter_service }}/smtpd_milters={{ maildivvy_milter_nonexistent }}"]
+      changed_when: false
+
+    - name: Reload Postfix onto the broken binding
+      ansible.builtin.command:
+        argv: [postfix, reload]
+      changed_when: false
+
+    - name: Ask submission what it answers now
+      ansible.builtin.command:
+        argv: [python3, "{{ maildivvy_milter_probe_program }}"]
+      register: maildivvy_milter_broken
+      changed_when: false
+
+    - name: Clear the broken binding again
+      ansible.builtin.command:
+        argv: [postconf, -P, -X, "{{ maildivvy_milter_service }}/smtpd_milters"]
+      changed_when: false
+
+    - name: Reload Postfix with nothing bound
+      ansible.builtin.command:
+        argv: [postfix, reload]
+      changed_when: false
+
+    - name: Ask submission again, with nothing bound at all
+      ansible.builtin.command:
+        argv: [python3, "{{ maildivvy_milter_probe_program }}"]
+      register: maildivvy_milter_unbound
+      changed_when: false
+
+    - name: The broken binding refused temporarily and the rollback undid it
+      ansible.builtin.assert:
+        that:
+          - (maildivvy_milter_broken.stdout | from_json).mail.code == '451'
+          - (maildivvy_milter_unbound.stdout | from_json).mail.code != '451'
+        fail_msg: "broken: {{ maildivvy_milter_broken.stdout }} / unbound: {{ maildivvy_milter_unbound.stdout }}"
+        quiet: true
+
+  # --- the real binding, on `submissions` alone -----------------------------
+  #
+  # ⛔ it is written after the drill, which took it away: the write always runs and
+  # reports a change only when the machine did not already hold it, so a re-run leaves the
+  # same binding and says so.
+  always:
+    - name: Bind the milter on submission, and nowhere else
+      ansible.builtin.command:
+        argv: [postconf, -P, "{{ maildivvy_milter_service }}/smtpd_milters={{ maildivvy_milter_binding }}"]
+      changed_when: maildivvy_milter_bound_to != [maildivvy_milter_binding]
+
+    - name: The configuration parses with the binding in it
+      ansible.builtin.command:
+        argv: [postfix, check]
+      changed_when: false
+
+    - name: Reload Postfix onto the real binding
+      ansible.builtin.command:
+        argv: [postfix, reload]
+      changed_when: maildivvy_milter_bound_to != [maildivvy_milter_binding]
+
+# --- the step's own proofs ----------------------------------------------------------------
+
+- name: Read the binding back from the daemon's own view of it
+  ansible.builtin.command:
+    argv: [postconf, "{{ item }}"]
+  loop: [-P, -n]
+  register: maildivvy_milter_read
+  changed_when: false
+
+- name: Submission names the socket, and the global value is empty
+  ansible.builtin.assert:
+    that:
+      - maildivvy_milter_service ~ '/smtpd_milters = ' ~ maildivvy_milter_binding
+        in maildivvy_milter_read.results[0].stdout_lines
+      - maildivvy_milter_read.results[0].stdout_lines
+        | select('search', '/smtpd_milters *=') | list | length == 1
+      - "'smtpd_milters =' in maildivvy_milter_read.results[1].stdout"
+      - "'milter_default_action = tempfail' in maildivvy_milter_read.results[1].stdout"
+      - "'milter_protocol = 6' in maildivvy_milter_read.results[1].stdout"
+    fail_msg: "{{ maildivvy_milter_read.results[0].stdout }}"
+    quiet: true
+
+- name: Ask submission one last time, with the daemon bound and answering
+  ansible.builtin.command:
+    argv: [python3, "{{ maildivvy_milter_probe_program }}"]
+  register: maildivvy_milter_bound_probe
+  changed_when: false
+
+- name: Nothing is deferred now that the daemon it is bound to answers
+  ansible.builtin.assert:
+    that: (maildivvy_milter_bound_probe.stdout | from_json).mail.code != '451'
+    fail_msg: "{{ maildivvy_milter_bound_probe.stdout }}"
+    quiet: true

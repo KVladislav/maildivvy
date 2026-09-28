@@ -1,0 +1,11 @@
+# Maildivvy, install step 8. The archive is an ordinary mailbox with a login of its
+# own, read-only by an ACL on its own mailboxes. Nothing is shared: no
+# acl_global_path, whose rule for a mailbox named INBOX would match every user's
+# INBOX, and no acl_sharing_map.
+acl_driver = vfile
+
+# A mailbox with no ACL of its own takes its INBOX's, the namespace root included: the
+# archive, whose INBOX is `owner lrs`, cannot create a folder, and a person's mailbox,
+# whose INBOX has no ACL, keeps every right. Measured on 2.4.2: without
+# it the archive could CREATE folders and APPEND to any folder lacking its own ACL.
+acl_defaults_from_inbox = yes

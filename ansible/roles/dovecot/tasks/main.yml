@@ -1,0 +1,293 @@
+# Install step 8: Dovecot 2.4 from the distribution, configured by conf.d files that
+# replace the stock ones by name; its database role given LOGIN and
+# a passfile; the index on its own filesystem through the view's
+# paths; one \Sent mailbox. The effective configuration is
+# read back from the daemon, never from the files. 993 stays closed by
+# the firewall until publication (step 19): the packages answer on 993 and 143 with a
+# certificate of their own until this step replaces their configuration.
+
+- name: Install Dovecot from the distribution
+  ansible.builtin.apt:
+    name: "{{ maildivvy_dovecot_packages }}"
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Read Dovecot's version
+  ansible.builtin.command:
+    argv: [dovecot, --version]
+  register: maildivvy_dovecot_version
+  changed_when: false
+
+- name: Dovecot is 2.4, the version this configuration is written and checked against
+  ansible.builtin.assert:
+    that: maildivvy_dovecot_version.stdout is match('2\.4\.')
+    fail_msg: "Dovecot {{ maildivvy_dovecot_version.stdout }}; the configuration is 2.4's"
+    quiet: true
+
+- name: Make the directory for the distribution's originals
+  ansible.builtin.file:
+    path: "{{ maildivvy_dovecot_stock }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Once: a file already ours is never taken for the original (the rollback)
+- name: Keep the distribution's originals of the files this step replaces
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      for f in {{ maildivvy_dovecot_conf | join(' ') }}; do
+        src=/etc/dovecot/conf.d/$f
+        if [ -e "$src" ] && [ ! -e "{{ maildivvy_dovecot_stock }}/$f" ] && ! grep -q 'Maildivvy, install step 8' "$src"; then
+          cp -p "$src" "{{ maildivvy_dovecot_stock }}/$f"
+          echo "kept $f"
+        fi
+      done
+  register: maildivvy_dovecot_kept
+  changed_when: "'kept ' in maildivvy_dovecot_kept.stdout"
+
+# --- the database role ---------------------------------
+
+- name: Give the daemon's role LOGIN, which step 6 withheld until its user existed
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
+    stdin: |
+      DO $$
+      BEGIN
+          IF NOT (SELECT rolcanlogin FROM pg_roles WHERE rolname = '{{ maildivvy_dovecot_db_role }}') THEN
+              ALTER ROLE {{ maildivvy_dovecot_db_role }} LOGIN;
+              RAISE NOTICE 'granted login';
+          END IF;
+      END
+      $$;
+  register: maildivvy_dovecot_login
+  changed_when: "'granted login' in maildivvy_dovecot_login.stderr"
+
+# Before the configuration that names it; the password never leaves the machine
+- name: Give the role its password in a passfile owned by the SQL auth worker's user
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ maildivvy_dovecot_db_role }}", "{{ maildivvy_dovecot_passfile }}",
+           "{{ maildivvy_dovecot_auth_user }}", --db, "{{ maildivvy_dovecot_db_name }}"]
+  register: maildivvy_dovecot_password
+  changed_when: (maildivvy_dovecot_password.stdout | from_json).changed
+
+- name: Read the passfile back by owner, mode and shape, never printing it
+  ansible.builtin.command:
+    argv: [sh, -c, 'stat -c "%U %a" "$1" && awk -F: "END { print NR, NF }" "$1" && cut -d: -f1-4 "$1"', -,
+           "{{ maildivvy_dovecot_passfile }}"]
+  register: maildivvy_dovecot_passfile_read
+  changed_when: false
+  failed_when: >-
+    maildivvy_dovecot_passfile_read.rc != 0 or maildivvy_dovecot_passfile_read.stdout_lines !=
+    [maildivvy_dovecot_auth_user ~ ' 600', '1 5',
+     'localhost:5432:' ~ maildivvy_dovecot_db_name ~ ':' ~ maildivvy_dovecot_db_role]
+
+- name: The role logs in as itself with that passfile, as the auth worker's user
+  ansible.builtin.command:
+    argv: [runuser, -u, "{{ maildivvy_dovecot_auth_user }}", --, env, "PGPASSFILE={{ maildivvy_dovecot_passfile }}",
+           psql, -X, -w, -At, -U, "{{ maildivvy_dovecot_db_role }}", -d, "{{ maildivvy_dovecot_db_name }}", -c,
+           "SELECT count(*) FROM mailbox_opens"]
+  changed_when: false
+
+# --- the configuration -----------------------------------------------------------------------
+
+# Dovecot creates the socket, not its directory; Postfix's own mode for it (postfix-files)
+- name: Make Postfix's private directory for the SASL listener
+  ansible.builtin.file:
+    path: "{{ maildivvy_dovecot_postfix_auth | dirname }}"
+    state: directory
+    owner: postfix
+    group: root
+    mode: "0700"
+
+# --- the Sent hook's script, written before the configuration that binds it -------
+# The compiling of it comes after that configuration, below: `sievec` reads it too.
+
+- name: Make the directory for the global Sieve scripts
+  ansible.builtin.file:
+    path: "{{ maildivvy_dovecot_sieve_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The binding names a program in sieve_pipe_bin_dir; the programs role put it there
+# before this step. A binding whose program is missing is a Sent hook that logs and
+# records nothing, with the APPEND succeeding all the same.
+- name: The hook's program is in place before anything binds a script to it
+  ansible.builtin.stat:
+    path: "{{ maildivvy_dovecot_pipe_bin_dir }}/{{ maildivvy_dovecot_sent_hook }}"
+  register: maildivvy_dovecot_hook_program
+
+- name: The Sent hook's program is executable
+  ansible.builtin.assert:
+    that:
+      - maildivvy_dovecot_hook_program.stat.exists
+      - maildivvy_dovecot_hook_program.stat.executable
+    fail_msg: "{{ maildivvy_dovecot_pipe_bin_dir }}/{{ maildivvy_dovecot_sent_hook }} is not an
+               executable program; the programs role installs it before this step"
+    quiet: true
+
+- name: Write the Sent hook's Sieve script
+  ansible.builtin.copy:
+    src: sent.sieve
+    dest: "{{ maildivvy_dovecot_sent_script }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_dovecot_sieve_written
+
+- name: Write the configuration
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: /etc/dovecot/conf.d/{{ item }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ maildivvy_dovecot_conf }}"
+  register: maildivvy_dovecot_written
+
+- name: The whole configuration parses
+  ansible.builtin.command:
+    argv: [doveconf, -n]
+  changed_when: false
+
+- name: Restart Dovecot for the new configuration
+  ansible.builtin.systemd:
+    name: dovecot
+    state: restarted
+  when: maildivvy_dovecot_written.changed
+
+- name: Dovecot runs and starts at boot
+  ansible.builtin.systemd:
+    name: dovecot
+    state: started
+    enabled: true
+
+# --- the Sent hook's script, compiled once the configuration is in place -----------------------
+
+# ⚠️ AFTER THE CONFIGURATION, NEVER BEFORE IT (measured 2026-09-20 on a clean machine):
+# `sievec` reads `/etc/dovecot` for itself, so with the stock configuration still in
+# place it knows neither `imapsieve` nor `vnd.dovecot.pipe` and refuses the script
+# (`unknown Sieve capability 'imapsieve'`, rc 89). On a machine this step has already
+# run on it compiles, which is exactly the shape of fault only a from-clean run shows.
+- name: Read whether the compiled script is there
+  ansible.builtin.stat:
+    path: "{{ maildivvy_dovecot_sent_binary }}"
+  register: maildivvy_dovecot_sieve_binary
+
+# ⛔ Plain `sievec <script> <out>`, no flags: `-x` REPLACES the extension
+# set rather than adding to it, which loses `imapsieve`, and `-P` hid that the plugins
+# were wrong. A warning naming a setting is the fault itself, so it fails this step.
+- name: Compile it with plain sievec, so the imap process never compiles it itself
+  ansible.builtin.command:
+    argv: [sievec, "{{ maildivvy_dovecot_sent_script }}", "{{ maildivvy_dovecot_sent_binary }}"]
+  when: maildivvy_dovecot_sieve_written.changed or not maildivvy_dovecot_sieve_binary.stat.exists
+  register: maildivvy_dovecot_sievec
+  changed_when: true
+  failed_when: maildivvy_dovecot_sievec.rc != 0 or
+               'warning' in (maildivvy_dovecot_sievec.stdout ~ maildivvy_dovecot_sievec.stderr) | lower
+
+- name: The compiled script is readable by the mail owner, which is what runs it
+  ansible.builtin.file:
+    path: "{{ maildivvy_dovecot_sent_binary }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0644"
+
+# --- read back from the daemon --------------------------------------------------
+
+- name: Read the effective values this step relies on
+  ansible.builtin.command:
+    argv: [doveconf, -h, "{{ item }}"]
+  loop: "{{ maildivvy_dovecot_expected | dict2items | map(attribute='key') | list }}"
+  register: maildivvy_dovecot_effective
+  changed_when: false
+
+- name: Each reads as written
+  ansible.builtin.assert:
+    that: item.stdout == maildivvy_dovecot_expected[item.item]
+    fail_msg: "{{ item.item }} reads {{ item.stdout }}, not {{ maildivvy_dovecot_expected[item.item] }}"
+    quiet: true
+  loop: "{{ maildivvy_dovecot_effective.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read the passdbs and userdbs in force
+  ansible.builtin.shell:
+    cmd: doveconf -n | grep -E '^(passdb|userdb) ' | sort
+  register: maildivvy_dovecot_dbs
+  changed_when: false
+
+- name: Exactly one passdb and one userdb, both ours
+  ansible.builtin.assert:
+    that: maildivvy_dovecot_dbs.stdout_lines == ['passdb maildivvy_passdb {', 'userdb maildivvy_userdb {']
+    fail_msg: "{{ maildivvy_dovecot_dbs.stdout_lines }}"
+    quiet: true
+
+- name: Read Dovecot's TCP listeners
+  ansible.builtin.shell:
+    cmd: ss -ltnpH | grep '"dovecot"' | awk '{print $4}' | sed 's/.*://' | sort -u
+  register: maildivvy_dovecot_ports
+  changed_when: false
+
+- name: Dovecot listens on 993 alone; 143 is closed
+  ansible.builtin.assert:
+    that: maildivvy_dovecot_ports.stdout_lines == ['993']
+    fail_msg: "Dovecot listens on {{ maildivvy_dovecot_ports.stdout_lines }}"
+    quiet: true
+
+# 67 is "no such user": the auth worker asked the database and got no row. 75 would be a
+# temporary failure, such as a passfile it cannot read.
+#
+# ⚠️ ASKED MORE THAN ONCE, BECAUSE DOVECOT'S SQL POOL RECONNECTS LAZILY. Step 6 restarts
+# the cluster whenever its listen drop-in changes, and every connection Dovecot's auth
+# process was holding dies with it; the pool notices on the NEXT lookup, not before.
+# Measured on the test VM 2026-09-22, restarting the cluster and asking twice in a row:
+# the first lookup is 75 (`sqlpool(pgsql): Query failed, retrying` then `aborting`,
+# `FATAL: terminating connection due to administrator command`) and the second is 67.
+# So a single-shot reading here is a reading of the pool's age, not of the auth worker's
+# access; it made a re-run of the whole playbook fail at step 8 during a full
+# test run. The verdict is unchanged - 67 and nothing else - and a worker that really cannot
+# reach the database answers 75 to every attempt and still fails this.
+- name: The auth worker reaches the database and answers a lookup of nobody
+  ansible.builtin.command:
+    argv: [doveadm, user, nobody@maildivvy-install.invalid]
+  register: maildivvy_dovecot_lookup
+  changed_when: false
+  failed_when: maildivvy_dovecot_lookup.rc != 67
+  until: maildivvy_dovecot_lookup.rc == 67
+  retries: 4
+  delay: 3
+
+- name: The mail owner can open the userdb and anvil sockets
+  ansible.builtin.command:
+    argv: [runuser, -u, vmail, --, test, -r, "/run/dovecot/{{ item }}", -a, -w, "/run/dovecot/{{ item }}"]
+  loop: [auth-userdb, anvil]
+  changed_when: false
+
+- name: Read the Sent hook's binding as the daemon holds it
+  ansible.builtin.shell:
+    cmd: doveconf -n | grep -A3 'sieve_script maildivvy_sent'
+  register: maildivvy_dovecot_binding
+  changed_when: false
+
+- name: The one script bound is the Sent hook's, on append, and its file is there
+  ansible.builtin.assert:
+    that:
+      - "'cause = append' in maildivvy_dovecot_binding.stdout"
+      - "maildivvy_dovecot_sent_script in maildivvy_dovecot_binding.stdout"
+    fail_msg: "{{ maildivvy_dovecot_binding.stdout }}"
+    quiet: true
+
+# The imap process compiles a script whose binary is missing or older, as the mail
+# owner, into a directory it cannot write: that is an error line per message and a
+# recompilation per message.
+- name: The compiled script is not older than the script itself
+  ansible.builtin.command:
+    argv: [test, "{{ maildivvy_dovecot_sent_binary }}", -nt, "{{ maildivvy_dovecot_sent_script }}"]
+  changed_when: false

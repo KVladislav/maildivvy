@@ -1,0 +1,35 @@
+# Maildivvy, install step 18: the login-failure ban. Managed by Ansible (roles/ban).
+#
+# Two jails, one per published service: `dovecot` for IMAP on 993 and `postfix` for
+# submission on 465. The postfix jail reads SASL failures (`mode = auth`): the stock mode
+# counts refused recipients, and the outside probe's own refusal at RCPT TO would then
+# count against it.
+#
+# ⛔ `ignoreip` is under [DEFAULT], never under a jail: a key in a jail.d file replaces the
+# default rather than extending it, and one under a jail leaves the other banning the
+# administrators' own networks. Loopback stays in it: health's IMAP probe
+# fails a login from 127.0.0.1 every five minutes.
+#
+# A ban covers every TCP port of the source, in fail2ban's own nftables
+# table: nothing is written into ufw's rule files, which install step 3 owns and puts back
+# whole when its timer reverts a change.
+#
+# The jails read the journal: the distribution's paths-debian.conf gives both a `systemd`
+# backend, so no `backend` or `logpath` is written here; the install reads the backend back
+# from the running daemon.
+[DEFAULT]
+ignoreip = {{ maildivvy_ban_ignoreip | join(' ') }}
+banaction = nftables[type=allports]
+banaction_allports = nftables[type=allports]
+findtime = {{ maildivvy_ban_findtime }}
+maxretry = {{ maildivvy_ban_maxretry }}
+bantime = {{ maildivvy_ban_bantime }}
+
+[dovecot]
+enabled = true
+port = imaps
+
+[postfix]
+enabled = true
+mode = auth
+port = submissions

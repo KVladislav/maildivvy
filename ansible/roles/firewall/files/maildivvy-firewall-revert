@@ -1,0 +1,35 @@
+#!/bin/sh
+# Maildivvy, install step 3: what the firewall's self-reverting timer runs when no new SSH
+# session proved a change in time. Managed by Ansible (roles/firewall).
+#
+# ⛔ IT PUTS BACK THE RULES THAT WERE IN FORCE BEFORE THE CHANGE, AND NEVER OPENS ANYTHING
+# ON THE WAY. On an installed machine 993 and 465 have listeners: the
+# source's revert, `ufw --force disable`, opened them and every other port to the world.
+# ⚠️ `ufw reload` is no better: it stops the firewall before starting it again, and in
+# between every policy is ACCEPT (measured: 465 answered from outside during one). The
+# saved rules are therefore loaded the way ufw itself loads a changed rule set,
+# `iptables-restore --noflush` of the rule files, which rewrites the chains they declare
+# and leaves the rest of the firewall - and its DROP policy - in place throughout.
+#
+# Only a machine whose firewall was not enabled before the change, which is a first
+# installation, goes back to that: at step 3 nothing of the product listens yet.
+set -eu
+
+saved=/etc/ufw/maildivvy-saved
+
+cp -p "$saved/user.rules" /etc/ufw/user.rules
+cp -p "$saved/user6.rules" /etc/ufw/user6.rules
+cp -p "$saved/default-ufw" /etc/default/ufw
+cp -p "$saved/ufw.conf" /etc/ufw/ufw.conf
+
+if ! grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf; then
+    exec /usr/sbin/ufw --force disable
+fi
+if ! iptables -w -n -L ufw-user-input >/dev/null 2>&1; then
+    # enabled on disk and not loaded: nothing is running to be kept, so start it
+    exec /usr/sbin/ufw --force enable
+fi
+# The step sets nothing but the rules and `deny incoming`, and an installed machine already
+# denied incoming, so the kernel's policy is the saved one and stays DROP throughout.
+iptables-restore -w -n < /etc/ufw/user.rules
+ip6tables-restore -w -n < /etc/ufw/user6.rules

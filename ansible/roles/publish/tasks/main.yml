@@ -1,0 +1,190 @@
+# Install step 19: publication, the last step.
+#
+# 993 and 465 are opened to anywhere at the host firewall, and only now: step 18 has proved
+# the ban in this run, or this step runs the same whole proof itself, and it reads the ban
+# again through health before it opens anything.
+# Each published port carries a per-source rate limit. Router and NAT are
+# the operator's: the product does not configure them (public
+# publication).
+#
+# Proof: the ports answer here; health reads `ban` PASS with the rate limits judged, and
+# `network` PASS but for `publication`, which only an outside probe's recorded result can
+# make PASS. The step prints the command that runs that probe.
+# ⛔ If anything here fails, 993 and 465 are closed again before the install stops.
+
+- name: Install maildivvy-publication, which records the outside probe's result
+  ansible.builtin.copy:
+    src: maildivvy_publication.py
+    dest: "{{ maildivvy_publish_program }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Publish; if anything fails, the mail ports are closed again and the install stops
+  block:
+    # ⛔ Health's ban check reads neither maxretry nor the live counter, so it cannot stand
+    # in for the proof: a run of this step without step 18 (`--tags publish`, or any run
+    # that skipped step 18) proves every jail itself first.
+    - name: The whole ban proof, unless step 18 passed it in this same run
+      ansible.builtin.command:
+        argv: "{{ maildivvy_ban_prove_argv }}"
+      changed_when: false
+      when: not (maildivvy_ban_proved | default(false))
+
+    - name: The ban reads PASS in health before anything is opened
+      ansible.builtin.command:
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_publish_health }}", --subsystem, ban]
+        chdir: /
+      changed_when: false
+
+    # ufw loads before.rules at boot; the running firewall gets the same rules below
+    # without a `ufw reload`, which accepts everything for a moment
+    - name: The per-source rate limits in ufw's before rules, each family
+      ansible.builtin.blockinfile:
+        path: "{{ maildivvy_publish_before_rules[item] }}"
+        marker: "# {mark} {{ maildivvy_publish_block }}"
+        insertafter: "^# End required lines"
+        block: "{{ lookup('ansible.builtin.template', 'mail-limits.rules.j2',
+                   template_vars={'maildivvy_publish_family': item}) }}"
+      loop: [4, 6]
+      register: maildivvy_publish_limits_written
+
+    # The chain is declared, so it is replaced whole, in one transaction; loading it as it
+    # already stands changes nothing, and a chain lost from the kernel comes back.
+    - name: Load the limits' chain into the running firewall, without stopping it
+      ansible.builtin.command:
+        argv: ["{{ 'iptables-restore' if item.item == 4 else 'ip6tables-restore' }}", -w, --noflush]
+        stdin: "{{ lookup('ansible.builtin.template', 'mail-limits.rules.j2',
+                   template_vars={'maildivvy_publish_family': item.item, 'maildivvy_publish_restore': true}) }}"
+      loop: "{{ maildivvy_publish_limits_written.results }}"
+      loop_control:
+        label: "IPv{{ item.item }}"
+      changed_when: item is changed
+
+    - name: The limits' chain is reached from ufw's input
+      ansible.builtin.shell: |
+        set -eu
+        tool={{ 'iptables' if item == 4 else 'ip6tables' }}
+        chain={{ 'ufw-before-input' if item == 4 else 'ufw6-before-input' }}
+        jump="-p tcp -m multiport --dports {{ maildivvy_publish_ports | join(',') }} -m conntrack --ctstate NEW -j {{ maildivvy_publish_chain }}"
+        if ! $tool -w -C $chain $jump 2>/dev/null; then
+            $tool -w -I $chain 1 $jump
+            echo inserted
+        fi
+      loop: [4, 6]
+      register: maildivvy_publish_jump
+      changed_when: "'inserted' in maildivvy_publish_jump.stdout"
+
+    - name: The limits' chain matches before.rules rule by rule, IPv4
+      maildivvy_chains:
+        chains: ["{{ maildivvy_publish_chain }}"]
+        file: "{{ maildivvy_publish_before_rules[4] }}"
+        block: "{{ maildivvy_publish_block }}"
+        ordered: true
+
+    - name: The limits' chain matches before6.rules rule by rule, IPv6
+      maildivvy_chains:
+        chains: ["{{ maildivvy_publish_chain }}"]
+        file: "{{ maildivvy_publish_before_rules[6] }}"
+        block: "{{ maildivvy_publish_block }}"
+        ordered: true
+        family: 6
+
+    # Adding a rule never stops the firewall. ufw writes each for IPv4 and IPv6;
+    # step 3 keeps exactly these rules on a re-run (ansible/library/maildivvy_ufw.py).
+    - name: Open 993 and 465 to anywhere
+      ansible.builtin.command:
+        argv: [ufw, allow, proto, tcp, from, any, to, any, port, "{{ item }}"]
+      loop: "{{ maildivvy_publish_ports }}"
+      register: maildivvy_publish_opened
+      changed_when: "'Rule added' in maildivvy_publish_opened.stdout"
+
+    - name: Record that the ports are published, and since when
+      ansible.builtin.copy:
+        dest: "{{ maildivvy_publish_record }}"
+        content: "{{ {'published_at': now(utc=true).strftime('%Y-%m-%dT%H:%M:%S+00:00')} | to_json }}\n"
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+
+    # --- read back -------------------------------------------------------------------------------
+
+    - name: Read the kernel's user input chains
+      ansible.builtin.shell: |
+        set -e
+        iptables -w -S ufw-user-input
+        ip6tables -w -S ufw6-user-input
+      register: maildivvy_publish_open
+      changed_when: false
+
+    - name: The kernel accepts 993 and 465 from anywhere, over IPv4 and IPv6
+      ansible.builtin.assert:
+        that:
+          - ('-A ufw-user-input -p tcp -m tcp --dport ' ~ item ~ ' -j ACCEPT') in maildivvy_publish_open.stdout_lines
+          - ('-A ufw6-user-input -p tcp -m tcp --dport ' ~ item ~ ' -j ACCEPT') in maildivvy_publish_open.stdout_lines
+        fail_msg: "{{ item }} is not accepted: {{ maildivvy_publish_open.stdout_lines }}"
+        quiet: true
+      loop: "{{ maildivvy_publish_ports }}"
+
+    - name: The ports answer here, IMAP on 993 and SMTP on 465, in TLS from the first byte
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import socket, ssl, sys
+            context = ssl._create_unverified_context()
+            for port, greeting in ((993, b"* OK"), (465, b"220")):
+                with context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=30)) as tls:
+                    first = tls.recv(512)
+                    assert first.startswith(greeting), (port, first[:80])
+                    print(port, first.split(b"\r\n")[0].decode())
+      register: maildivvy_publish_answer
+      changed_when: false
+
+    - name: Health reads the ban as PASS, with the rate limits now judged
+      ansible.builtin.command:
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_publish_health }}", --subsystem, ban]
+        chdir: /
+      changed_when: false
+
+    # Accepted: every network check PASS, and `publication` in whatever state a recorded
+    # outside result gives it - UNKNOWN until there is one, printed below.
+    - name: Health reads the network as PASS, but for the outside proof
+      ansible.builtin.command:
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_publish_health }}", --subsystem, network]
+        chdir: /
+      register: maildivvy_publish_network
+      changed_when: false
+      failed_when: >-
+        maildivvy_publish_network.stdout_lines | select('match', '^  [A-Z]+ ')
+        | reject('match', '^  PASS ') | reject('match', '^  [A-Z]+ publication: ') | list | length > 0
+        or maildivvy_publish_network.stdout_lines | select('match', '^  [A-Z]+ publication: ') | list | length != 1
+
+  rescue:
+    - name: Close 993 and 465 again
+      ansible.builtin.include_tasks: close.yml
+
+    - name: Stop the install
+      ansible.builtin.fail:
+        msg:
+          - "PUBLICATION FAILED, SO 993 AND 465 ARE CLOSED."
+          - "{{ ansible_failed_task.name | default('') }}"
+          - "{{ ansible_failed_result.stdout_lines | default([]) }}"
+          - "{{ ansible_failed_result.stderr_lines | default([]) }}"
+          - "{{ ansible_failed_result.msg | default('') }}"
+
+- name: "PUBLISHED: NOW PROVE IT FROM OUTSIDE"
+  ansible.builtin.debug:
+    msg:
+      - "993 and 465 are open at this machine's firewall. {{ (maildivvy_publish_network.stdout_lines
+         | select('match', '^  [A-Z]+ publication: ') | first).strip() }}"
+      - "Publication reads UNKNOWN until an outside probe's result is recorded, and again once it is
+         older than health's publication_days."
+      - "From a machine OUTSIDE this network (not the LAN, not a network that answers 993, 465 or
+         443 itself), with this repository's tools/outside-probe/:"
+      - "    python3 maildivvy_outside_probe.py {{ maildivvy_cert_name }} [--address <public address>]{{
+         '' if maildivvy_cert_mode | default('acme') == 'acme'
+         else ' --cafile <a copy of /etc/ssl/certs/' ~ maildivvy_cert_name ~ '.crt>' }} > probe-result.json"
+      - "Then, on this machine:  sudo maildivvy-publication record < probe-result.json"

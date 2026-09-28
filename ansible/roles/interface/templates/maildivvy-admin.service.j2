@@ -1,0 +1,52 @@
+# Managed by Ansible (roles/interface). Install step 15.
+# The administration interface: plain HTTP on a unix socket, with the reverse proxy in
+# front of it holding the certificate and the TLS rules. This program
+# opens no TCP port at all.
+[Unit]
+Description=Maildivvy: the administration interface, behind the local reverse proxy
+Documentation=file://{{ maildivvy_interface_opt }}/lib/maildivvy/admin/run.py
+# it reads accounts, sessions and the journal out of the database
+After=network-online.target postgresql.service
+Wants=network-online.target
+# ⚠️ the proxy comes up after the socket it proxies to, or the first person through the
+# door after a reboot is answered 502 by a proxy whose upstream is not there yet.
+Before={{ maildivvy_interface_proxy_unit }}
+
+[Service]
+# ⛔ READY=1 is sent by the program after its bind, never before: a restart that has
+# returned means the next request is answered rather than refused.
+Type=notify
+NotifyAccess=main
+User={{ maildivvy_interface_user }}
+Group={{ maildivvy_interface_user }}
+# ⛔ the one group this user takes, and it takes it so it can GIVE its socket away:
+# the socket is chowned to the proxy's group at bind, which needs membership. The
+# reverse - putting the proxy in this user's group - would open /etc/maildivvy/admin,
+# the passfile and the session secret, to the proxy.
+SupplementaryGroups={{ maildivvy_interface_proxy_group }}
+ExecStart={{ maildivvy_interface_program }} --socket {{ maildivvy_interface_socket }} --socket-group {{ maildivvy_interface_proxy_group }}
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# ⚠️ ITS SOCKET'S DIRECTORY AND NOTHING ELSE: the interface writes nothing to disk,
+# and /run is read-only under strict like everything else, so the one
+# path here is the tmpfs directory it binds in. The directory is made by tmpfiles at
+# every boot, so it is there before the namespace is built.
+ReadWritePaths={{ maildivvy_interface_socket_dir }}
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+# It binds a unix socket, not a port: no capability in either set.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

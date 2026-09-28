@@ -1,0 +1,12 @@
+# ⛔ OBSERVE MODE: NOTHING IS REJECTED HERE. The message was accepted twice before we
+# scored it, so this is filing rather than blocking, and nothing in the pipeline files by
+# the action: the delivery filter compares the score with the receiving domain's
+# threshold.
+#
+# ⚠️ `reject` is kept at a score nothing reaches rather than removed, because it is the
+# ceiling of that threshold: a message the scanner rejects outright is then at or above
+# every threshold a domain may hold, and needs no special case. It is one value with the
+# CHECK on `domain.spam_threshold` and `maildivvy.lib.scan.TOP_SCORE`.
+reject = {{ maildivvy_rspamd_reject_score }};
+add_header = {{ maildivvy_rspamd_add_header_score }};
+greylist = {{ maildivvy_rspamd_greylist_score }};

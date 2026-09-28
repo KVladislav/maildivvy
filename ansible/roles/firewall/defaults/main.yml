@@ -1,0 +1,25 @@
+# Fixed by the design: SSH, then the interface's proxy.
+# SSH comes first, so its rule exists before anything else is written.
+# The mail ports 993 and 465 are not here: publication is the last step.
+maildivvy_admin_ports: [22, 443]
+
+# The mail ports, which step 19 opens to anywhere once the ban is proved. This step never
+# opens them, and on a re-run it keeps exactly the rules step 19 wrote for them. The same
+# list as the publish role's `maildivvy_publish_ports`; a unit test holds them equal.
+maildivvy_mail_ports: [993, 465]
+
+# How long a firewall change may stand before the timer puts the rules in force before
+# it back, unless a new SSH session proved it first.
+maildivvy_firewall_revert_seconds: 300
+maildivvy_firewall_revert_unit: maildivvy-firewall-revert
+maildivvy_firewall_revert_program: /usr/local/sbin/maildivvy-firewall-revert
+maildivvy_firewall_saved: /etc/ufw/maildivvy-saved
+
+# How a change is confirmed before the timer is cancelled: `new-session`, a new
+# SSH session opened through the new rules (a control machine's run); `ssh-login`, a new
+# SSH login from `maildivvy_admin_ssh_source` that sshd accepts while the timer is armed
+# (a local run); or `console`, the administrator's explicit choice to confirm nothing, said
+# in the output. A local connection is refused `new-session` at step 1: its own session
+# never crosses the firewall. The same two in the docker_block role; a unit test holds them equal.
+maildivvy_firewall_confirmation: new-session
+maildivvy_admin_ssh_source: ""

@@ -1,0 +1,40 @@
+# Install step 2, one-disk mode: the store and index are directories on the filesystem
+# that holds /srv/maildivvy, which preflight found to be ext4, or xfs with reflink off
+# or consented to. Nothing is formatted and nothing is mounted.
+
+- name: Create the store and index directories, owned by vmail
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: vmail
+    group: vmail
+    mode: "0700"
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: The disk mode, for the record
+  ansible.builtin.set_fact:
+    maildivvy_disk_facts:
+      mode: single
+
+# --- read back -------------------------------------------------------------------
+
+- name: Read the filesystem that holds each data directory, one target per call
+  ansible.builtin.command:
+    argv: [findmnt, -n, -o, "TARGET,FSTYPE", --target, "{{ item.path }}"]
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: maildivvy_holding
+  changed_when: false
+
+- name: Each is on the filesystem preflight checked, not a mount of its own
+  ansible.builtin.assert:
+    that: >-
+      item.stdout.split() == [maildivvy_preflight.filesystem.target, maildivvy_preflight.filesystem.fstype]
+    fail_msg: "{{ item.item.path }} is on {{ item.stdout }}, not on {{ maildivvy_preflight.filesystem.target }}"
+    quiet: true
+  loop: "{{ maildivvy_holding.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"

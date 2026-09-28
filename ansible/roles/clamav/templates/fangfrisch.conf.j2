@@ -1,0 +1,38 @@
+# Maildivvy, install step 10: the community signature feed, on the host.
+#
+# ⛔ At exactly /etc/fangfrisch.conf: the shipped timer carries
+# ConditionPathExists=/etc/fangfrisch.conf, so a configuration anywhere else leaves a
+# timer that reads enabled and active and never fires.
+#
+# ⛔ It writes into the packaged daemon's own database directory, as
+# the user that daemon runs as, so there is one writer and one set of databases.
+#
+# ⚠️ This updater verifies a feed with a checksum served by THE SAME HOST as the
+# payload. That is not a signature and not a chain of trust; `https://` carries the
+# only transport trust there is, which is why the prefix is pinned to it.
+[DEFAULT]
+db_url = sqlite:///{{ maildivvy_fangfrisch_db }}
+local_directory = {{ maildivvy_clamav_database_dir }}
+log_level = INFO
+
+# ⚠️ Sanesecurity alone. The other feeds this tool can fetch have not been read against
+# what they cost in memory, and this machine is sized for ClamAV's running peak.
+[sanesecurity]
+enabled = {{ 'yes' if maildivvy_clamav_community_feed else 'no' }}
+prefix = {{ maildivvy_clamav_sanesecurity_prefix }}
+integrity_check = sha256
+
+[securiteinfo]
+enabled = no
+
+[malwarepatrol]
+enabled = no
+
+[urlhaus]
+enabled = no
+
+[interserver]
+enabled = no
+
+[fangfrischnews]
+enabled = no

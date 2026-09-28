@@ -1,0 +1,6 @@
+# Install step 17's one setting.
+
+# A directory for node_exporter's textfile collector. When set, the
+# health timer's every run also writes `maildivvy.prom` there, replaced whole, and the
+# step makes the directory the health user's. Empty: no Prometheus file is written.
+maildivvy_health_textfile_dir: ""

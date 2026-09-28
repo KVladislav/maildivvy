@@ -1,0 +1,13 @@
+# The container block's name in /etc/ufw/after.rules, and its pre-change copy.
+maildivvy_after_rules: /etc/ufw/after.rules
+maildivvy_after_rules_copy: /etc/ufw/after.rules.maildivvy-predocker
+maildivvy_docker_block: maildivvy DOCKER-USER
+
+# How long an edit of after.rules may stand before the timer restores the copy.
+maildivvy_docker_block_revert_seconds: 300
+maildivvy_docker_block_revert_unit: maildivvy-docker-block-revert
+
+# How the edit is confirmed before the timer is cancelled, as step 3's (the
+# firewall role's defaults say what each means). A unit test holds the two roles equal.
+maildivvy_firewall_confirmation: new-session
+maildivvy_admin_ssh_source: ""

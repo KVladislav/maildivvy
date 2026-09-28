@@ -1,0 +1,38 @@
+# Maildivvy, install step 8. Replaces the distribution's file of this name, whose
+# `!include auth-system.conf.ext` is a system passdb: kept beside it, every local Unix
+# account could sign in. The original is in conf.d.stock/.
+#
+# One lookup, on the whole login `<account>@<domain>`, in the view `mailbox_opens`,
+# for both passdb and userdb. A blocked person, a wrong
+# password, an unknown login and an unknown domain all get the same refusal:
+# the rule that a mailbox opens lives in the view and nowhere else.
+
+auth_allow_cleartext = no
+auth_mechanisms = plain login
+
+# No password in any form: `doveconf -n` prints one in clear. The unix socket, as
+# {{ maildivvy_dovecot_db_role }}, whose password is in the passfile alone, 0600 and
+# owned by the auth worker's user.
+pgsql {{ maildivvy_dovecot_db_socket }} {
+  parameters {
+    dbname = {{ maildivvy_dovecot_db_name }}
+    user = {{ maildivvy_dovecot_db_role }}
+    passfile = {{ maildivvy_dovecot_passfile }}
+  }
+}
+
+# Every block has its own name: blocks sharing one merge silently, and
+# every block names its driver, which 2.4 requires.
+passdb maildivvy_passdb {
+  driver = sql
+  sql_driver = pgsql
+  sql_query = SELECT login AS user, password FROM mailbox_opens WHERE login = '%{user}'
+}
+
+# No uid or gid: mail_uid fixes them. The index and control paths come
+# from the view, the one derivation of every path.
+userdb maildivvy_userdb {
+  driver = sql
+  sql_driver = pgsql
+  sql_query = SELECT login AS user, home, index_path AS mail_index_path, control_path AS mail_control_path FROM mailbox_opens WHERE login = '%{user}'
+}

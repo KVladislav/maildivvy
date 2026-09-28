@@ -1,0 +1,9 @@
+# Install step 9: what an operator may override. Everything else the product fixes
+# (ansible/roles/postfix/vars/main.yml).
+
+# The families actually served. `ipv4` is what makes the port 465
+# read-back a single line; a machine given an IPv6 address serves `all`.
+maildivvy_postfix_inet_protocols: ipv4
+
+# The floor for both ends of TLS, as Dovecot's `ssl_min_protocol` is for 993.
+maildivvy_postfix_tls_protocols: ">=TLSv1.2"

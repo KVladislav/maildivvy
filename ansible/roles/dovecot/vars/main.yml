@@ -1,0 +1,58 @@
+# Install step 8: Dovecot. The product fixes its paths; none of this is a setting.
+
+maildivvy_dovecot_packages: [dovecot-core, dovecot-imapd, dovecot-pgsql, dovecot-flatcurve, dovecot-sieve]
+
+# The files of conf.d this step writes. Those the distribution ships are replaced by
+# name, their originals kept once in conf.d.stock/ as the rollback.
+maildivvy_dovecot_conf:
+  - 10-auth.conf
+  - 10-mail.conf
+  - 10-master.conf
+  - 10-ssl.conf
+  - 15-mailboxes.conf
+  - 20-acl.conf
+  - 20-fts.conf
+  - 20-sieve.conf
+  - 90-fts.conf
+  - 90-fts-flatcurve.conf
+maildivvy_dovecot_stock: /etc/dovecot/conf.d.stock
+
+# The database: the unix socket, as the daemon's own role, its password only
+# in a passfile 0600 owned by the user the SQL auth worker runs as.
+maildivvy_dovecot_db_name: maildivvy
+maildivvy_dovecot_db_role: maildivvy_dovecot
+maildivvy_dovecot_db_socket: /var/run/postgresql
+maildivvy_dovecot_passfile: /etc/dovecot/maildivvy.pgpass
+maildivvy_dovecot_auth_user: dovecot
+
+maildivvy_dovecot_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
+maildivvy_dovecot_key: /etc/ssl/private/{{ maildivvy_cert_name }}.key
+maildivvy_dovecot_postfix_auth: /var/spool/postfix/private/auth
+maildivvy_dovecot_pipe_bin_dir: /opt/maildivvy/bin
+
+# The Sent hook: its script and the compiled binary Dovecot loads,
+# installed in this step because this step binds them. The program itself
+# is `{{ maildivvy_dovecot_pipe_bin_dir }}/maildivvy-sent-hook`, deployed by the
+# programs role, which runs before this step.
+maildivvy_dovecot_sieve_dir: /etc/dovecot/sieve
+maildivvy_dovecot_sent_script: /etc/dovecot/sieve/sent.sieve
+maildivvy_dovecot_sent_binary: /etc/dovecot/sieve/sent.svbin
+maildivvy_dovecot_sent_hook: maildivvy-sent-hook
+
+# The effective values the step reads back with `doveconf -h`.
+maildivvy_dovecot_expected:
+  protocols: imap
+  mail_driver: maildir
+  mail_inbox_path: "%{home}/Maildir"
+  mailbox_list_layout: maildir++
+  mailbox_list_storage_escape_char: "^"
+  mail_uid: "{{ maildivvy_vmail_uid | string }}"
+  mail_gid: "{{ maildivvy_vmail_gid | string }}"
+  maildir_broken_filename_sizes: "yes"
+  auth_allow_cleartext: "no"
+  ssl: required
+  ssl_min_protocol: TLSv1.2
+  fts_autoindex: "no"
+  fts_search_read_fallback: "no"
+  acl_driver: vfile
+  acl_defaults_from_inbox: "yes"

@@ -1,0 +1,112 @@
+# Install step 12: mpop 1.4.23, built on the machine from the author's tarball once it
+# matches the pinned sha256, installed as the only mpop
+# before anything renders a configuration for it. The build's packages,
+# compiler included, are purged after it; the binary's libraries are marked manual so
+# no autoremove can take them. The proof is the version of the binary the
+# fetch runner will execute.
+
+- name: Read the installed mpop's version
+  ansible.builtin.command: "{{ maildivvy_mpop }} --version"
+  register: maildivvy_mpop_installed
+  changed_when: false
+  failed_when: false
+
+- name: Build and install the pinned mpop
+  when: (maildivvy_mpop_installed.stdout_lines | default([''], true))[0] != maildivvy_mpop_expected
+  block:
+    - name: List the packages installed before the build
+      ansible.builtin.command: dpkg-query -W -f '${db:Status-Status} ${Package}\n'
+      register: maildivvy_mpop_before
+      changed_when: false
+
+    - name: Install the build's packages
+      ansible.builtin.apt:
+        name: "{{ maildivvy_mpop_build_packages }}"
+        install_recommends: false
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Make a build directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -mpop
+      register: maildivvy_mpop_tmp
+
+    - name: Download the tarball; a sha256 other than the pin is removed, never unpacked
+      ansible.builtin.get_url:
+        url: "{{ maildivvy_mpop_release_url }}/mpop-{{ maildivvy_mpop_version }}.tar.xz"
+        dest: "{{ maildivvy_mpop_tmp.path }}/mpop.tar.xz"
+        checksum: "sha256:{{ maildivvy_mpop_sha256 }}"
+        mode: "0600"
+
+    - name: Unpack the tarball
+      ansible.builtin.unarchive:
+        src: "{{ maildivvy_mpop_tmp.path }}/mpop.tar.xz"
+        dest: "{{ maildivvy_mpop_tmp.path }}"
+        remote_src: true
+
+    - name: Configure with GnuTLS, GNU SASL and IDN, without keyring or mpopd
+      ansible.builtin.command:
+        argv: "{{ ['./configure'] + maildivvy_mpop_configure }}"
+        chdir: "{{ maildivvy_mpop_tmp.path }}/mpop-{{ maildivvy_mpop_version }}"
+      changed_when: true
+
+    - name: Compile
+      ansible.builtin.command:
+        cmd: make
+        chdir: "{{ maildivvy_mpop_tmp.path }}/mpop-{{ maildivvy_mpop_version }}"
+      changed_when: true
+
+    - name: Install the binary 0755 root:root
+      ansible.builtin.copy:
+        src: "{{ maildivvy_mpop_tmp.path }}/mpop-{{ maildivvy_mpop_version }}/src/mpop"
+        dest: "{{ maildivvy_mpop }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Keep the binary's libraries, purge what only the build brought
+      maildivvy_runtime:
+        binary: "{{ maildivvy_mpop }}"
+        build_packages: "{{ maildivvy_mpop_build_packages }}"
+        installed_before: "{{ maildivvy_mpop_before.stdout_lines | select('match', '^installed ') | map('split', ' ') | map('last') | list }}"
+  always:
+    - name: Remove the build directory
+      ansible.builtin.file:
+        path: "{{ maildivvy_mpop_tmp.path }}"
+        state: absent
+      when: maildivvy_mpop_tmp.path is defined
+
+- name: Read the version of the binary the fetch will run, as its user
+  ansible.builtin.command: runuser -u vmail -- {{ maildivvy_mpop }} --version
+  register: maildivvy_mpop_readback
+  changed_when: false
+
+- name: It is the pinned release, with GnuTLS, GNU SASL, IDN and no keyring
+  ansible.builtin.assert:
+    that:
+      - maildivvy_mpop_readback.stdout_lines[0] == maildivvy_mpop_expected
+      - "'TLS/SSL library: GnuTLS' in maildivvy_mpop_readback.stdout_lines"
+      - "maildivvy_mpop_readback.stdout is search('Authentication library: GNU SASL')"
+      - "'IDN support: enabled' in maildivvy_mpop_readback.stdout_lines"
+      - "'Keyring support: none' in maildivvy_mpop_readback.stdout_lines"
+    fail_msg: "{{ maildivvy_mpop }} is not the expected build: {{ maildivvy_mpop_readback.stdout_lines }}"
+    quiet: true
+
+- name: Remove the distribution's mpop, and its mpopd, now the built one is proved
+  ansible.builtin.apt:
+    name: mpop
+    state: absent
+    purge: true
+
+- name: The libraries stay manually installed and none is auto-removable
+  maildivvy_runtime:
+    binary: "{{ maildivvy_mpop }}"
+
+- name: Exactly one mpop, and no mpopd, on the host
+  ansible.builtin.shell: >-
+    find / -xdev \( -name mpop -o -name mpopd \) -type f -perm -u+x 2>/dev/null; true
+  register: maildivvy_mpop_found
+  changed_when: false
+  failed_when: maildivvy_mpop_found.stdout_lines != [maildivvy_mpop]

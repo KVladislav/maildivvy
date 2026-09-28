@@ -1,0 +1,7 @@
+# Fixed by the product, not settings (docs/architecture.md § Filesystems and paths).
+# Which device each is, or that there is one disk, comes from preflight.
+maildivvy_srv: /srv/maildivvy
+maildivvy_filesystems:
+  - {role: store, path: /srv/maildivvy/store}
+  - {role: index, path: /srv/maildivvy/index}
+maildivvy_swap_priority: 10

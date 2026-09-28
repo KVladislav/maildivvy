@@ -1,0 +1,22 @@
+#!/usr/bin/python3
+"""Collect mail from every external mailbox. See fetch/runner.py.
+
+A timer runs this every three minutes as the mail owner; a request handler runs it with
+`--only <id> --auth-only` to check one saved credential.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.fetch.runner import main  # noqa: E402
+
+sys.exit(main())

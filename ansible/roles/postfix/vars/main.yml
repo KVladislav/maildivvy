@@ -1,0 +1,139 @@
+# Install step 9: Postfix's configuration. The product fixes its own paths and
+# settings; only defaults/main.yml holds anything an operator may change.
+
+# `postfix-pgsql` is the lookup maps; `libsasl2-modules` is the SASL client's PLAIN and
+# LOGIN, without which the relay's AUTH finds no mechanism.
+maildivvy_postfix_packages: [postfix, postfix-pgsql, libsasl2-modules]
+
+maildivvy_postfix_db_name: maildivvy
+maildivvy_postfix_db_role: maildivvy_postfix
+# ⛔ over TCP, and by address: the chroot has no PostgreSQL socket and an empty
+# /etc/hosts, so the passfile's first field is this same text.
+maildivvy_postfix_db_host: 127.0.0.1
+
+maildivvy_postfix_queue: /var/spool/postfix
+# One file, two valid paths, never two copies that drift: `smtpd` runs chrooted and
+# resolves the map's `passfile=` against the queue directory, `postmap` does not.
+maildivvy_postfix_passfile: /etc/postfix/maildivvy.pgpass
+maildivvy_postfix_real_passfile: "{{ maildivvy_postfix_queue }}/etc/postfix/maildivvy.pgpass"
+
+# The five views of docs/architecture.md § Views, one lookup map each. Postfix reads
+# views and no table at all.
+maildivvy_postfix_maps:
+  - {name: sender-login, view: postfix_sender_login}
+  - {name: sasl-password, view: postfix_sasl_password}
+  - {name: generic, view: postfix_generic}
+  - {name: transport, view: postfix_transport}
+  - {name: relayhost, view: postfix_relayhost}
+maildivvy_postfix_map_dir: /etc/postfix
+maildivvy_postfix_map_prefix: maildivvy-
+
+# ⛔ The text is part of the value, not a gloss on it: it is what a refusal carries
+# back, and what the read-back compares.
+maildivvy_postfix_error: "error:no per-sender transport for this sender"
+
+maildivvy_postfix_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
+maildivvy_postfix_key: /etc/ssl/private/{{ maildivvy_cert_name }}.key
+maildivvy_postfix_cert_program: /usr/local/sbin/maildivvy-cert
+
+# --- main.cf, written by postconf and never by appending ------------------
+#
+# ⛔ THE DEFAULT TRANSPORT IS `error` AND SO IS THE RELAY TRANSPORT. Nothing sends
+# unless a per-sender map gives that sender a transport, which is what stops a
+# misconfiguration turning this machine into an open relay for its own users. The
+# repair a reader reaches for instead - a deliverable default transport - opens every
+# sender at once, and configuring a relay host does not override the guard, because
+# the transport is chosen before the next hop.
+maildivvy_postfix_main:
+  myhostname: "{{ maildivvy_cert_name }}"
+  mydestination: ""
+  relayhost: ""
+  inet_interfaces: all
+  inet_protocols: "{{ maildivvy_postfix_inet_protocols }}"
+  smtputf8_enable: "no"
+
+  default_transport: "{{ maildivvy_postfix_error }}"
+  relay_transport: "{{ maildivvy_postfix_error }}"
+
+  # The five per-sender maps. ⛔ Keyed BY SENDER, never by host: the lookup falls back
+  # to the relay host on a miss, so with several mailboxes at one provider a missing
+  # per-sender key authenticates as some other mailbox and sends under its identity,
+  # to a real recipient, with nothing in the log.
+  sender_dependent_default_transport_maps: "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}transport.cf"
+  sender_dependent_relayhost_maps: "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}relayhost.cf"
+  smtp_sasl_password_maps: "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}sasl-password.cf"
+  smtpd_sender_login_maps: "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}sender-login.cf"
+  # ⚠️ the rewrite is the SMTP CLIENT's, never cleanup's: a canonical rewrite runs
+  # before the per-sender maps are read and collapses the key they are looked up by,
+  # so the wrong relay and the wrong credential are chosen.
+  smtp_generic_maps: "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}generic.cf"
+
+  smtp_sender_dependent_authentication: "yes"
+  smtp_sasl_auth_enable: "yes"
+  smtp_sasl_security_options: noanonymous
+  # ⛔ `secure`, never `encrypt`: the provider's certificate is verified against
+  # the distribution's CA bundle and the host name the mailbox is configured with before
+  # its password is sent. `encrypt` takes any certificate, so anyone on the path could
+  # present their own and collect every mailbox's password from AUTH PLAIN. The bundle is
+  # a FILE, read before the client enters its chroot; a CA directory would be looked up
+  # inside the chroot, where it is not. Measured on 3.10.6: a host configured as an IP
+  # address never matches, not even a certificate that names that address.
+  smtp_tls_security_level: secure
+  smtp_tls_secure_cert_match: nexthop
+  smtp_tls_CAfile: /etc/ssl/certs/ca-certificates.crt
+  smtp_tls_mandatory_protocols: "{{ maildivvy_postfix_tls_protocols }}"
+
+  # ⛔ Only root may put mail in the queue by `sendmail`. The pickup path has no
+  # From check and no scan, and the per-sender maps would relay any sender it names with
+  # that mailbox's own provider password; nothing of the product submits mail locally.
+  authorized_submit_users: root
+
+  # ⛔ without these 465 serves the distribution's snakeoil pair and every client
+  # refuses it by name. They are the deploy hook's destinations, not lego's
+  # own store, which `postfix` cannot read.
+  smtpd_tls_cert_file: "{{ maildivvy_postfix_cert }}"
+  smtpd_tls_key_file: "{{ maildivvy_postfix_key }}"
+  smtpd_tls_protocols: "{{ maildivvy_postfix_tls_protocols }}"
+  smtpd_tls_mandatory_protocols: "{{ maildivvy_postfix_tls_protocols }}"
+
+# --- master.cf: the one listener, and the client for implicit TLS -------------------------
+#
+# ⛔ The distribution's bare `smtp inet` binds every address of `inet_interfaces`; it is
+# taken away by name, or 25 listens on the LAN. The loopback listener the
+# source kept for local submission is taken away too (reversing):
+# it relayed any sender a local process named, with no From check and no scan, and
+# nothing of the product submits mail locally.
+maildivvy_postfix_absent: [smtp/inet, 127.0.0.1:smtp/inet]
+
+maildivvy_postfix_services:
+  # Submission, and the only port the network reaches: 465 in wrapper mode, SASL
+  # through Dovecot's socket inside the queue directory, authenticated clients only.
+  # 587 stays closed.
+  submissions/inet:
+    definition: submissions inet n - y - - smtpd
+    # ⛔ install step 14 owns `smtpd_milters` here and writes it only once the daemon has
+    # been proved to answer; this step neither writes it nor takes it away on a re-run.
+    keep: [smtpd_milters]
+    overrides:
+      syslog_name: postfix/submissions
+      smtpd_tls_wrappermode: "yes"
+      smtpd_tls_security_level: encrypt
+      smtpd_sasl_auth_enable: "yes"
+      smtpd_sasl_type: dovecot
+      smtpd_sasl_path: private/auth
+      smtpd_tls_auth_only: "yes"
+      smtpd_client_restrictions: permit_sasl_authenticated,reject
+      # ⛔ `reject_sender_login_mismatch` answers DUNNO ON A MATCH, so a bare reject
+      # after it refuses the very messages it just approved. The explicit permit is
+      # what makes the pair work.
+      smtpd_sender_restrictions: reject_sender_login_mismatch,permit_sasl_authenticated,reject
+      smtpd_recipient_restrictions: permit_sasl_authenticated,reject
+
+  # The SMTP client for a provider on 465, which speaks TLS from the first byte (RFC
+  # 8314): `postfix_transport` names it for a mailbox on that port. The plain `smtp`
+  # client waits for a greeting in clear text there, and the provider waits for a TLS
+  # hello, so nothing is ever sent. The security level is main.cf's `secure`.
+  smtps/unix:
+    definition: smtps unix - - y - - smtp
+    overrides:
+      smtp_tls_wrappermode: "yes"

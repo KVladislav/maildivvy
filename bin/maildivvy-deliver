@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+"""Scan and mark one message, then file it in its domain's archive. See deliver/filter.py.
+
+mpop pipes every retrieved message into this program as the mail owner; nothing else
+runs it. It never rejects - it files - and it exits 75 only while the antivirus is
+unreachable.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.deliver.filter import main  # noqa: E402
+
+sys.exit(main())

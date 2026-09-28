@@ -1,0 +1,108 @@
+# Install step 4: the container firewall block in /etc/ufw/after.rules, before Docker
+# exists. An edit keeps a pre-change copy and runs under a
+# self-reverting timer that restores it. Whether or not anything changed,
+# the kernel's DOCKER-USER is compared with the file rule by rule, and a missing chain
+# fails the step: the block fails open when it is lost.
+
+- name: Would the block change after.rules? (read with privilege)
+  ansible.builtin.blockinfile:
+    path: "{{ maildivvy_after_rules }}"
+    marker: "# {mark} {{ maildivvy_docker_block }}"
+    block: "{{ lookup('ansible.builtin.template', 'docker-user.rules.j2') }}"
+  check_mode: true
+  register: maildivvy_docker_block_check
+
+- name: Edit after.rules under the self-reverting timer
+  when: maildivvy_docker_block_check is changed
+  block:
+    - name: Keep a pre-change copy of after.rules
+      ansible.builtin.copy:
+        src: "{{ maildivvy_after_rules }}"
+        dest: "{{ maildivvy_after_rules_copy }}"
+        remote_src: true
+        mode: preserve
+
+    - name: Clear a revert unit an earlier run left behind
+      ansible.builtin.shell: |
+        systemctl stop {{ maildivvy_docker_block_revert_unit }}.timer {{ maildivvy_docker_block_revert_unit }}.service
+        systemctl reset-failed {{ maildivvy_docker_block_revert_unit }}.timer {{ maildivvy_docker_block_revert_unit }}.service
+        true
+      changed_when: false
+
+    - name: Arm the self-revert that restores the copy, before editing
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - "--on-active={{ maildivvy_docker_block_revert_seconds }}"
+          - "--unit={{ maildivvy_docker_block_revert_unit }}"
+          - /bin/sh
+          - -c
+          - "cp -p {{ maildivvy_after_rules_copy }} {{ maildivvy_after_rules }} && /usr/sbin/ufw reload"
+
+    - name: Write the block into after.rules
+      ansible.builtin.blockinfile:
+        path: "{{ maildivvy_after_rules }}"
+        marker: "# {mark} {{ maildivvy_docker_block }}"
+        block: "{{ lookup('ansible.builtin.template', 'docker-user.rules.j2') }}"
+
+    - name: Reload ufw, which creates DOCKER-USER from the block
+      ansible.builtin.command: ufw reload
+
+# --- read back ---------------------------------------------------------------------
+
+- name: DOCKER-USER matches the block in after.rules, rule by rule
+  maildivvy_chains:
+    chains: [DOCKER-USER, maildivvy-docker-deny]
+    file: "{{ maildivvy_after_rules }}"
+    block: "{{ maildivvy_docker_block }}"
+    ordered: true
+
+- name: Close the SSH connection in use
+  ansible.builtin.meta: reset_connection
+  when: maildivvy_docker_block_check is changed and maildivvy_firewall_confirmation == 'new-session'
+
+- name: Open a new session after the reload
+  ansible.builtin.ping:
+  when: maildivvy_firewall_confirmation == 'new-session'
+
+- name: Read whether a revert timer is armed
+  ansible.builtin.command: systemctl is-active {{ maildivvy_docker_block_revert_unit }}.timer
+  register: maildivvy_docker_block_timer
+  changed_when: false
+  failed_when: false
+
+# As step 3 on a local run: the reload is confirmed by a new SSH login from the
+# administrator's address while the timer is armed, or the timer restores the copy.
+- name: "Waiting for a new SSH login from {{ maildivvy_admin_ssh_source }} after the reload"
+  maildivvy_ssh_login:
+    source: "{{ maildivvy_admin_ssh_source }}"
+    unit: "{{ maildivvy_docker_block_revert_unit }}"
+    seconds: "{{ maildivvy_docker_block_revert_seconds }}"
+  when: maildivvy_firewall_confirmation == 'ssh-login' and maildivvy_docker_block_timer.stdout == 'active'
+
+- name: Say that no SSH login confirmed the reload, by the administrator's console-only choice
+  ansible.builtin.debug:
+    msg: >-
+      console-only: the container block's reload was not confirmed by any SSH login, as the
+      settings chose; SSH after the reload is not proved
+  when: maildivvy_firewall_confirmation == 'console' and maildivvy_docker_block_timer.stdout == 'active'
+
+# ⛔ Never on a local connection's own session, as step 3.
+- name: Cancel the self-revert, only now the chain is read back
+  ansible.builtin.command: systemctl stop {{ maildivvy_docker_block_revert_unit }}.timer
+  when:
+    - maildivvy_docker_block_timer.stdout == 'active'
+    - maildivvy_firewall_confirmation != 'new-session'
+      or ansible_connection | default('ssh') not in ['local', 'ansible.builtin.local']
+
+- name: Read after.rules' owner and mode
+  ansible.builtin.stat:
+    path: "{{ maildivvy_after_rules }}"
+  register: maildivvy_after_rules_stat
+
+- name: after.rules is still 0640 root:root
+  ansible.builtin.assert:
+    that:
+      - maildivvy_after_rules_stat.stat.mode == '0640'
+      - maildivvy_after_rules_stat.stat.pw_name == 'root' and maildivvy_after_rules_stat.stat.gr_name == 'root'
+    quiet: true

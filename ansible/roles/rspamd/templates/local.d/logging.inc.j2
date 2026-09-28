@@ -1,0 +1,5 @@
+# The scanner writes to its own output, which the container runtime forwards to the
+# journal, so recreating the container - which is what a repin does - keeps the readings
+# that explain a score.
+type = "console";
+level = "notice";

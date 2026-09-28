@@ -1,0 +1,89 @@
+# Maildivvy, install step 10: clamd from the distribution.
+#
+# ⛔ This file is the product's, not the package's: `clamav-daemon/debconf` is false,
+# so the package's postinst leaves it alone instead of regenerating it from debconf
+# answers. Change it here, in the role's template, and run the install again.
+#
+# ⛔ Nothing that MOVES, REMOVES or COPIES a file. The delivery filter
+# and the milter hand this daemon bytes over the socket, never a path, and the store
+# is readable only by the mail owner: a scanner with no reason to write anywhere
+# cannot touch mail through a misconfiguration.
+
+LocalSocket {{ maildivvy_clamav_socket }}
+LocalSocketGroup {{ maildivvy_clamav_user }}
+# 0660: the mail owner and the milter open it as members of the group;
+# the package's own 666 would open it to every account on the machine.
+LocalSocketMode 660
+FixStaleSocket true
+User {{ maildivvy_clamav_user }}
+
+# ⛔ Two limits that behave differently: over StreamMaxLength a stream gets an error
+# and a closed connection - no verdict - while the same bytes under MaxFileSize are
+# answered OK. Our own gate takes the lower of the two before any socket is
+# contacted.
+StreamMaxLength {{ maildivvy_clamav_stream_max }}
+MaxFileSize {{ maildivvy_clamav_file_max }}
+MaxScanSize 100M
+# ⛔ A scan the daemon cuts short at MaxFileSize, MaxScanSize, MaxRecursion or MaxScanTime
+# is answered `OK` unless this is set (measured on 1.5.4: an archive nested 25 deep read
+# clean). With it the answer is `Heuristics.Limits.Exceeded.<limit> FOUND`, which the
+# product reads as unscanned, never as clean nor as infected.
+AlertExceedsMax yes
+
+# ⛔ A concurrent reload keeps two databases resident.
+ConcurrentDatabaseReload {{ maildivvy_clamav_concurrent_reload }}
+
+DatabaseDirectory {{ maildivvy_clamav_database_dir }}
+SelfCheck 3600
+# The updater's notification after a signature update, and the version reading health
+# takes from the running daemon. Shutdown and stats stay off.
+EnableReloadCommand yes
+EnableVersionCommand yes
+EnableShutdownCommand false
+EnableStatsCommand false
+
+# The journal is the machine's log (docs/architecture.md § Filesystems and
+# paths). Running in the foreground under systemd, the daemon's own output is the unit's
+# journal: no LogFile to rotate, and no LogSyslog, which would write every line twice
+# (measured 2026-09-20). The journal timestamps each line, so the daemon does not.
+LogTime false
+LogClean false
+LogVerbose false
+
+Foreground true
+ScanMail true
+ScanArchive true
+ScanPE true
+ScanELF true
+ScanOLE2 true
+ScanPDF true
+ScanHTML true
+ScanSWF true
+ScanXMLDOCS true
+ScanHWP3 true
+AlgorithmicDetection true
+PhishingSignatures true
+PhishingScanURLs true
+FollowDirectorySymlinks false
+FollowFileSymlinks false
+CrossFilesystems true
+DetectPUA false
+LeaveTemporaryFiles false
+ExitOnOOM false
+MaxDirectoryRecursion 15
+MaxRecursion 16
+MaxFiles 10000
+MaxScanTime 120000
+MaxThreads 12
+MaxConnectionQueueLength 15
+MaxQueue 100
+ReadTimeout 180
+CommandReadTimeout 30
+SendBufTimeout 200
+IdleTimeout 30
+ExtendedDetectionInfo true
+AllowAllMatchScan true
+Bytecode true
+BytecodeSecurity TrustSigned
+BytecodeTimeout 60000
+CVDCertsDirectory /etc/clamav/certs

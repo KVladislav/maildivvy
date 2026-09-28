@@ -1,0 +1,42 @@
+# Managed by Ansible (roles/health). Install step 17.
+# One system helper per connection, as root, for what no group reads: the firewall's rules
+# (0640 root) and the kernel's ruleset, the container runtime and fail2ban's sockets, the
+# outbound queue behind Postfix's public/, and the milter's socket in Postfix's queue.
+# It takes nothing but the names of its
+# readings, from a closed list, runs only programs that list and inspect, and writes nothing.
+[Unit]
+Description=Maildivvy: read the firewall, the ban, the milter and the scanner for health
+Documentation=file://{{ maildivvy_health_opt }}/lib/maildivvy/health/helper.py
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# The milter's socket is 0660 maildivvy-milter:postfix in a 2750 directory: Postfix's group
+# crosses to it and may connect, which is the one thing a negotiation needs.
+SupplementaryGroups=postfix
+ExecStart={{ maildivvy_health_helper }} system
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# the docker client keeps no configuration here: /root is not reachable
+Environment=DOCKER_CONFIG=/run/maildivvy-health-no-docker-config
+TimeoutStartSec=300
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# It writes nothing.
+ReadWritePaths=
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+# ⛔ TWO CAPABILITIES, AND BOTH READ. CAP_NET_ADMIN is what iptables needs to LIST the
+# kernel's ruleset over netlink; CAP_DAC_READ_SEARCH crosses Postfix's `public/`
+# (postdrop's) to ask showq for the queue. Nothing here is written with either.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

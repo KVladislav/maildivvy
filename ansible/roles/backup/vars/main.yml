@@ -1,0 +1,24 @@
+# Install step 16: the backup. The product fixes its own paths;
+# none of this is a setting. The two directories are src/maildivvy/backup's BACKUPS and
+# STATUS's parent, and a unit test holds the spellings together.
+
+# The runs: root's alone, 0700, every file in it 0600.
+maildivvy_backup_dir: /var/backups/maildivvy
+# What the rest of the machine may read about the newest run: its name, what it held, and
+# what the store copy did. No secret is in it; the pipeline's enable gate reads it.
+maildivvy_backup_status_dir: /var/lib/maildivvy/backup
+maildivvy_backup_status: "{{ maildivvy_backup_status_dir }}/status.json"
+maildivvy_backup_conf: /etc/maildivvy/backup.conf
+maildivvy_backup_opt: /opt/maildivvy
+maildivvy_backup_program: "{{ maildivvy_backup_opt }}/bin/maildivvy-backup"
+maildivvy_backup_unit: maildivvy-backup.service
+maildivvy_backup_timer: maildivvy-backup.timer
+
+# Daily, with up to an hour of jitter, and a machine that was down at the time catches up
+# when it is up (the timer; Persistent= acts on a calendar only).
+maildivvy_backup_calendar: daily
+maildivvy_backup_jitter: 1h
+# A run waits for a fetch and a pass already going, each bounded at an hour by its own
+# unit, and then runs the operator's copy of the store: six hours before systemd stops it,
+# and the program resumes collection on its way out.
+maildivvy_backup_run_timeout: 21600

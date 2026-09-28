@@ -1,0 +1,9 @@
+# ⛔ OFF. Bayes wants a Redis-compatible backend, which is a daemon nobody has chosen,
+# and it could only be global: there is no recipient at ingest, so per-user training is
+# impossible rather than merely undesirable.
+#
+# ⚠️ Measured 2026-09-20 on 4.2.0: this keeps every BAYES symbol out of the answer, but
+# the classifier is still called once per message and logs
+# `rspamd_redis_process_tokens: call to redis failed`. That line is the classifier being
+# off, not a scanner failure.
+enabled = false;

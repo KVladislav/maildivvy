@@ -1,0 +1,15 @@
+{% if not maildivvy_rspamd_rbls %}
+# ⛔ OFF UNTIL A RESOLVER THAT ANSWERS DNSBLs IS CHOSEN. Through a forwarding resolver
+# every public list answers `127.255.255.254` - "Error: open resolver" - which is inside
+# the `127.0.0.0/8` range a DNSBL uses to mean LISTED, so every message would read as
+# listed on every list at once, in observe mode, where nobody would see it.
+# Measured on this machine by the step itself.
+#
+# Turning them on is `maildivvy_rspamd_rbls: true`, and the step then refuses to go on
+# while this machine's resolver still answers for an address that is not listed.
+enabled = false;
+{% else %}
+# DNSBLs are on: the step has read this machine's resolver answering nothing for an
+# address that is not listed, which is what makes a "listed" answer mean anything.
+# The lists themselves stay the image's.
+{% endif %}

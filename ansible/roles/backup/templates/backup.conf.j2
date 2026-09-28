@@ -1,0 +1,7 @@
+# Managed by Ansible (roles/backup). Install step 16. Read by maildivvy-backup.
+# How many runs are kept: counted, never aged.
+keep={{ maildivvy_backup_keep }}
+# The operator's store-copy command, run as root after the dump and
+# before collection resumes, in a transient unit of its own; MAILDIVVY_BACKUP_STAMP names
+# the run it pairs with. The copy must keep hardlinks. Empty: none.
+store_copy={{ maildivvy_backup_store_copy }}

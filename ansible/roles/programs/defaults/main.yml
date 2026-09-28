@@ -1,0 +1,10 @@
+# The programs role's one default: the fetch period, in whole minutes (every
+# three). It is a role default, not an install setting: step 1 does not ask for it, and
+# overriding it takes the same settings file as any other role default. The fetch timer
+# renders its calendar and its description from it, and the interface reads its "look
+# again by" off that installed timer, so nothing spells it twice.
+#
+# ⚠️ Before shortening it against a provider, read that provider's LOGIN-DELAY and
+# measure whether it enforces it. An enforced delay shows as refused
+# logins, which read as a changed password.
+maildivvy_fetch_minutes: 3

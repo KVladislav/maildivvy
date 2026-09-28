@@ -1,0 +1,40 @@
+# Install step 14: the submission milter. The product fixes its own paths; nothing here
+# is a setting.
+
+# pymilter, the distribution's: a C extension, so its import is proved as
+# an unprivileged user before any socket is bound.
+maildivvy_milter_packages: [python3-milter]
+
+maildivvy_milter_user: maildivvy-milter
+maildivvy_milter_unit: maildivvy-milter.service
+
+# ⛔ INSIDE POSTFIX'S QUEUE. `submissions` is chrooted to /var/spool/postfix, so a
+# socket at /run/… comes up correctly and no submission can ever reach it. Postfix names
+# it relatively, from inside the jail.
+maildivvy_milter_queue: /var/spool/postfix
+maildivvy_milter_socket_dir: "{{ maildivvy_milter_queue }}/maildivvy"
+maildivvy_milter_socket: "{{ maildivvy_milter_socket_dir }}/milter.sock"
+maildivvy_milter_binding: "unix:maildivvy/milter.sock"
+# The rollback drill's binding: a socket nothing listens on, so the fail-closed default
+# is exercised before the real one is written.
+maildivvy_milter_nonexistent: "unix:maildivvy/does-not-exist.sock"
+
+maildivvy_milter_opt: /opt/maildivvy
+maildivvy_milter_etc: /etc/maildivvy
+maildivvy_milter_db_conf: "{{ maildivvy_milter_etc }}/milter/db.conf"
+maildivvy_milter_clamd_socket: /run/clamav/clamd.ctl
+maildivvy_milter_program: "{{ maildivvy_milter_opt }}/bin/maildivvy-milter"
+# The step's own submission probe, for the rollback drill and its two controls.
+maildivvy_milter_probe_program: /usr/local/sbin/maildivvy-submission-probe
+
+# ⛔ fail closed: a milter that will not start refuses every submission, which is
+# intended - and is why nothing is bound until the daemon has answered.
+# The global value stays empty: a global binding also puts the milter in front of
+# the pickup path, where nothing authenticates and every message would be refused.
+maildivvy_milter_main:
+  milter_default_action: tempfail
+  milter_protocol: 6
+  smtpd_milters: ""
+  non_smtpd_milters: ""
+
+maildivvy_milter_service: submissions/inet

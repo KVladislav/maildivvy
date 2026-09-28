@@ -1,0 +1,38 @@
+# Maildivvy, install step 8: what the Sent hook's Sieve binding needs loaded, and the
+# binding itself, written in the same step as the script it names. Before
+# the real hook existed the step bound a probe instead and read what arrives.
+sieve_plugins {
+  sieve_imapsieve = yes
+  sieve_extprograms = yes
+}
+
+# `pipe`, for global scripts only; no `+` prefix, which 2.4 would take as part of the
+# name. `pipe` reads sieve_pipe_bin_dir; sieve_execute_bin_dir is not
+# set, so the load-bearing one is plain.
+sieve_global_extensions {
+  vnd.dovecot.pipe = yes
+}
+sieve_pipe_bin_dir = {{ maildivvy_dovecot_pipe_bin_dir }}
+
+# The IMAP side: without imap_sieve a bound script is never invoked.
+# Added to the global list, which this boolean list extends.
+protocol imap {
+  mail_plugins {
+    imap_sieve = yes
+  }
+}
+
+# The Sent hook's binding, written with the script it names, never a step apart:
+# a binding pointing at a script that is not there yet leaves a window in
+# which every APPEND to Sent references a missing file. The one folder that advertises
+# `\Sent` is the only one watched; appends to any other are ignored, and the
+# hook refuses any other mailbox for itself as well.
+namespace inbox {
+  mailbox Sent {
+    sieve_script maildivvy_sent {
+      type = before
+      cause = append
+      path = {{ maildivvy_dovecot_sent_script }}
+    }
+  }
+}

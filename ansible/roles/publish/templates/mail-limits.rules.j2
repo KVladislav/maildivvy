@@ -1,0 +1,27 @@
+{#
+  The rate limits' block in ufw's before rules, for one family (maildivvy_publish_family).
+  With maildivvy_publish_restore, the same chain as an iptables-restore document, without
+  the jump, to load it into the running firewall; the jump is inserted on its own.
+#}
+{% set family = maildivvy_publish_family | int %}
+{% set restore = maildivvy_publish_restore | default(false) %}
+{% set before = 'ufw-before-input' if family == 4 else 'ufw6-before-input' %}
+{% set chain = maildivvy_publish_chain %}
+{% if restore %}
+*filter
+{% endif %}
+:{{ chain }} - [0:0]
+{% if not restore %}
+-A {{ before }} -p tcp -m multiport --dports {{ maildivvy_publish_ports | join(',') }} -m conntrack --ctstate NEW -j {{ chain }}
+{% endif %}
+-A {{ chain }} -i lo -j RETURN
+{% for net in maildivvy_admin_networks if (':' in net) == (family == 6) %}
+-A {{ chain }} -s {{ net }} -j RETURN
+{% endfor %}
+{% for port in maildivvy_publish_ports %}
+{% set limit = maildivvy_publish_rate_limits[port] %}
+-A {{ chain }} -p tcp --dport {{ port }} -m hashlimit --hashlimit-above {{ limit.rate }} --hashlimit-burst {{ limit.burst }} --hashlimit-mode srcip --hashlimit-name maildivvy-{{ limit.name }} -j DROP
+{% endfor %}
+{% if restore %}
+COMMIT
+{% endif %}

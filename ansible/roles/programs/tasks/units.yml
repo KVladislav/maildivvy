@@ -1,0 +1,53 @@
+# The programs role's hook, run at step 13's place: each program task lists its own
+# configuration in maildivvy_program_files and its units in maildivvy_program_units
+# (vars/main.yml). A unit marked `enabled` is enabled and started, and read back. During
+# an upgrade (maildivvy_collection_paused, set by maildivvy-install) they are enabled and
+# left stopped: the installer paused collection and fan-out, and starts them again once
+# the new version is written.
+
+- name: Install each program's configuration
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ maildivvy_program_files }}"
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Install each program's systemd unit
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.src | basename | regex_replace('\\.j2$', '') }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ maildivvy_program_units }}"
+  loop_control:
+    label: "{{ item.src | basename }}"
+  register: maildivvy_units_written
+
+- name: Tell systemd the units changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: maildivvy_units_written is changed
+
+- name: Enable and start the units that run
+  ansible.builtin.systemd_service:
+    name: "{{ item.src | basename | regex_replace('\\.j2$', '') }}"
+    enabled: true
+    state: "{{ omit if maildivvy_collection_paused | default(false) else 'started' }}"
+  loop: "{{ maildivvy_program_units | selectattr('enabled', 'defined') | selectattr('enabled') }}"
+  loop_control:
+    label: "{{ item.src | basename }}"
+
+- name: Read each of them back
+  ansible.builtin.command:
+    argv: [systemctl, is-enabled, "{{ item.src | basename | regex_replace('\\.j2$', '') }}"]
+  loop: "{{ maildivvy_program_units | selectattr('enabled', 'defined') | selectattr('enabled') }}"
+  loop_control:
+    label: "{{ item.src | basename }}"
+  register: maildivvy_units_enabled
+  changed_when: false
+  failed_when: maildivvy_units_enabled.stdout != 'enabled'

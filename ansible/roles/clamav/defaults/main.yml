@@ -1,0 +1,22 @@
+# What an operator may override for step 10 (`ansible/README.md`).
+
+# The two ClamAV limits, set deliberately: the delivery filter and the milter gate on
+# the lower of them before contacting the socket. Setting
+# both to 50M raises the stream limit (shipped 25M) and leaves the file limit at 25M's
+# default, so neither is what an unread default would give.
+maildivvy_clamav_stream_max: 50M
+maildivvy_clamav_file_max: 50M
+
+# ⛔ Off on a memory-constrained host: a concurrent reload keeps two databases resident.
+# Off costs a few seconds of blocked scans, which a scheduled
+# fetcher does not notice.
+maildivvy_clamav_concurrent_reload: "no"
+
+# The community feed: Sanesecurity alone, over https, from a mirror
+# whose memory cost is measured. The checksum fangfrisch verifies is served by the same
+# host as the payload, so https carries the only transport trust there is.
+maildivvy_clamav_community_feed: true
+maildivvy_clamav_sanesecurity_prefix: https://mirror.rollernet.us/sanesecurity/
+
+# How long the first signature download may take before the step gives up (seconds).
+maildivvy_clamav_database_wait: 1200

@@ -1,0 +1,13 @@
+# Maildivvy, install step 18: the Dovecot filter. Managed by Ansible (roles/ban).
+#
+# The stock filter was written for Dovecot 2.3's `Aborted login (auth failed, ...)` and
+# matches nothing Dovecot 2.4.2 writes, and a jail that matches nothing reads exactly like
+# a quiet one. This file EXTENDS the stock expressions rather than replacing
+# them, so a 2.3 line still counts. Dovecot 2.4.2 ends a failed login as
+#     Login aborted: Logged out (auth failed, 1 attempts in 2 secs) (auth_failed): user=<...>, method=PLAIN, rip=...
+#     Login aborted: Connection closed (auth failed, 1 attempts in 6 secs) (auth_failed): user=<...>, ...
+# depending on how the client left, so the words before the parenthesis are not
+# pinned; the address is taken from `rip=` and nowhere else in the line.
+[Definition]
+failregex = %(known/failregex)s
+            ^Login aborted: [^(]*\(auth failed, \d+ attempts(?: in \d+ secs)?\) \(\w+\): user=<[^>]*>(?:, method=\S+)?, rip=<HOST>(?:,|$)

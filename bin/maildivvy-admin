@@ -1,0 +1,22 @@
+#!/usr/bin/python3
+"""Serve the administration interface on a unix socket. See admin/run.py.
+
+TLS, the certificate and the listen address are the reverse proxy's; this
+program opens no TCP port and writes nothing to disk but its own socket.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.admin.run import main  # noqa: E402
+
+sys.exit(main())

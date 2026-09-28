@@ -1,0 +1,11 @@
+# Maildivvy, install step 9: one Postfix lookup map, read as {{ maildivvy_postfix_db_role }}.
+#
+# ⛔ The secret lives in the passfile the URI NAMES, never here: `postconf -n` prints
+# this file's contents back, and every verification on this machine runs it.
+# The file is 0640 root:postfix; the passfile is 0600 postfix:root.
+#
+# ⚠️ Every %s is QUOTED. Postfix escapes the value but does not quote it, and the error
+# that follows names a missing table rather than a missing quote.
+hosts = postgresql://{{ maildivvy_postfix_db_role }}@{{ maildivvy_postfix_db_host }}/{{ maildivvy_postfix_db_name }}?passfile={{ maildivvy_postfix_passfile }}
+dbname = {{ maildivvy_postfix_db_name }}
+query = SELECT mvalue FROM {{ item.view }} WHERE mkey = '%s'

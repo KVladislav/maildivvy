@@ -1,0 +1,42 @@
+# Managed by Ansible (roles/backup). Install step 16.
+# The backup: the database and the fetch state in one run, with collection and fan-out
+# paused around it. Root's, because it stops and starts the two
+# timers and reads the mail owner's fetch state; the database is reached as its owner,
+# through the owner's own db.conf and passfile, over the unix socket.
+[Unit]
+Description=Maildivvy: back up the database and the fetch state together
+Documentation=file://{{ maildivvy_backup_opt }}/lib/maildivvy/backup/run.py
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart={{ maildivvy_backup_program }}
+# It waits for a fetch or a pass already going, then the operator's store copy runs; on
+# this timeout systemd stops it, and the program resumes collection on its way out.
+TimeoutStartSec={{ maildivvy_backup_run_timeout }}
+# ⛔ A run killed (SIGKILL, or stopped inside its own resume) never reaches that: this
+# starts again whatever the run recorded as stopped by it, and after an ordinary run
+# finds nothing to do.
+ExecStopPost={{ maildivvy_backup_program }} --resume
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# The runs, and the status the rest of the machine reads. Nothing else: the operator's
+# store copy is a transient unit of its own, outside this sandbox (backup/run.py).
+ReadWritePaths={{ maildivvy_backup_dir }} {{ maildivvy_backup_status_dir }}
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+# ⛔ ONE CAPABILITY, AND IT IS THE ONE THAT READS. With an empty bounding set root cannot
+# open the mail owner's 0700 fetch state, and the predecessor's tar failed after the dump was
+# already written, leaving a 45-byte archive of nothing and a unit in exit-code.
+# Nothing here writes as anyone but root, so nothing else is kept.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

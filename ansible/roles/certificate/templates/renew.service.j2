@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew the machine's certificate if it is due (lego run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ maildivvy_cert_program }} run

@@ -1,0 +1,14 @@
+# ⛔ OFF, AND ITS WORK IS DONE BY `../rspamd.local.lua`. rspamd must still be told that
+# the message arrived by POP3 collection, or the last hop it sees is the provider's own
+# POP3 server and SPF, the ASN and every IP list judge the provider.
+#
+# ⚠️ None of this module's strategies fits a collected message: `hostname_map` needs a
+# `Received` header written BY a listed peer, and a POP3 server writes none; `count` pins
+# by position and misses a re-injection that adds a hop; and every strategy reads
+# rspamd's parsed address, which takes the HELO literal out of
+# `from [address] (helo=[address])`.
+#
+# ⚠️ Disabled BY NAME rather than by deleting this file, so an override tree copied over
+# an older one cannot leave the old rule running beside the new one. The step reads it
+# back as a module disabled explicitly, never as an absence.
+enabled = false;

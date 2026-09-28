@@ -1,0 +1,52 @@
+# Install step 15: the administration interface behind the distribution's reverse proxy.
+# The product fixes its own paths;
+# nothing here is a setting.
+
+# nginx-core, from the distribution's main pocket, so it is patched by the same
+# unattended security updates as everything else. `nginx-common` comes with it
+# and brings the unit, /etc/nginx and the sites directories.
+maildivvy_interface_packages: [nginx-core]
+maildivvy_interface_proxy_unit: nginx.service
+maildivvy_interface_proxy_user: www-data
+# The group the socket is handed to, and the only one that may open it.
+maildivvy_interface_proxy_group: www-data
+# ⛔ the certificate is reached by the PROXY, never by the interface: TLS moved out of
+# our process, so ssl-cert is the proxy's group and the interface joins nothing
+# (read in the direction of).
+maildivvy_interface_proxy_groups: [ssl-cert]
+
+# The proxy serves one site and the distribution's own (port 80) is removed.
+maildivvy_interface_site: maildivvy-admin
+maildivvy_interface_sites_available: /etc/nginx/sites-available
+maildivvy_interface_sites_enabled: /etc/nginx/sites-enabled
+maildivvy_interface_default_site: /etc/nginx/sites-enabled/default
+maildivvy_interface_port: 443
+# ⛔ stated, never inherited: only an explicit minimum stops an old version being
+# accepted, and the default has moved between releases.
+maildivvy_interface_tls_protocols: TLSv1.2 TLSv1.3
+
+# The pair step 5 republishes out of lego's store; named explicitly, or the
+# endpoint would serve whatever the package left behind (for 443).
+maildivvy_interface_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
+maildivvy_interface_key: /etc/ssl/private/{{ maildivvy_cert_name }}.key
+maildivvy_interface_cert_program: /usr/local/sbin/maildivvy-cert
+# What the step's own request verifies against: the system trust store with a real
+# certificate, and the published certificate itself while the machine is self-signed or
+# on the staging CA - never nothing, and never `-k`.
+maildivvy_interface_anchor: "{{ [] if maildivvy_cert_mode == 'acme'
+                                else ['--cacert', maildivvy_interface_cert] }}"
+
+maildivvy_interface_user: maildivvy-admin
+maildivvy_interface_unit: maildivvy-admin.service
+maildivvy_interface_opt: /opt/maildivvy
+maildivvy_interface_program: "{{ maildivvy_interface_opt }}/bin/maildivvy-admin"
+# The socket and its directory. /run is tmpfs, so the directory is made by tmpfiles as
+# well as by the install: a directory made once is gone at the first reboot, and the
+# unit would then die 226/NAMESPACE naming no path.
+# ⛔ A directory OF ITS OWN, inside root's `/run/maildivvy`: rspamd's socket
+# directory is in that parent too, and an interface that owned the parent could rename
+# the scanner's directory away and put its own socket where every incoming message goes.
+maildivvy_interface_run_dir: /run/maildivvy
+maildivvy_interface_socket_dir: /run/maildivvy/admin
+maildivvy_interface_socket: "{{ maildivvy_interface_socket_dir }}/admin.sock"
+maildivvy_interface_tmpfiles: /etc/tmpfiles.d/maildivvy-admin.conf

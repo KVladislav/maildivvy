@@ -1,0 +1,27 @@
+#!/usr/bin/python3
+"""Bind a submitted message's sender, then scan it. See milter/decision.py.
+
+Postfix's submission service hands every message to this daemon before the queue. It
+refuses a From header that is not the sending external mailbox's address, and refuses
+malware; it never rewrites anything.
+
+⛔ NOT NAMED AFTER THE LIBRARY IT IMPORTS: pymilter imports a
+lowercase C extension `milter` from inside its own package, and a module of that name
+beside this program would shadow it at every start.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.milter.run import main  # noqa: E402
+
+sys.exit(main())

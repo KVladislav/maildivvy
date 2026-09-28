@@ -1,0 +1,38 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# The pass: record what the archive holds and give every receiver a name for it
+# (docs/architecture.md § The path of a message, Record and fan out). It runs as the
+# mail owner, because it reads the archive through doveadm and makes the hardlinks in
+# people's maildirs.
+[Unit]
+Description=Maildivvy: record the archive's new mail and fan it out
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/fanout/pass_.py
+After=network-online.target postgresql.service dovecot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vmail
+Group=vmail
+ExecStart={{ maildivvy_opt }}/bin/maildivvy-pass
+# A run that overruns the timer's period is not killed here: the next run takes each
+# cursor row with FOR UPDATE, so two passes queue per (domain, mailbox) instead of
+# reading one range twice.
+TimeoutStartSec={{ maildivvy_pass_run_timeout }}
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# It makes names in the store, moves index trees on a transfer, and drains the request
+# queue: a refetch runs the fetch runner as a CHILD OF THIS UNIT, which writes the
+# fetcher's state, and deleting an external mailbox removes it.
+ReadWritePaths={{ maildivvy_store }} {{ maildivvy_index }} {{ maildivvy_var }}/fetch
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+# Nothing it does needs a capability, in either set.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

@@ -1,0 +1,6 @@
+# Install step 16's two settings (ansible/README.md § Settings); step 1 checks both.
+# How many runs are kept: counted, never aged (the predecessor kept 8).
+maildivvy_backup_keep: 8
+# The operator's store-copy command, one line, run as root after each dump and before
+# collection resumes. Empty: none, and the product copies no mail.
+maildivvy_backup_store_copy: ""

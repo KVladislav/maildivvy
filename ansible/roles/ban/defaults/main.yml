@@ -1,0 +1,20 @@
+# Install step 18: the login-failure ban.
+#
+# The thresholds are the design's ("ban thresholds"): five
+# failures in ten minutes ban a source for an hour. They are defaults, not settings asked
+# at install; the proof reads `maxretry` back from the running daemon.
+maildivvy_ban_findtime: 10m
+maildivvy_ban_maxretry: 5
+maildivvy_ban_bantime: 1h
+
+# Never banned: loopback (health fails a login from 127.0.0.1 every five minutes)
+# and every administrator network, which a ban on every port would cut off.
+maildivvy_ban_ignoreip: "{{ ['127.0.0.1/8', '::1'] + maildivvy_admin_networks }}"
+
+maildivvy_ban_jail_file: /etc/fail2ban/jail.d/maildivvy.local
+maildivvy_ban_filter_file: /etc/fail2ban/filter.d/dovecot.local
+maildivvy_ban_program: /usr/local/sbin/maildivvy-ban
+# The whole proof, as step 18 runs it; step 19 runs it again before it opens anything
+# when step 18 did not run in the same play (`--tags publish`).
+maildivvy_ban_prove_argv: "{{ [maildivvy_ban_program, 'prove', '--maxretry', maildivvy_ban_maxretry | string]
+                              + (maildivvy_ban_ignoreip | map('regex_replace', '^', '--ignore=') | list) }}"

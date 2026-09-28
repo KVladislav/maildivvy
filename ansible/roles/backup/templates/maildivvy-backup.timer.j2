@@ -1,0 +1,17 @@
+# Managed by Ansible (roles/backup). Install step 16.
+# Once a day, with up to an hour of jitter, the same command an operator
+# runs by hand.
+[Unit]
+Description=Maildivvy: back up the database and the fetch state {{ maildivvy_backup_calendar }}
+
+[Timer]
+OnCalendar={{ maildivvy_backup_calendar }}
+# A machine that was down at the time takes its backup when it is up, rather than going
+# a second day without one (Persistent= acts on a calendar timer only).
+Persistent=true
+AccuracySec=10s
+RandomizedDelaySec={{ maildivvy_backup_jitter }}
+Unit={{ maildivvy_backup_unit }}
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,27 @@
+#
+# Docker publishes a container port by DNAT in PREROUTING and forwards the packet, so
+# it crosses FORWARD and never meets the INPUT chain ufw writes: a published port would
+# answer off-host while ufw lists a deny. DOCKER-USER is the chain
+# Docker leaves to the operator and evaluates first in FORWARD. This block is in place
+# before Docker is installed, so the bypass never exists.
+#
+# It FAILS OPEN IF LOST: a missing block raises no error. The install's read-back
+# refuses a kernel chain that differs from this block.
+*filter
+:ufw-user-forward - [0:0]
+:maildivvy-docker-deny - [0:0]
+:DOCKER-USER - [0:0]
+# 1. ufw's forward chain first, so `ufw route` rules govern containers too
+-A DOCKER-USER -j ufw-user-forward
+# 2. replies to allowed connections pass; invalid packets are dropped
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+# 3. traffic from a container passes: egress, and containers between themselves
+-A DOCKER-USER -s {{ maildivvy_container_pool }} -j RETURN
+# 4. a new connection into a container from off this host is logged and dropped
+-A DOCKER-USER -m conntrack --ctstate NEW -d {{ maildivvy_container_pool }} -j maildivvy-docker-deny
+# 5. anything not involving a container is not this block's business
+-A DOCKER-USER -j RETURN
+-A maildivvy-docker-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[MAILDIVVY DOCKER BLOCK] "
+-A maildivvy-docker-deny -j DROP
+COMMIT

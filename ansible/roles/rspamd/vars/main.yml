@@ -1,0 +1,51 @@
+# Install step 11: the product fixes these paths and names; none of them is a setting.
+
+# The image as the runtime is given it: the repository and the digest, never a tag.
+maildivvy_rspamd_image: "{{ maildivvy_rspamd_repository }}@{{ maildivvy_rspamd_digest }}"
+
+# The host group whose gid is the image's own (the programs role makes it), which is how
+# the container reads the override tree and how the mail owner opens the socket.
+maildivvy_rspamd_group: maildivvy-rspamd
+
+maildivvy_rspamd_dir: /etc/maildivvy/rspamd
+maildivvy_rspamd_state: /var/lib/maildivvy/rspamd
+maildivvy_rspamd_socket_dir: /run/maildivvy/rspamd
+maildivvy_rspamd_socket: /run/maildivvy/rspamd/rspamd.sock
+maildivvy_rspamd_tmpfiles: /etc/tmpfiles.d/maildivvy-rspamd.conf
+maildivvy_rspamd_project: maildivvy
+maildivvy_rspamd_container: maildivvy-rspamd-1   # <project>-<service>-<n>
+maildivvy_rspamd_log_tag: maildivvy-rspamd
+# The pin as health reads it: no secret, beside `certificate.json`, outside the
+# scanner's own directory, which only root enters.
+maildivvy_rspamd_record: /etc/maildivvy/scanner.json
+
+# Everything written under the scanner's directory. The files under `local.d` are the
+# override tree the container mounts read-only, so they are written `0640` to the group
+# that names the image's gid, which is how the container reads them at all; no secret is
+# in any of them.
+maildivvy_rspamd_files:
+  - {src: compose.yml.j2, dest: compose.yml}
+  - {src: env.j2, dest: .env}
+  - {src: rspamd.local.lua.j2, dest: rspamd.local.lua}
+  - {src: local.d/worker-normal.inc.j2, dest: local.d/worker-normal.inc}
+  - {src: local.d/worker-controller.inc.j2, dest: local.d/worker-controller.inc}
+  - {src: local.d/worker-proxy.inc.j2, dest: local.d/worker-proxy.inc}
+  - {src: local.d/logging.inc.j2, dest: local.d/logging.inc}
+  - {src: local.d/actions.conf.j2, dest: local.d/actions.conf}
+  - {src: local.d/classifier-bayes.conf.j2, dest: local.d/classifier-bayes.conf}
+  - {src: local.d/external_relay.conf.j2, dest: local.d/external_relay.conf}
+  - {src: local.d/rbl.conf.j2, dest: local.d/rbl.conf}
+
+# The step's proof, and the last act of a repin: a message scored through the
+# product's own client, as the mail owner, over the socket the delivery filter will use.
+# A failure here fails the step.
+maildivvy_rspamd_probe: |
+  import dataclasses, json
+  from maildivvy.lib import scan
+  message = (b'Received: from mail.example.org ([198.51.100.25]) by pop.example.net '
+             b'with ESMTPS; Sun, 20 Sep 2026 00:00:00 +0000\r\n'
+             b'From: a@example.org\r\nTo: b@example.net\r\nSubject: hello\r\n'
+             b'Date: Sun, 20 Sep 2026 00:00:00 +0000\r\n'
+             b'Message-ID: <probe@example.org>\r\n\r\nplain words\r\n')
+  print(json.dumps({'scored': dataclasses.asdict(scan.scan_spam(message)),
+                    'top': float(scan.TOP_SCORE)}))

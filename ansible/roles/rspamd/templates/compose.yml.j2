@@ -1,0 +1,46 @@
+# The spam scanner, and the only container on this machine.
+#
+# ⛔ NOTHING IS PUBLISHED AND THE NETWORK IS THE RUNTIME'S OWN. A published container
+# port is translated in PREROUTING and forwarded, so it never meets the firewall's INPUT
+# rules and answers from outside while ufw lists a deny.
+# The keys that would do it are absent, and the step greps this file for them - which is
+# why neither is named here even in a comment: a comment naming the key puts the key in
+# the file.
+#
+# ⛔ The image is pinned BY DIGEST from `.env`, and `:?` makes an unset variable a
+# refusal rather than a silent `latest`.
+name: {{ maildivvy_rspamd_project }}
+services:
+  rspamd:
+    image: ${RSPAMD_IMAGE:?RSPAMD_IMAGE must name the scanner image by digest}
+    restart: unless-stopped
+    read_only: true
+    # ⛔ No capability, and no way to gain one: the scanner runs as the image's
+    # own unprivileged id and binds a unix socket it owns, so the runtime's default set is
+    # only what a compromised scanner could use, through a set-id program in the image.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # ⛔ The image's own check probes a TCP port, and this deployment binds a unix
+    # socket, so it would read `(unhealthy)` for ever while the scanner served every
+    # message. A check that can never pass trains people to ignore the column; what
+    # watches this scanner is the health export, over the socket.
+    healthcheck:
+      disable: true
+    # The scanner's log leaves the container, so recreating it - which is what a repin
+    # does - keeps the readings that explain a score.
+    logging:
+      driver: journald
+      options:
+        tag: {{ maildivvy_rspamd_log_tag }}
+    tmpfs:
+      - /tmp
+    volumes:
+      - {{ maildivvy_rspamd_socket_dir }}:/run/rspamd
+      # ⚠️ `local.d`, never its parent: mounting the parent produces
+      # /etc/rspamd/local.d/local.d/… and rspamd reads none of it.
+      - {{ maildivvy_rspamd_dir }}/local.d:/etc/rspamd/local.d:ro
+      # The sender-pinning rule, which rspamd loads from outside the override tree and
+      # from nowhere else, so it needs a mount of its own.
+      - {{ maildivvy_rspamd_dir }}/rspamd.local.lua:/etc/rspamd/rspamd.local.lua:ro
+      - {{ maildivvy_rspamd_state }}:/var/lib/rspamd

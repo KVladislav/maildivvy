@@ -1,0 +1,305 @@
+# Install step 11: the container runtime from the distribution, and rspamd as an image
+# pinned by digest, reached over a unix socket and publishing nothing (#). The container firewall block is already in place
+# from step 4, before the runtime existed.
+#
+# ⛔ This step is also the product's REPIN ACT. Change the digest and the tag together and
+# run the install: it records the new pin, recreates the container, reads the
+# configuration back from the running daemon and scans a probe message before it reports
+# success. A repin never happens on a timer.
+
+- name: Every provider host is trusted or judged, and nothing else
+  ansible.builtin.assert:
+    that:
+      - maildivvy_rspamd_provider_hosts | dict2items
+        | rejectattr('value', 'in', ['trust_login', 'judge_provider']) | list == []
+    fail_msg: >-
+      maildivvy_rspamd_provider_hosts: each host is `trust_login` or `judge_provider`,
+      never anything else; {{ maildivvy_rspamd_provider_hosts }}
+    quiet: true
+
+# --- the runtime ----------------------------------------------------------------
+
+- name: Install the container runtime and its compose plugin from the distribution
+  ansible.builtin.apt:
+    name: "{{ maildivvy_docker_packages }}"
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: The runtime runs and starts at boot
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Read every listener and the runtime's own command line
+  ansible.builtin.shell:
+    cmd: set -o pipefail; ss -H -ltn | awk '{print $4}'; systemctl show docker -p ExecStart --value
+    executable: /bin/bash
+  register: maildivvy_docker_listeners
+  changed_when: false
+
+- name: The runtime exposes no TCP API
+  ansible.builtin.assert:
+    that:
+      - maildivvy_docker_listeners.stdout_lines | select('search', ':(2375|2376)$') | list == []
+      - "'-H tcp' not in maildivvy_docker_listeners.stdout"
+      - "'tcp://' not in maildivvy_docker_listeners.stdout"
+    fail_msg: "{{ maildivvy_docker_listeners.stdout_lines }}"
+    quiet: true
+
+# --- DNSBLs and the resolver, which are one decision -----------------------------
+
+- name: Refuse DNSBLs while this machine's resolver answers for an address that is not listed
+  when: maildivvy_rspamd_rbls | bool
+  block:
+    - name: Ask a list about an address that is listed and one that is not
+      ansible.builtin.command:
+        argv: [dig, +short, +time=5, +tries=2, A, "{{ item }}"]
+      loop:
+        - "{{ maildivvy_rspamd_rbl_listed_probe }}"
+        - "{{ maildivvy_rspamd_rbl_clean_probe }}"
+      register: maildivvy_rspamd_dnsbl
+      changed_when: false
+
+    - name: A resolver that answers both cannot tell listed from clean
+      ansible.builtin.assert:
+        that:
+          - maildivvy_rspamd_dnsbl.results[0].stdout != ''      # the control: the list answers at all
+          - maildivvy_rspamd_dnsbl.results[1].stdout == ''
+        fail_msg: >-
+          this machine's resolver answers {{ maildivvy_rspamd_dnsbl.results[1].stdout | default('') }}
+          for {{ maildivvy_rspamd_rbl_clean_probe }}, which is not listed: through a forwarding
+          resolver every list answers inside the listed range, so every message would read as
+          listed on every list. Choose a resolver for the scanner before turning DNSBLs on.
+        quiet: true
+
+# --- the socket directory, before the container binds into it -----
+
+- name: The socket directory is recreated at every boot, owned by the image's own id
+  ansible.builtin.copy:
+    dest: "{{ maildivvy_rspamd_tmpfiles }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Maildivvy, install step 11. /run is tmpfs: a directory made once at install is
+      # gone at the first reboot, and the runtime then creates the bind-mount source as
+      # root, so rspamd cannot bind its socket and restart-loops (#). systemd-tmpfiles-setup runs at sysinit.target, before the
+      # runtime, and `d` also corrects a directory that is already there. The parent is
+      # root's and nobody else's: the interface's own directory is in it too.
+      d {{ maildivvy_rspamd_socket_dir | dirname }} 0755 root root -
+      d {{ maildivvy_rspamd_socket_dir }} 0750 {{ maildivvy_rspamd_gid }} {{ maildivvy_rspamd_gid }} -
+
+- name: Apply it now, so the directory is there before the container starts
+  ansible.builtin.command:
+    argv: [systemd-tmpfiles, --create, "{{ maildivvy_rspamd_tmpfiles }}"]
+  changed_when: false
+
+- name: Make the state directory the image writes into, owned by its own id
+  ansible.builtin.file:
+    path: "{{ maildivvy_rspamd_state }}"
+    state: directory
+    owner: "{{ maildivvy_rspamd_gid }}"
+    group: "{{ maildivvy_rspamd_gid }}"
+    mode: "0750"
+
+# --- the project, the override tree and the rule beside it ---------------------------------------
+
+- name: The scanner's directory, which only root enters
+  ansible.builtin.file:
+    path: "{{ maildivvy_rspamd_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# ⚠️ The override tree is a BIND MOUNT SOURCE, and its own permissions are what the
+# container meets: `0750 root:root` reads as `Permission denied` inside, rspamd falls
+# back to its built-in defaults - `bind_socket = "*:11333"`, `reject = 15`, every module
+# on - and says nothing about it (measured 2026-09-20). The group that names the image's
+# gid is what lets rspamd in, and nobody else.
+- name: The override tree, which the image's own id reads through the bind mount
+  ansible.builtin.file:
+    path: "{{ maildivvy_rspamd_dir }}/local.d"
+    state: directory
+    owner: root
+    group: "{{ maildivvy_rspamd_group }}"
+    mode: "0750"
+
+- name: Write the project, the override tree and the sender-pinning rule
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ maildivvy_rspamd_dir }}/{{ item.dest }}"
+    owner: root
+    group: "{{ maildivvy_rspamd_group }}"
+    mode: "0640"
+  loop: "{{ maildivvy_rspamd_files }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  register: maildivvy_rspamd_written
+
+- name: Read what else the override tree holds
+  ansible.builtin.find:
+    paths: "{{ maildivvy_rspamd_dir }}/local.d"
+    file_type: file
+  register: maildivvy_rspamd_tree
+
+# An override tree copied over an older one keeps whatever the old one had, and a rule
+# nobody remembers goes on scoring. That is why the modules that are off are named rather
+# than deleted, and why nothing else stays.
+- name: Remove a file the step no longer writes
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ maildivvy_rspamd_tree.files | map(attribute='path') | reject('in',
+       maildivvy_rspamd_files | map(attribute='dest')
+       | map('regex_replace', '^', maildivvy_rspamd_dir ~ '/')) | list }}
+  register: maildivvy_rspamd_removed
+
+- name: Record the pin where health reads whether a newer release is due
+  ansible.builtin.template:
+    src: scanner.json.j2
+    dest: "{{ maildivvy_rspamd_record }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# --- the image, pinned by digest -------------------------------------------------
+
+- name: Is the pinned image already on this machine?
+  ansible.builtin.command:
+    argv: [docker, image, inspect, "{{ maildivvy_rspamd_image }}", --format, "{{ '{{.Id}}' }}"]
+  register: maildivvy_rspamd_present
+  changed_when: false
+  failed_when: false
+
+# Only when it is missing: the registry is asked once per pin, never on a schedule.
+- name: Pull the pinned image
+  ansible.builtin.command:
+    argv: [docker, pull, "{{ maildivvy_rspamd_image }}"]
+  when: maildivvy_rspamd_present.rc != 0
+
+- name: Read the image's own user and group
+  ansible.builtin.command:
+    argv: [docker, image, inspect, "{{ maildivvy_rspamd_image }}", --format, "{{ '{{.Config.User}}' }}"]
+  register: maildivvy_rspamd_image_user
+  changed_when: false
+
+# The host group `maildivvy-rspamd` exists only to name this gid, so a
+# repin that moved it must stop here rather than leave the mail owner outside the socket.
+- name: The pinned image's gid is the one the host group names
+  ansible.builtin.assert:
+    that:
+      - maildivvy_rspamd_image_user.stdout.strip().split(':') | last | int == maildivvy_rspamd_gid | int
+    fail_msg: >-
+      the pinned image runs as {{ maildivvy_rspamd_image_user.stdout | trim }}, but the host group
+      maildivvy-rspamd names gid {{ maildivvy_rspamd_gid }}. A repin that moves the
+      id moves the group with it, in the programs role too.
+    quiet: true
+
+# --- start, or recreate for a changed pin or a changed tree --------------------------------------
+
+- name: Start the scanner, recreating it for a changed pin or a changed override tree
+  ansible.builtin.command:
+    argv: [docker, compose, up, --detach, --remove-orphans, --force-recreate]
+    chdir: "{{ maildivvy_rspamd_dir }}"
+  when: maildivvy_rspamd_written is changed or maildivvy_rspamd_removed is changed
+
+- name: Start the scanner if it is not running
+  ansible.builtin.command:
+    argv: [docker, compose, up, --detach, --remove-orphans]
+    chdir: "{{ maildivvy_rspamd_dir }}"
+  register: maildivvy_rspamd_up
+  changed_when: >-
+    'Started' in maildivvy_rspamd_up.stderr or 'Created' in maildivvy_rspamd_up.stderr
+    or 'Recreated' in maildivvy_rspamd_up.stderr
+
+- name: Wait for the socket the delivery filter opens
+  ansible.builtin.stat:
+    path: "{{ maildivvy_rspamd_socket }}"
+  register: maildivvy_rspamd_socket_read
+  until: maildivvy_rspamd_socket_read.stat.exists
+  retries: 30
+  delay: 2
+
+# --- read back what the running daemon was started with --------------------
+
+- name: Read the container back
+  ansible.builtin.command:
+    argv: [docker, inspect, "{{ maildivvy_rspamd_container }}"]
+  register: maildivvy_rspamd_inspect
+  changed_when: false
+
+- name: It runs the pin, publishes nothing, is read-only and has no check that cannot pass
+  vars:
+    container: "{{ (maildivvy_rspamd_inspect.stdout | from_json)[0] }}"
+    sources: "{{ (maildivvy_rspamd_inspect.stdout | from_json)[0].Mounts | map(attribute='Source') | list }}"
+  ansible.builtin.assert:
+    that:
+      - container.Config.Image == maildivvy_rspamd_image
+      - container.HostConfig.PortBindings == {}
+      - container.NetworkSettings.Ports.values() | select('!=', None) | list == []
+      - container.HostConfig.NetworkMode != 'host'
+      - container.Config.Healthcheck.Test == ['NONE']
+      - container.HostConfig.ReadonlyRootfs
+      - container.HostConfig.Tmpfs.keys() | list == ['/tmp']
+      - container.HostConfig.RestartPolicy.Name == 'unless-stopped'
+      - container.HostConfig.LogConfig.Type == 'journald'
+      - maildivvy_rspamd_dir ~ '/local.d' in sources
+      - maildivvy_rspamd_dir ~ '/rspamd.local.lua' in sources
+      - maildivvy_rspamd_socket_dir in sources
+      - container.Config.User.split(':') | last | int == maildivvy_rspamd_gid | int
+    fail_msg: "{{ maildivvy_rspamd_inspect.stdout }}"
+    quiet: true
+
+- name: Read the configuration the running daemon was started from
+  ansible.builtin.shell:
+    cmd: >-
+      docker exec {{ maildivvy_rspamd_container }} rspamadm configdump worker &&
+      docker exec {{ maildivvy_rspamd_container }} rspamadm configdump actions &&
+      docker exec {{ maildivvy_rspamd_container }} rspamadm configdump -m &&
+      docker exec {{ maildivvy_rspamd_container }} id -un
+    executable: /bin/bash
+  register: maildivvy_rspamd_configdump
+  changed_when: false
+
+- name: The socket is the only listener, the bands stand, and what is off says so by name
+  vars:
+    dump: "{{ maildivvy_rspamd_configdump.stdout }}"
+    bind: 'bind_socket = "/run/rspamd/rspamd.sock mode=0660 owner={{ maildivvy_rspamd_user }} group={{ maildivvy_rspamd_user }}";'
+    disabled: "{{ maildivvy_rspamd_configdump.stdout_lines | select('search', 'Modules disabled .explicitly.') | first | default('') }}"
+  ansible.builtin.assert:
+    that:
+      # the override tree was read at all: the image's own `bind_socket = "*:11333"` is gone
+      - bind in dump
+      - "'reject = ' ~ maildivvy_rspamd_reject_score ~ ';' in dump"
+      # a superseded module is off BY NAME, read back as disabled and never as an absence
+      - "'external_relay' in disabled"
+      - maildivvy_rspamd_rbls | bool or 'rbl' in disabled
+      - maildivvy_rspamd_configdump.stdout_lines | last | trim == maildivvy_rspamd_user
+    fail_msg: "{{ maildivvy_rspamd_configdump.stdout }}"
+    quiet: true
+
+# The step's proof (docs/architecture.md § Installation, step 11), and the last act of a
+# repin: a message scored through the product's own client, as the mail owner.
+- name: Score a probe message as the mail owner
+  ansible.builtin.command:
+    argv: [runuser, -u, vmail, --, env, PYTHONPATH=/opt/maildivvy/lib, PYTHONDONTWRITEBYTECODE=1,
+           python3, -c, "{{ maildivvy_rspamd_probe }}"]
+  register: maildivvy_rspamd_probe_read
+  changed_when: false
+
+- name: The scanner answered with a score below the top band
+  vars:
+    probe: "{{ maildivvy_rspamd_probe_read.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - probe.scored.score is not none          # a failure would be no score at all
+      - probe.scored.score | float < probe.top | float
+      - probe.scored.action != 'reject'         # nothing reaches the top band
+      - probe.scored.detail is none
+    fail_msg: "{{ maildivvy_rspamd_probe_read.stdout }}"
+    quiet: true

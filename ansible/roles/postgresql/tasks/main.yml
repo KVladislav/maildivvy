@@ -1,0 +1,359 @@
+# Install step 6: PostgreSQL from the distribution, on loopback only, with
+# pg_hba.conf's order fixed; the database owned by maildivvy_owner,
+# whose password lives only in its passfile; the initial
+# schema applied as that owner by the product's applier;
+# the break-glass hash. Every consumer's role with its own passfile and
+# db.conf; the schema grants them what they may do, and each is then
+# queried as itself. Every part is read back before the next step.
+
+- name: Install PostgreSQL from the distribution
+  ansible.builtin.apt:
+    name: postgresql
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Read the clusters
+  ansible.builtin.command:
+    argv: [pg_lsclusters, --no-header]
+  register: maildivvy_pg_clusters
+  changed_when: false
+
+- name: Exactly one cluster, main, on the product's port
+  ansible.builtin.assert:
+    that:
+      - maildivvy_pg_clusters.stdout_lines | length == 1
+      - maildivvy_pg_clusters.stdout.split()[1] == 'main'
+      - maildivvy_pg_clusters.stdout.split()[2] | int == maildivvy_db_port
+    fail_msg: "expected one cluster 'main' on {{ maildivvy_db_port }}: {{ maildivvy_pg_clusters.stdout }}"
+    quiet: true
+
+- name: Name the cluster's configuration and service
+  ansible.builtin.set_fact:
+    maildivvy_pg_etc: "/etc/postgresql/{{ maildivvy_pg_clusters.stdout.split()[0] }}/main"
+    maildivvy_pg_service: "postgresql@{{ maildivvy_pg_clusters.stdout.split()[0] }}-main"
+
+- name: Listen on loopback only, in a drop-in, never by editing the stock file
+  ansible.builtin.copy:
+    content: |
+      # Maildivvy, install step 6: every consumer is on this machine.
+      listen_addresses = 'localhost'
+    dest: "{{ maildivvy_pg_etc }}/conf.d/10-listen.conf"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  register: maildivvy_pg_listen
+
+- name: Put the product's pg_hba lines above the stock ones
+  ansible.builtin.blockinfile:
+    path: "{{ maildivvy_pg_etc }}/pg_hba.conf"
+    insertbefore: BOF
+    marker: "# {mark} maildivvy, install step 6: first match wins, so before the stock lines"
+    block: "{{ maildivvy_pg_hba }}"
+  register: maildivvy_pg_hba_file
+
+- name: Restart PostgreSQL for the listen addresses
+  ansible.builtin.systemd:
+    name: "{{ maildivvy_pg_service }}"
+    state: restarted
+  when: maildivvy_pg_listen.changed
+
+- name: Reload PostgreSQL for pg_hba
+  ansible.builtin.systemd:
+    name: "{{ maildivvy_pg_service }}"
+    state: reloaded
+  when: maildivvy_pg_hba_file.changed and not maildivvy_pg_listen.changed
+
+- name: PostgreSQL runs and starts at boot
+  ansible.builtin.systemd:
+    name: "{{ maildivvy_pg_service }}"
+    state: started
+    enabled: true
+
+# --- read back the server ------------------------------------------------------------
+
+- name: Read the listen addresses the server uses, and its sockets
+  ansible.builtin.shell:
+    cmd: >-
+      runuser -u postgres -- psql -X -At -c 'SHOW listen_addresses' &&
+      ss -ltnH '( sport = :{{ maildivvy_db_port }} )' | awk '{print $4}'
+  register: maildivvy_pg_listening
+  changed_when: false
+
+- name: The server listens on loopback only
+  ansible.builtin.assert:
+    that:
+      - maildivvy_pg_listening.stdout_lines[0] == 'localhost'
+      - "'127.0.0.1:' ~ maildivvy_db_port in maildivvy_pg_listening.stdout_lines[1:]"
+      - maildivvy_pg_listening.stdout_lines[1:] | difference(['127.0.0.1:' ~ maildivvy_db_port, '[::1]:' ~ maildivvy_db_port]) == []
+    fail_msg: "PostgreSQL listens on {{ maildivvy_pg_listening.stdout_lines }}"
+    quiet: true
+
+- name: Read the rules the server loaded from pg_hba.conf
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -F, ' ', -c,
+           "SELECT type, array_to_string(database, ','), array_to_string(user_name, ','), coalesce(address, '-'),
+                   auth_method, coalesce(error, '-') FROM pg_hba_file_rules ORDER BY rule_number"]
+  register: maildivvy_pg_rules
+  changed_when: false
+
+- name: The product's rules are the first four, and every rule loaded
+  ansible.builtin.assert:
+    that:
+      - maildivvy_pg_rules.stdout_lines[:4] == maildivvy_pg_rules_ours
+      - maildivvy_pg_rules.stdout_lines | reject('search', ' -$') | list == []
+    fail_msg: "{{ maildivvy_pg_rules.stdout_lines }}"
+    quiet: true
+  vars:
+    maildivvy_pg_rules_ours:
+      - "local {{ maildivvy_db_name }} postgres - peer -"
+      - "local {{ maildivvy_db_name }} all - scram-sha-256 -"
+      - "host {{ maildivvy_db_name }} {{ maildivvy_db_owner }} 0.0.0.0 reject -"
+      - "host {{ maildivvy_db_name }} {{ maildivvy_db_owner }} :: reject -"
+
+# --- the owner and the database -------------------------------------------
+
+- name: Create the owning role if it is missing
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
+    stdin: |
+      DO $$
+      BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ maildivvy_db_owner }}') THEN
+              CREATE ROLE {{ maildivvy_db_owner }} LOGIN;
+              RAISE NOTICE 'created role {{ maildivvy_db_owner }}';
+          END IF;
+      END
+      $$;
+  register: maildivvy_pg_owner_role
+  changed_when: "'created role' in maildivvy_pg_owner_role.stderr"
+
+- name: Read the database's owner, if there is a database
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -d, postgres, -c,
+           "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{{ maildivvy_db_name }}'"]
+  register: maildivvy_pg_db_owner
+  changed_when: false
+
+- name: Create the database owned by the schema's owner, not by postgres
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres, -c,
+           "CREATE DATABASE {{ maildivvy_db_name }} OWNER {{ maildivvy_db_owner }}"]
+  when: maildivvy_pg_db_owner.stdout == ''
+  changed_when: true
+
+- name: An existing database is the owner's
+  ansible.builtin.assert:
+    that: maildivvy_pg_db_owner.stdout in ['', maildivvy_db_owner]
+    fail_msg: "database {{ maildivvy_db_name }} is owned by {{ maildivvy_pg_db_owner.stdout }}, not {{ maildivvy_db_owner }}"
+    quiet: true
+
+- name: Write the owner's db.conf, with no password
+  ansible.builtin.copy:
+    content: |
+      # The owner's connection: the schema applier and the backup, run as root.
+      # The unix socket; the password is only in the passfile.
+      dbname={{ maildivvy_db_name }}
+      user={{ maildivvy_db_owner }}
+      passfile={{ maildivvy_owner_passfile }}
+    dest: "{{ maildivvy_owner_conf }}"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: Install the step's helper
+  ansible.builtin.copy:
+    src: maildivvy_pg.py
+    dest: /usr/local/sbin/maildivvy-pg
+    owner: root
+    group: root
+    mode: "0755"
+
+# Writes the passfile if it is missing, and sets the role's password only when it
+# cannot log in with it; the password never leaves the machine
+- name: Give the owner the password in its own passfile, in its own step
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ maildivvy_db_owner }}", "{{ maildivvy_owner_passfile }}", root,
+           --db, "{{ maildivvy_db_name }}"]
+  register: maildivvy_pg_owner_password
+  changed_when: (maildivvy_pg_owner_password.stdout | from_json).changed
+
+- name: Read the owner's passfile back, where it was written
+  ansible.builtin.stat:
+    path: "{{ maildivvy_owner_passfile }}"
+    get_checksum: false
+  register: maildivvy_pg_owner_passfile
+
+- name: Count the passfile's fields, never printing it
+  ansible.builtin.command:
+    argv: [awk, -F, ':', 'END { print NR " " NF }', "{{ maildivvy_owner_passfile }}"]
+  register: maildivvy_pg_owner_fields
+  changed_when: false
+
+- name: The owner's passfile is one line of five fields, 0600 root
+  ansible.builtin.assert:
+    that:
+      - maildivvy_pg_owner_passfile.stat.pw_name == 'root' and maildivvy_pg_owner_passfile.stat.mode == '0600'
+      - maildivvy_pg_owner_fields.stdout == '1 5'
+    quiet: true
+
+# --- the consumers' roles and passfiles -----------------------------
+
+# Before the schema, whose grants name them; the owner may not create roles
+- name: Create each consumer's role if it is missing; the daemons' roles cannot log in yet
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
+    stdin: |
+      DO $$
+      BEGIN
+      {% for item in maildivvy_db_consumers + maildivvy_db_daemon_roles %}
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ item.role }}') THEN
+              CREATE ROLE {{ item.role }} {{ 'LOGIN' if item.reader is defined else 'NOLOGIN' }};
+              RAISE NOTICE 'created role {{ item.role }}';
+          END IF;
+      {% endfor %}
+      END
+      $$;
+  register: maildivvy_pg_roles
+  changed_when: "'created role' in maildivvy_pg_roles.stderr"
+
+- name: Write each consumer's db.conf, with no password
+  ansible.builtin.copy:
+    content: |
+      # {{ item.consumer }}: the unix socket, as {{ item.role }}; the password is only in the
+      # passfile named here, readable by {{ item.reader }} alone.
+      dbname={{ maildivvy_db_name }}
+      user={{ item.role }}
+      passfile=/etc/maildivvy/{{ item.consumer }}/pgpass
+    dest: /etc/maildivvy/{{ item.consumer }}/db.conf
+    owner: root
+    group: "{{ item.group }}"
+    mode: "0640"
+  loop: "{{ maildivvy_db_consumers }}"
+  loop_control:
+    label: "{{ item.consumer }}"
+
+- name: Give each consumer's role its own password in its own passfile, in its own step
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ item.role }}", "/etc/maildivvy/{{ item.consumer }}/pgpass",
+           "{{ item.reader }}", --db, "{{ maildivvy_db_name }}"]
+  loop: "{{ maildivvy_db_consumers }}"
+  loop_control:
+    label: "{{ item.role }}"
+  register: maildivvy_pg_consumer_password
+  changed_when: (maildivvy_pg_consumer_password.stdout | from_json).changed
+
+- name: Read each passfile back by owner, mode and shape, never printing it
+  ansible.builtin.command:
+    argv: [sh, -c, 'stat -c "%U %a" "$1" && awk -F: "END { print NR, NF }" "$1" && cut -d: -f1-4 "$1"', -,
+           "/etc/maildivvy/{{ item.consumer }}/pgpass"]
+  loop: "{{ maildivvy_db_consumers }}"
+  loop_control:
+    label: "{{ item.consumer }}"
+  register: maildivvy_pg_consumer_passfile
+  changed_when: false
+  failed_when: >-
+    maildivvy_pg_consumer_passfile.rc != 0 or maildivvy_pg_consumer_passfile.stdout_lines !=
+    [item.reader ~ ' 600', '1 5', 'localhost:' ~ maildivvy_db_port ~ ':' ~ maildivvy_db_name ~ ':' ~ item.role]
+
+# --- the schema -----------------------------------------
+
+- name: Apply the schema as the owner, over the socket, with no password argument
+  ansible.builtin.command:
+    argv: ["{{ maildivvy_schema_program }}"]
+  register: maildivvy_schema_applied
+  changed_when: "'applied ' in maildivvy_schema_applied.stdout"
+
+- name: Read schema_version
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -d, "{{ maildivvy_db_name }}", -c,
+           "SELECT version FROM schema_version ORDER BY version"]
+  register: maildivvy_schema_versions
+  changed_when: false
+
+- name: Every migration shipped is recorded as applied
+  ansible.builtin.assert:
+    that: maildivvy_schema_versions.stdout_lines == maildivvy_schema_shipped
+    fail_msg: "schema_version holds {{ maildivvy_schema_versions.stdout_lines }}, the code ships {{ maildivvy_schema_shipped }}"
+    quiet: true
+  vars:
+    maildivvy_schema_shipped: >-
+      {{ lookup('ansible.builtin.fileglob', playbook_dir ~ '/../schema/*.sql', wantlist=True)
+         | map('basename') | map('regex_replace', '_.*$', '') | sort }}
+
+# A migration runs check_grants() once, when it is applied, so a run that applies nothing
+# would never read the grants again: one granted or revoked by hand since the install
+# would pass every later run. The catalog is asked on every run.
+- name: The grants the schema relies on still hold, read from the catalog
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -v, ON_ERROR_STOP=1, -d, "{{ maildivvy_db_name }}",
+           -c, "SELECT check_grants()"]
+  register: maildivvy_schema_grants
+  changed_when: false
+  failed_when: maildivvy_schema_grants.rc != 0 or maildivvy_schema_grants.stdout != 't'
+
+# --- every role queried as itself (step 6's proof) ---------------------
+
+- name: Each consumer, logged in through its own passfile as its own user, reads a permitted column
+  ansible.builtin.command:
+    argv: [runuser, -u, "{{ item.reader }}", --, env, "PGPASSFILE=/etc/maildivvy/{{ item.consumer }}/pgpass",
+           psql, -X, -w, -At, -U, "{{ item.role }}", -d, "{{ maildivvy_db_name }}", -c, "{{ item.permitted }} LIMIT 0"]
+  loop: "{{ maildivvy_db_consumers }}"
+  loop_control:
+    label: "{{ item.role }}"
+  changed_when: false
+
+- name: Each consumer is refused a column it must not read
+  ansible.builtin.command:
+    argv: [runuser, -u, "{{ item.reader }}", --, env, "PGPASSFILE=/etc/maildivvy/{{ item.consumer }}/pgpass",
+           psql, -X, -w, -At, -U, "{{ item.role }}", -d, "{{ maildivvy_db_name }}", -c, "{{ item.denied }} LIMIT 0"]
+  loop: "{{ maildivvy_db_consumers }}"
+  loop_control:
+    label: "{{ item.role }}"
+  register: maildivvy_pg_denied
+  changed_when: false
+  failed_when: maildivvy_pg_denied.rc == 0 or 'permission denied for' not in maildivvy_pg_denied.stderr
+
+- name: Each daemon's role reads its view, and is refused a table
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -d, "{{ maildivvy_db_name }}", -c,
+           "SET ROLE {{ item.0.role }}; {{ item.0[item.1] }} LIMIT 0"]
+  loop: "{{ maildivvy_db_daemon_roles | product(['permitted', 'denied']) | list }}"
+  loop_control:
+    label: "{{ item.0.role }} {{ item.1 }}"
+  register: maildivvy_pg_daemon_read
+  changed_when: false
+  failed_when: >-
+    (maildivvy_pg_daemon_read.rc != 0) if item.1 == 'permitted' else
+    (maildivvy_pg_daemon_read.rc == 0 or 'permission denied for' not in maildivvy_pg_daemon_read.stderr)
+
+# --- the break-glass hash --------------------------------------------------------
+
+- name: Store the break-glass hash, computed on the machine; only the hash reaches the server
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/maildivvy-pg, breakglass, --db, "{{ maildivvy_db_name }}"]
+    stdin: "{{ maildivvy_breakglass_password }}"
+  register: maildivvy_pg_breakglass
+  changed_when: (maildivvy_pg_breakglass.stdout | from_json).changed
+  no_log: true
+
+- name: Read the break-glass row by shape, never by content
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -d, "{{ maildivvy_db_name }}", -c,
+           "SELECT count(*) || ' ' || min(length(password_hash)) || ' ' || min(left(password_hash, 3)) FROM break_glass"]
+  register: maildivvy_pg_breakglass_shape
+  changed_when: false
+
+- name: One break-glass row, a bare sha512-crypt hash of 106 characters
+  ansible.builtin.assert:
+    that: maildivvy_pg_breakglass_shape.stdout == '1 106 $6$'
+    fail_msg: "the break-glass row reads {{ maildivvy_pg_breakglass_shape.stdout }}"
+    quiet: true
+
+- name: No login role of the product is left with no password
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -At, -d, postgres, -c,
+           "SELECT rolname FROM pg_authid WHERE rolcanlogin AND rolpassword IS NULL AND rolname LIKE 'maildivvy%'"]
+  register: maildivvy_pg_nopassword
+  changed_when: false
+  failed_when: maildivvy_pg_nopassword.rc != 0 or maildivvy_pg_nopassword.stdout != ''

@@ -1,0 +1,54 @@
+# Managed by Ansible (roles/milter). Install step 14.
+# The submission milter: it binds the From header to the authenticated login and scans
+# what a person submits, before Postfix queues it (docs/architecture.md § The path of a
+# message, Outgoing).
+[Unit]
+Description=Maildivvy: bind a submitted message's sender and scan it
+Documentation=file://{{ maildivvy_milter_opt }}/lib/maildivvy/milter/decision.py
+# ⛔ on boot Postfix must not accept a submission before this can answer - with
+# `tempfail` it would refuse every one - and the sender directory is the database.
+After=network-online.target postgresql.service
+Before=postfix.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ maildivvy_milter_user }}
+Group={{ maildivvy_milter_user }}
+# ⛔ 0007, never 0077: with 0077 the socket is 0700, and every submission is deferred
+# with a permission error naming nothing useful. Expected: srwxrwx--- <user>:postfix.
+UMask=0007
+# ⛔ root-privileged (`+`), because under ProtectSystem=strict an unprivileged
+# ExecStartPre cannot create this and the unit dies 226/NAMESPACE naming no path. The
+# socket path, this line and ReadWritePaths= must all agree, or the daemon logs that it
+# cannot open the socket while `systemctl is-active` reads `active`.
+ExecStartPre=+/usr/bin/install -d -o {{ maildivvy_milter_user }} -g postfix -m 2750 {{ maildivvy_milter_socket_dir }}
+# a socket file left by a killed daemon would stop the new one binding
+ExecStartPre=+/bin/rm -f {{ maildivvy_milter_socket }}
+# ⚠️ the sender directory is named EXPLICITLY: without it the program would fall back
+# on another consumer's connection file, which this user cannot read, and every
+# submission would be deferred while its own files read exactly as expected.
+ExecStart={{ maildivvy_milter_program }} --socket {{ maildivvy_milter_socket }} --db-conf {{ maildivvy_milter_db_conf }} --clamd-socket {{ maildivvy_milter_clamd_socket }}
+Restart=on-failure
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# ⛔ the `-` prefix: an unprefixed path that does not exist yet refuses to start, and
+# this one is made by the ExecStartPre above.
+# ⚠️ ITS SOCKET AND NOTHING ELSE: it reads one view and answers, and it never touches
+# the store - which is why the mail disks are absent here and present on the two
+# pipeline units.
+ReadWritePaths=-{{ maildivvy_milter_socket_dir }}
+# The rest of install step 13's set, the same on every program of ours.
+# It binds a unix socket, not a port: no capability in either set.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

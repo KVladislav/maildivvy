@@ -1,0 +1,240 @@
+# The programs role, first part: every system user, the /etc and /var layout, and the
+# code in /opt/maildivvy. It runs before the steps whose files these users own
+# (PostgreSQL's passfiles, ClamAV's group). The second part, tasks/units.yml, is the
+# hook that installs each program's units at step 13's place.
+
+# The fetch period is a role default an operator may override (defaults/main.yml). The
+# timer writes it as `*:0/<n>`, which is an even period only when n divides an hour, and
+# is what the interface reads its "look again by" from.
+- name: The fetch period is a whole number of minutes that divides an hour
+  ansible.builtin.assert:
+    that:
+      - maildivvy_fetch_minutes | string is match('^[0-9]+$')
+      - maildivvy_fetch_minutes | int in [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60]
+    fail_msg: >-
+      maildivvy_fetch_minutes is {{ maildivvy_fetch_minutes }}: it must be a whole number
+      of minutes that divides an hour (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30 or 60)
+    quiet: true
+
+# --- users (docs/architecture.md § Users) ----------------------------------------
+
+- name: Create maildivvy-rspamd with the rspamd image's gid
+  ansible.builtin.group:
+    name: maildivvy-rspamd
+    gid: "{{ maildivvy_rspamd_gid }}"
+    system: true
+
+- name: Create each program user's own group
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    system: true
+  loop: "{{ maildivvy_program_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create each program user, allocated, no home, no shell, in exactly its groups
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    group: "{{ item.name }}"
+    groups: "{{ item.groups }}"
+    append: false
+    system: true
+    create_home: false
+    home: /nonexistent
+    shell: /usr/sbin/nologin
+  loop: "{{ maildivvy_program_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Put vmail in exactly the scanners' groups
+  ansible.builtin.user:
+    name: vmail
+    groups: "{{ maildivvy_vmail_groups }}"
+    append: false
+
+# --- configuration and state directories (§ Filesystems and paths) --------------
+
+- name: /etc/maildivvy
+  ansible.builtin.file:
+    path: "{{ maildivvy_etc }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: One directory per consumer, entered only by its own user
+  ansible.builtin.file:
+    path: "{{ maildivvy_etc }}/{{ item.name }}"
+    state: directory
+    owner: root
+    group: "{{ item.group }}"
+    mode: "0750"
+  loop: "{{ maildivvy_consumers }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Generate the interface's session secret on the machine, once
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - umask 077 && openssl rand -hex 32 > "$1.new" && chown maildivvy-admin:maildivvy-admin "$1.new" && mv "$1.new" "$1"
+      - sh
+      - "{{ maildivvy_etc }}/admin/secret"
+    creates: "{{ maildivvy_etc }}/admin/secret"
+
+- name: The session secret is 0600 by the interface user
+  ansible.builtin.file:
+    path: "{{ maildivvy_etc }}/admin/secret"
+    state: file
+    owner: maildivvy-admin
+    group: maildivvy-admin
+    mode: "0600"
+
+- name: /var/lib/maildivvy
+  ansible.builtin.file:
+    path: "{{ maildivvy_var }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: The fetch state, vmail 0700
+  ansible.builtin.file:
+    path: "{{ maildivvy_var }}/fetch"
+    state: directory
+    owner: vmail
+    group: vmail
+    mode: "0700"
+
+# --- the libraries the code imports ----------------------------------------------
+
+- name: Install the interface's library, the distribution's
+  ansible.builtin.apt:
+    name: "{{ maildivvy_program_packages }}"
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ⛔ the interface answers 500 on every screen if this import fails at request time
+- name: It imports as the interface's own user
+  ansible.builtin.command:
+    argv: [runuser, -u, maildivvy-admin, --, python3, -c, "import flask; print(flask.__file__)"]
+  register: maildivvy_flask_import
+  changed_when: false
+
+- name: It is the distribution's, not something of ours
+  ansible.builtin.assert:
+    that: maildivvy_flask_import.stdout.startswith('/usr/lib/python3')
+    fail_msg: "import flask answered {{ maildivvy_flask_import.stdout }}"
+    quiet: true
+
+# --- the code ---------------------------------------------
+
+- name: Code tree
+  vars:
+    maildivvy_repo: "{{ playbook_dir | dirname }}"
+  block:
+    - name: Make a scratch archive on the controller
+      ansible.builtin.tempfile:
+        suffix: .tar
+      delegate_to: localhost
+      become: false
+      register: maildivvy_code_local
+      changed_when: false
+
+    # src/maildivvy becomes lib/maildivvy; every program in bin/ goes, not a list;
+    # schema/ is the applier's migrations (step 6)
+    - name: Pack src/maildivvy, bin/ and schema/ on the controller
+      ansible.builtin.command:
+        argv: >-
+          {{ ['tar', '--create', '--file', maildivvy_code_local.path, '--directory', maildivvy_repo,
+              '--exclude', '__pycache__', '--exclude', '*.pyc',
+              '--transform', 's,^src/maildivvy,lib/maildivvy,', 'src/maildivvy']
+             + (['bin'] if (maildivvy_repo ~ '/bin') is directory else [])
+             + (['schema'] if (maildivvy_repo ~ '/schema') is directory else []) }}
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Make a scratch file on the machine
+      ansible.builtin.tempfile:
+        suffix: .tar
+      register: maildivvy_code_remote
+      changed_when: false
+
+    - name: Send the archive
+      ansible.builtin.copy:
+        src: "{{ maildivvy_code_local.path }}"
+        dest: "{{ maildivvy_code_remote.path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
+    # compares every path, owner, mode and digest; when any differs, removes /opt/maildivvy
+    # first and writes it whole, caches left out, then reads it back
+    - name: Deploy the code tree to /opt/maildivvy, removing the destination first when it differs
+      maildivvy_tree:
+        archive: "{{ maildivvy_code_remote.path }}"
+        dest: "{{ maildivvy_opt }}"
+  always:
+    - name: Remove the scratch archive from the machine
+      ansible.builtin.file:
+        path: "{{ maildivvy_code_remote.path }}"
+        state: absent
+      when: maildivvy_code_remote.path is defined
+      changed_when: false
+
+    - name: Remove the scratch archive from the controller
+      ansible.builtin.file:
+        path: "{{ maildivvy_code_local.path }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      when: maildivvy_code_local.path is defined
+      changed_when: false
+
+# --- read back ---------------------------------------------------------------------
+
+- name: Read each user's groups
+  ansible.builtin.command:
+    argv: [id, -nG, "{{ item.name }}"]
+  loop: "{{ [{'name': 'vmail', 'groups': maildivvy_vmail_groups}] + maildivvy_program_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: maildivvy_user_groups
+  changed_when: false
+
+- name: Each user is in its own group and exactly its others
+  ansible.builtin.assert:
+    that: item.stdout.split() | sort == ([item.item.name] + item.item.groups) | sort
+    fail_msg: "{{ item.item.name }} is in {{ item.stdout }}"
+    quiet: true
+  loop: "{{ maildivvy_user_groups.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Read the maildivvy-rspamd group
+  ansible.builtin.getent:
+    database: group
+    key: maildivvy-rspamd
+
+- name: maildivvy-rspamd has the image's gid
+  ansible.builtin.assert:
+    that: ansible_facts.getent_group['maildivvy-rspamd'][1] | int == maildivvy_rspamd_gid | int
+    quiet: true
+
+- name: Read the session secret
+  ansible.builtin.stat:
+    path: "{{ maildivvy_etc }}/admin/secret"
+    get_checksum: false
+  register: maildivvy_secret
+
+- name: The secret holds 32 random bytes in hex, 0600 by the interface user
+  ansible.builtin.assert:
+    that:
+      - maildivvy_secret.stat.size == 65
+      - maildivvy_secret.stat.pw_name == 'maildivvy-admin' and maildivvy_secret.stat.mode == '0600'
+    quiet: true

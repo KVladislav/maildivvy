@@ -1,0 +1,7 @@
+# The inventory maildivvy-install runs site.yml with: the machine itself, over a local
+# connection. An install from a control machine writes its own inventory instead.
+maildivvy:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: /usr/bin/python3

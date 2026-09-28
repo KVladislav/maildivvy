@@ -1,0 +1,47 @@
+---
+# The public checks: the unit tests, ansible-lint and Ansible's syntax check, on every
+# push and pull request. They run the public Makefile's targets, so `make test-unit` and
+# `make lint` on a checkout run the same commands. Nothing here needs a mail machine.
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests
+    # the release Maildivvy installs on
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+      # ansible-core as Ubuntu 26.04 ships it, which the installer runs the roles with
+      - name: Install the test dependencies
+        run: >-
+          python -m pip install
+          pytest==9.0.2 pyyaml==6.0.3 flask==3.1.3 jinja2==3.1.6 ansible-core==2.20.1
+      - name: Run the unit tests
+        run: make test-unit
+
+  lint:
+    name: Ansible lint and syntax check
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install ansible-lint
+        run: python -m pip install ansible-core==2.20.1 ansible-lint==26.9.0
+      - name: Run ansible-lint and the syntax check
+        run: make lint

@@ -1,0 +1,31 @@
+# Maildivvy, install step 8: every full-text search setting, in one file. The
+# distribution's 90-fts.conf and 90-fts-flatcurve.conf are emptied, since a 90- file
+# overrides this one whatever it says.
+#
+# Search covers headers and body text, never attachment contents: no decoder is
+# configured.
+fts_driver = flatcurve
+
+# The block form: the flat alias is a different setting the driver never reads.
+fts flatcurve {
+  substring_search = no
+}
+
+# Background indexing stays off until a schedule is decided.
+fts_autoindex = no
+
+# A body search is answered from the index or fails; it never falls back to reading
+# every message, which would hide a lost index.
+fts_search_read_fallback = no
+
+# From the stock 90-fts.conf: a search indexes the messages not yet indexed first.
+fts_search_add_missing = yes
+
+# From the stock 90-fts-flatcurve.conf: the language pipeline.
+language_filters = normalizer-icu snowball stopwords
+language_tokenizers = generic email-address
+language_tokenizer_generic_algorithm = simple
+language en {
+  default = yes
+  filters = lowercase snowball english-possessive stopwords
+}

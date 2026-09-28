@@ -1,0 +1,22 @@
+#!/usr/bin/python3
+"""Report every subsystem's health. See health/run.py.
+
+A timer runs this as maildivvy-health every five minutes (install step 17); an operator or
+a monitoring system runs it the same way, whole or for one subsystem.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.health.run import main  # noqa: E402
+
+sys.exit(main())

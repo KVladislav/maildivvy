@@ -1,0 +1,6 @@
+# Maildivvy, install step 8: deliberately empty of settings, and it has to exist.
+#
+# Replaces the distribution's file of this name (the original is in conf.d.stock/).
+# conf.d is read in name order, so a 90- file overrides 20-fts.conf; the stock one
+# turned on what 20-fts.conf turns off. Deleting it would let a package upgrade bring
+# it back.

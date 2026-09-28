@@ -1,0 +1,103 @@
+# Install step 16: the backup.
+#
+# What the step leaves: `maildivvy-backup` and its daily timer; the database and the fetch
+# state dumped together, retained by count, judged by content; the operator's store-copy
+# command, if one is set. The product copies no mail: the store's copy is the operator's,
+# must keep hardlinks and must be no older than the dump it is restored with.
+#
+# Proof: a first run taken through the unit itself - so its sandbox, its one capability
+# and its pause of collection and fan-out are what is exercised - and read back. A re-run
+# over a machine that has one takes no second run: it reads the newest one back instead,
+# so a re-run changes nothing.
+
+- name: The runs' directory, root's alone
+  ansible.builtin.file:
+    path: "{{ maildivvy_backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: The directory of the status the rest of the machine reads
+  ansible.builtin.file:
+    path: "{{ maildivvy_backup_status_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: The backup's settings
+  ansible.builtin.template:
+    src: backup.conf.j2
+    dest: "{{ maildivvy_backup_conf }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Install the backup's unit and timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: ["{{ maildivvy_backup_unit }}", "{{ maildivvy_backup_timer }}"]
+  register: maildivvy_backup_units_written
+
+- name: Tell systemd the units changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: maildivvy_backup_units_written is changed
+
+- name: The timer runs and starts at boot; the service is started by it alone
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_backup_timer }}"
+    enabled: true
+    state: started
+
+- name: Is there a run already?
+  ansible.builtin.stat:
+    path: "{{ maildivvy_backup_status }}"
+  register: maildivvy_backup_status_file
+
+# `systemctl start` on a oneshot returns when the run has ended, with its exit: a run that
+# failed fails the step here, with the unit's own words in its journal.
+- name: Take the first run, through the unit
+  ansible.builtin.command:
+    argv: [systemctl, start, "{{ maildivvy_backup_unit }}"]
+  when: not maildivvy_backup_status_file.stat.exists
+  changed_when: true
+
+# --- read back --------------------------------------------------------------------------------
+
+- name: Read the newest run's status
+  ansible.builtin.slurp:
+    src: "{{ maildivvy_backup_status }}"
+  register: maildivvy_backup_status_read
+
+- name: Read the newest run back from the disk
+  ansible.builtin.stat:
+    path: "{{ maildivvy_backup_dir }}/{{ (maildivvy_backup_status_read.content | b64decode | from_json).stamp }}/{{ item }}"
+  loop: [database.dump, fetch.tar, manifest.json]
+  register: maildivvy_backup_files
+
+- name: Read the runs' directory back
+  ansible.builtin.stat:
+    path: "{{ maildivvy_backup_dir }}"
+  register: maildivvy_backup_dir_read
+
+- name: The newest run is whole, held tables and rows, and is root's alone
+  vars:
+    held: "{{ maildivvy_backup_status_read.content | b64decode | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - held.tables | int > 0
+      - held.rows | int > 0
+      - held.state_entries | int > 0
+      - maildivvy_backup_files.results | selectattr('stat.exists') | list | length == 3
+      - maildivvy_backup_files.results | map(attribute='stat.mode') | unique | list == ['0600']
+      - maildivvy_backup_files.results | map(attribute='stat.pw_name') | unique | list == ['root']
+      - maildivvy_backup_dir_read.stat.mode == '0700'
+      - maildivvy_backup_dir_read.stat.pw_name == 'root'
+    fail_msg: "the newest backup run {{ held.stamp | default('?') }} is not whole: {{ held }}"
+    quiet: true

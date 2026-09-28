@@ -1,0 +1,28 @@
+# Install step 7: the Postfix package alone, so the `postfix` account exists before
+# Dovecot first starts with a listener owned by it. Step 1
+# preseeded the package's question (`Local only`: loopback only), so the install never
+# waits; step 9 writes the product's configuration.
+
+- name: Install Postfix from the distribution
+  ansible.builtin.apt:
+    name: postfix
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Read the postfix account
+  ansible.builtin.getent:
+    database: passwd
+    key: postfix
+
+- name: Read the postfix group
+  ansible.builtin.getent:
+    database: group
+    key: postfix
+
+- name: The postfix account and group exist (step 7's proof)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.getent_passwd.postfix is defined
+      - ansible_facts.getent_group.postfix is defined
+    quiet: true

@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+"""Name an outgoing message in the domain archive. See senthook/hook.py.
+
+Dovecot invokes this program through `sent.sieve` on an APPEND to Sent, as the mail
+owner, with the mailbox as its one argument, the message on stdin and the login in
+`USER`. It exits 0 whatever happens: its exit would otherwise fail the client's APPEND.
+"""
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # /opt/maildivvy is the deployed tree exactly
+
+# /opt/maildivvy/bin -> /opt/maildivvy/lib; bin/ -> src/ in a checkout
+for lib in ("lib", "src"):
+    candidate = Path(__file__).resolve().parents[1] / lib
+    if (candidate / "maildivvy").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from maildivvy.senthook.hook import main  # noqa: E402
+
+sys.exit(main())

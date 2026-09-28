@@ -1,0 +1,6 @@
+# ⛔ NO COPIES. The milter proxy is how a mail server talks to rspamd; ours talks to the
+# normal worker over the unix socket instead. Measured 2026-09-20: left at its default
+# this worker listens on `*:11332` inside the container and warns that it accepts
+# privileged file inputs on a non-loopback listener. Off, rspamd binds no TCP port at
+# all.
+count = 0;

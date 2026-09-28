@@ -1,0 +1,13 @@
+---
+# ansible-lint's configuration for the roles in ansible/ (`make lint`, and the CI workflow).
+# The rules run as ansible-lint ships them; what is left out is left out on purpose, and
+# each exception says why. A single task the rule does not fit is listed, with its reason,
+# in .ansible-lint-ignore beside this file.
+
+skip_list:
+  # Every setting and every registered result is named `maildivvy_<role>_...` or
+  # `maildivvy_...`: one prefix across the roles, because the operator sets them all in
+  # one inventory, the preflight module reads settings that several roles share, and a
+  # name never collides with another project's. The rule wants `<role>_` instead, which
+  # would rename every setting an installed machine's inventory already holds.
+  - var-naming[no-role-prefix]

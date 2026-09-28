@@ -1,0 +1,48 @@
+# What an operator may override for install step 11 (`ansible/README.md`). Nothing here
+# is site-specific.
+
+maildivvy_docker_packages: [docker.io, docker-compose-v2]
+
+# ⛔ THE PIN. A tag moves, and a machine that pulls again then runs another scanner with
+# nobody looking. The digest is what the runtime is given; the tag is
+# recorded beside it so a reader knows which release it names, and the two are changed
+# together. Repinning is an act of the upgrade path, which this step performs and
+# verifies - it never happens on a timer.
+maildivvy_rspamd_repository: docker.io/rspamd/rspamd
+maildivvy_rspamd_tag: "4.2.0"                # read from the registry 2026-09-20
+maildivvy_rspamd_digest: "sha256:063ba7817e2ffba07a8b7ec8224dcdcecf74aefad551f5cae6196dbf3e58603f"
+
+# The image's own gid, and the name its passwd entry gives that id. The host group
+# `maildivvy-rspamd` (the programs role, same number) exists only to name this gid, so
+# the mail owner and health open the socket rspamd creates. The step
+# reads both out of the image: a repin that moved them stops the install.
+maildivvy_rspamd_gid: 11333
+maildivvy_rspamd_user: _rspamd
+
+# The scanner's bands. Nothing in the pipeline files by the action: the delivery filter
+# compares the score with the receiving domain's threshold.
+# ⛔ `reject` is ONE VALUE with the ceiling of `domain.spam_threshold`
+# (`schema/0001_initial.sql`) and `maildivvy.lib.scan.TOP_SCORE`, so a message the scanner
+# rejects outright is at or above every threshold a domain may hold. Move it here and it
+# moves there, in a migration of its own.
+maildivvy_rspamd_reject_score: 150
+maildivvy_rspamd_add_header_score: 6
+maildivvy_rspamd_greylist_score: 4
+
+# What a provider host's own `Received` header means, per host:
+#   trust_login     an authenticated submission there names the sender: the client is
+#                   pinned and the task marked authenticated, so SPF and DMARC are skipped
+#   judge_provider  a login there is any customer: the provider's own address stays in
+#                   place for a submission and SPF and DMARC run against it
+# ⛔ Empty by default. A provider is pinned only after a real chain of its mail has been
+# read; one that is not listed is judged against its POP3 server, and the rule logs that
+# it was not pinned.
+maildivvy_rspamd_provider_hosts: {}
+
+# DNSBLs stay off until a resolver that answers them is chosen: through a forwarding
+# resolver every public list answers "open resolver" INSIDE the listed range, so every
+# message would read as listed on every list. Turning them on is refused
+# while this machine's resolver answers for an address that is not listed.
+maildivvy_rspamd_rbls: false
+maildivvy_rspamd_rbl_listed_probe: 2.0.0.127.zen.spamhaus.org   # listed by design
+maildivvy_rspamd_rbl_clean_probe: 1.0.0.127.zen.spamhaus.org    # never listed, by design

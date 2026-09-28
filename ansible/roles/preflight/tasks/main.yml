@@ -1,0 +1,222 @@
+# Install step 1: settings, disks, packages. Nothing is changed until every setting
+# and every disk passes; a refusal lists all of them at once.
+
+# a machine maildivvy-install recorded a version for is upgraded by it, a backup
+# first and by its version rule. A run from a control machine takes no backup and applies
+# no rule, so it installs afresh or re-proves the version recorded, nothing else.
+- name: Refuse what a run from a control machine must not install over
+  when: not maildivvy_installer_run | default(false)
+  block:
+    - name: Read the version installed, for a run from a control machine
+      ansible.builtin.slurp:
+        src: /etc/maildivvy/version
+      register: maildivvy_installed_version
+      failed_when: false
+
+    - name: A run from a control machine never upgrades a machine that records its version
+      ansible.builtin.assert:
+        that: >-
+          maildivvy_installed_version.content is not defined
+          or (maildivvy_installed_version.content | b64decode | trim) == maildivvy_release_version
+        fail_msg: >-
+          this machine runs Maildivvy {{ maildivvy_installed_version.content | default('') | b64decode | trim }}
+          and this tree is {{ maildivvy_release_version }}: upgrade it with maildivvy-install from the
+          unpacked release, which takes a backup first
+        quiet: true
+
+    # our schema with no version file and no unfinished install is a machine from
+    # before 0.1.0 (as installer.upgrade.installed reads it). maildivvy-install moves it on
+    # to a 0.1 release only, with a backup and collection paused first; a control machine's
+    # run would apply this tree's migrations with neither, whatever its version, so it is
+    # refused. The first version's own tree, the way back from a failed upgrade, has no
+    # such check.
+    - name: Refuse a machine from before 0.1.0, or one that cannot tell
+      when: maildivvy_installed_version.content is not defined
+      block:
+        - name: Read whether this machine has our schema, for a run from a control machine with no version
+          ansible.builtin.command:
+            argv: [runuser, -u, postgres, --, psql, -X, -At, -d, maildivvy, -c, SELECT count(*) FROM schema_version]
+          register: maildivvy_schema_read
+          changed_when: false
+          failed_when: false
+
+        - name: Read whether a first install is unfinished, for a run from a control machine with no version
+          ansible.builtin.stat:
+            path: /etc/maildivvy/installing
+          register: maildivvy_unfinished
+
+        - name: A run from a control machine never takes over a machine from before 0.1.0
+          ansible.builtin.assert:
+            that: >-
+              not (maildivvy_schema_read.rc | default(1) == 0
+                   and (maildivvy_schema_read.stdout | default('0') | int) > 0
+                   and not maildivvy_unfinished.stat.exists)
+            fail_msg: >-
+              this machine runs Maildivvy from before 0.1.0 (our schema, no /etc/maildivvy/version):
+              upgrade it with maildivvy-install from an unpacked 0.1 release, which takes a backup
+              first; a run from a control machine takes none
+            quiet: true
+
+        # Fails closed, as installer.upgrade.schema_versions does: a database that does not
+        # answer cannot tell a machine from before 0.1.0 from a clean one. Only a read saying
+        # nothing is there (no psql, no postgres account, no database or no table), an
+        # answer, or an unfinished install goes on.
+        - name: A run from a control machine with no version refuses a machine whose database does not answer
+          ansible.builtin.assert:
+            that: >-
+              maildivvy_unfinished.stat.exists
+              or maildivvy_schema_read.rc | default(1) in [0, 127]
+              or 'does not exist' in maildivvy_schema_read.stderr | default('')
+            fail_msg: >-
+              cannot tell whether this machine runs Maildivvy from before 0.1.0 (no /etc/maildivvy/version):
+              its database did not answer (exit {{ maildivvy_schema_read.rc | default('none') }}:
+              {{ maildivvy_schema_read.stderr | default(maildivvy_schema_read.msg | default('')) | trim }});
+              start PostgreSQL and run again
+            quiet: true
+
+- name: Check every setting and identify the data disks
+  maildivvy_preflight:
+    hostname: "{{ maildivvy_hostname | default(omit) }}"
+    cert_name: "{{ maildivvy_cert_name | default(omit) }}"
+    vmail_uid: "{{ maildivvy_vmail_uid | default(omit) }}"
+    vmail_gid: "{{ maildivvy_vmail_gid | default(omit) }}"
+    disk_mode: "{{ maildivvy_disk_mode | default(omit) }}"
+    store_disk: "{{ maildivvy_store_disk | default(omit) }}"
+    index_disk: "{{ maildivvy_index_disk | default(omit) }}"
+    swap_disk: "{{ maildivvy_swap_disk | default(omit) }}"
+    single_disk_allow_reflink: "{{ maildivvy_single_disk_allow_reflink | default(omit) }}"
+    admin_networks: "{{ maildivvy_admin_networks | default(omit) }}"
+    firewall_confirmation: "{{ maildivvy_firewall_confirmation | default(omit) }}"
+    admin_ssh_source: "{{ maildivvy_admin_ssh_source | default(omit) }}"
+    connection: "{{ ansible_connection | default('ssh') }}"
+    container_pool: "{{ maildivvy_container_pool }}"
+    breakglass_password: "{{ maildivvy_breakglass_password | default(omit) }}"
+    cert_mode: "{{ maildivvy_cert_mode | default(omit) }}"
+    insecure_test_certificate: "{{ maildivvy_insecure_test_certificate | default(omit) }}"
+    acme_dns_provider: "{{ maildivvy_acme_dns_provider | default(omit) }}"
+    acme_dns_credentials: "{{ maildivvy_acme_dns_credentials | default(omit) }}"
+    acme_email: "{{ maildivvy_acme_email | default(omit) }}"
+    provided_cert: "{{ maildivvy_provided_cert | default(omit) }}"
+    provided_chain: "{{ maildivvy_provided_chain | default(omit) }}"
+    provided_key: "{{ maildivvy_provided_key | default(omit) }}"
+    backup_keep: "{{ maildivvy_backup_keep | default(omit) }}"
+    backup_store_copy: "{{ maildivvy_backup_store_copy | default(omit) }}"
+    health_textfile_dir: "{{ maildivvy_health_textfile_dir | default(omit) }}"
+  register: maildivvy_preflight
+
+- name: Read the vmail group, if there is one
+  ansible.builtin.getent:
+    database: group
+    key: vmail
+    fail_key: false
+
+- name: Read the vmail user, if there is one
+  ansible.builtin.getent:
+    database: passwd
+    key: vmail
+    fail_key: false
+
+- name: An existing vmail keeps its uid and gid; it is never renumbered
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.getent_group.vmail is none
+        or ansible_facts.getent_group.vmail[1] | int == maildivvy_vmail_gid | int
+      - ansible_facts.getent_passwd.vmail is none
+        or (ansible_facts.getent_passwd.vmail[1] | int == maildivvy_vmail_uid | int
+            and ansible_facts.getent_passwd.vmail[2] | int == maildivvy_vmail_gid | int)
+    fail_msg: >-
+      vmail already exists with other ids than the settings' uid {{ maildivvy_vmail_uid }}
+      and gid {{ maildivvy_vmail_gid }}; the store's owner is never renumbered, so
+      correct the settings or the machine
+    quiet: true
+
+- name: Preseed Postfix's mailer-type question, so its install never waits
+  ansible.builtin.debconf:
+    name: postfix
+    question: postfix/main_mailer_type
+    vtype: select
+    value: Local only
+
+- name: Install the base packages non-interactively
+  ansible.builtin.apt:
+    name: "{{ maildivvy_base_packages }}"
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# The distribution's ClamAV turns the rule of no ClamAV on the host around: the host's
+# ClamAV daemon and updater are what step 10 installs, since the distribution's package is
+# patched unattended. What stays of the rule is this package, which makes the `clamav`
+# account the programs role's groups and step 10 need, and --no-install-recommends, which
+# keeps host scanning tools off the machine.
+- name: Install clamav-base without Recommends, for the clamav account
+  ansible.builtin.apt:
+    name: clamav-base
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# --- read back ----------------------------------------------------------------
+
+- name: Read the installed packages back
+  ansible.builtin.package_facts:
+
+- name: Every base package is installed, and no host scanning tools
+  ansible.builtin.assert:
+    that:
+      - (maildivvy_base_packages + ['clamav-base']) | difference(ansible_facts.packages.keys()) == []
+      - "'clamav' not in ansible_facts.packages"       # clamscan and clamconf: step 10 probes
+      - "'clamdscan' not in ansible_facts.packages"    # with the product's own client instead
+    quiet: true
+
+- name: The clamav account exists, made by clamav-base
+  ansible.builtin.getent:
+    database: passwd
+    key: clamav
+
+- name: Read /etc/ssl/private
+  ansible.builtin.stat:
+    path: /etc/ssl/private
+  register: maildivvy_ssl_private
+
+- name: /etc/ssl/private is 0710 root:ssl-cert, the package's own
+  ansible.builtin.assert:
+    that:
+      - maildivvy_ssl_private.stat.mode == '0710'
+      - maildivvy_ssl_private.stat.pw_name == 'root'
+      - maildivvy_ssl_private.stat.gr_name == 'ssl-cert'
+    quiet: true
+
+# a first install from a control machine is recorded as unfinished, as
+# maildivvy-install records its own, until the version is written at the end of the play.
+# Without it, one that stopped past step 6 leaves our schema and no version file, which
+# maildivvy-install takes for a machine from before 0.1.0 and would upgrade. Only where
+# the installer would find nothing (installer.upgrade.schema_versions, read above): no psql,
+# no postgres account, no database or no table - never on a machine with our schema, nor
+# one whose PostgreSQL does not answer.
+- name: Tell whether this is a first install from a control machine
+  ansible.builtin.set_fact:
+    maildivvy_control_first_install: >-
+      {{ maildivvy_schema_read.rc is defined and (maildivvy_schema_read.rc == 127
+         or 'does not exist' in maildivvy_schema_read.stderr | default('')) }}
+
+- name: /etc/maildivvy exists, for the unfinished record
+  ansible.builtin.file:
+    path: /etc/maildivvy
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: maildivvy_control_first_install | bool
+
+- name: Record a first install from a control machine as unfinished until its version is written
+  ansible.builtin.copy:
+    content: "{{ maildivvy_release_version }}\n"
+    dest: /etc/maildivvy/installing
+    owner: root
+    group: root
+    mode: "0644"
+  when: maildivvy_control_first_install | bool

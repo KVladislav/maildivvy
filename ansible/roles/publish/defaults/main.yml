@@ -1,0 +1,25 @@
+# Install step 19: publication.
+#
+# The two published ports. Step 3 keeps exactly the rules this step writes for them
+# (ansible/roles/firewall, `maildivvy_mail_ports` there); a unit test holds the two equal.
+maildivvy_publish_ports: [993, 465]
+
+# The per-source connection budgets: IMAP's is higher, because a client
+# reconnects whenever IDLE drops. A source above its budget has its new connections
+# dropped; loopback and the administrator networks are not limited, as they never came
+# through the router that carried these limits before.
+maildivvy_publish_rate_limits:
+  993: {name: imaps, rate: 30/min, burst: 60}
+  465: {name: submissions, rate: 10/min, burst: 20}
+
+maildivvy_publish_chain: maildivvy-mail-limit
+maildivvy_publish_block: maildivvy mail rate limits
+maildivvy_publish_before_rules:
+  4: /etc/ufw/before.rules
+  6: /etc/ufw/before6.rules
+
+# Written once the ports are open: `{"published_at": ...}`; the outside probe's result is
+# added to it by maildivvy-publication. Health reads it (health/settings.py).
+maildivvy_publish_record: /var/lib/maildivvy/publication.json
+maildivvy_publish_program: /usr/local/sbin/maildivvy-publication
+maildivvy_publish_health: /opt/maildivvy/bin/maildivvy-health

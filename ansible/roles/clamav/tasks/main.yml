@@ -1,0 +1,243 @@
+# Install step 10: ClamAV from the distribution, so it is patched unattended with the
+# rest of the machine. Its daemon, its signature updater and the
+# community feed updater run on the host as the `clamav` account `clamav-base` made in
+# step 1; `vmail` and `maildivvy-milter` are in its group from the programs role, so the
+# delivery filter and the milter open the socket. The socket's directory is recreated at
+# every boot before anything binds into it. The step's
+# proof is EICAR through the product's own client as `vmail`.
+
+- name: Read the clamav account, which every part of this step runs as
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ maildivvy_clamav_user }}"
+
+# --- the socket directory, before any daemon binds into it -------
+
+- name: The socket directory is recreated at every boot, with the daemon's ownership
+  ansible.builtin.copy:
+    dest: "{{ maildivvy_clamav_tmpfiles }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Maildivvy, install step 10. /run is tmpfs: a directory made once at install is
+      # gone at the first reboot, and a daemon that cannot bind its socket looks like an
+      # intermittent scanner rather than a missing directory (#). systemd-tmpfiles-setup runs at sysinit.target, before the
+      # daemons and before the container runtime, and `d` corrects an existing directory.
+      d {{ maildivvy_clamav_socket_dir }} 0750 {{ maildivvy_clamav_user }} {{ maildivvy_clamav_user }} -
+  register: maildivvy_clamav_tmpfiles_written
+
+- name: Apply it now, so the directory is there before the daemon starts
+  ansible.builtin.command:
+    argv: [systemd-tmpfiles, --create, "{{ maildivvy_clamav_tmpfiles }}"]
+  changed_when: false
+
+# --- the packages, then the daemon's configuration, ours and not theirs -------------------------
+
+- name: Install the daemon, the signature updater and the community feed updater
+  ansible.builtin.apt:
+    name: "{{ maildivvy_clamav_packages }}"
+    install_recommends: false   # no clamdscan: the product's own client is the probe
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ⛔ After the package, never before it. The package's own configure step decides this
+# answer and writes clamd.conf from it, so a value set beforehand is overwritten once
+# and the step would need a second run to settle. With it false the postinst leaves
+# /etc/clamav/clamd.conf alone from here on, instead of regenerating it from debconf
+# answers at an upgrade, which would undo the settings below on a machine that is
+# patched unattended.
+- name: The package does not manage clamd.conf
+  ansible.builtin.debconf:
+    name: clamav-daemon
+    question: clamav-daemon/debconf
+    vtype: boolean
+    value: "false"
+
+- name: Write clamd.conf, replacing whatever the package left
+  ansible.builtin.template:
+    src: clamd.conf.j2
+    dest: "{{ maildivvy_clamav_conf }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_clamav_conf_written
+
+- name: The updater runs and starts at boot
+  ansible.builtin.systemd:
+    name: clamav-freshclam
+    state: started
+    enabled: true
+
+# The daemon's unit and its socket carry ConditionPathExistsGlob on these, so both are
+# skipped silently while the first download is still running.
+- name: Wait for the official databases the daemon needs to start
+  ansible.builtin.shell:
+    cmd: >-
+      ls {{ maildivvy_clamav_database_dir }}/main.c[vl]d {{ maildivvy_clamav_database_dir }}/main.inc
+      {{ maildivvy_clamav_database_dir }}/daily.c[vl]d {{ maildivvy_clamav_database_dir }}/daily.inc
+      2>/dev/null | wc -l
+  register: maildivvy_clamav_databases
+  changed_when: false
+  until: maildivvy_clamav_databases.stdout | int >= 2
+  retries: "{{ (maildivvy_clamav_database_wait | int / 10) | int }}"
+  delay: 10
+
+- name: Read the systemd units again, so the socket unit is generated from our clamd.conf
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: maildivvy_clamav_conf_written.changed
+
+# The socket's mode and group come from the generator reading clamd.conf, so a changed
+# configuration means both are made again, the service first since the socket triggers it.
+- name: Stop the daemon and its socket for a changed configuration
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop: [clamav-daemon.service, clamav-daemon.socket]
+  when: maildivvy_clamav_conf_written.changed
+
+- name: The socket and the daemon run and start at boot
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: [clamav-daemon.socket, clamav-daemon.service]
+
+# --- the community feed --------------------------------------------------
+
+- name: Make the feed updater's state directory, owned by the account it runs as
+  ansible.builtin.file:
+    path: "{{ maildivvy_fangfrisch_state }}"
+    state: directory
+    owner: "{{ maildivvy_clamav_user }}"
+    group: "{{ maildivvy_clamav_user }}"
+    mode: "0770"   # the shipped unit's StateDirectoryMode, so its own run changes nothing
+
+- name: Write the feed updater's configuration, at the path its timer's condition names
+  ansible.builtin.template:
+    src: fangfrisch.conf.j2
+    dest: "{{ maildivvy_fangfrisch_conf }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Make the feed updater's database, as the account that writes the signatures
+  ansible.builtin.command:
+    argv: [runuser, -u, "{{ maildivvy_clamav_user }}", --, fangfrisch, --conf,
+           "{{ maildivvy_fangfrisch_conf }}", initdb]
+    creates: "{{ maildivvy_fangfrisch_db }}"
+
+# Run through its own unit, as the timer will, so the run proves the unit too. The
+# journal keeps what it did; a failure here is a failure of the step (:
+# signatures are never quietly left out).
+- name: Refresh the community signatures now
+  ansible.builtin.systemd:
+    name: fangfrisch.service
+    state: restarted
+  changed_when: false
+
+- name: The feed updater's timer is enabled and running
+  ansible.builtin.systemd:
+    name: fangfrisch.timer
+    state: started
+    enabled: true
+
+# Otherwise the community signatures wait for the daemon's next self-check, and the
+# step's own probe would read a daemon that has not loaded what this step just wrote.
+- name: Load the signatures into the running daemon
+  ansible.builtin.systemd:
+    name: clamav-daemon
+    state: reloaded
+  changed_when: false
+
+- name: Wait until the daemon answers again, the reload being a pause in scanning
+  ansible.builtin.command:
+    argv: [runuser, -u, vmail, --, env, PYTHONPATH=/opt/maildivvy/lib, PYTHONDONTWRITEBYTECODE=1,
+           python3, -c, "{{ maildivvy_clamav_ping }}"]
+  register: maildivvy_clamav_ping_read
+  changed_when: false
+  until: maildivvy_clamav_ping_read.stdout == 'clean'
+  retries: 30
+  delay: 10
+
+# --- read back ----------------------------------------------------------------------------------
+
+- name: Read the configuration the daemon was started from, from the file
+  ansible.builtin.command:
+    argv: [grep, -E, '^(ConcurrentDatabaseReload|StreamMaxLength|MaxFileSize|LocalSocket|LocalSocketMode|Move|Remove|Copy)',
+           "{{ maildivvy_clamav_conf }}"]
+  register: maildivvy_clamav_effective
+  changed_when: false
+
+- name: Reload is off, the limits are the ones set, and nothing moves a file
+  ansible.builtin.assert:
+    that:
+      - "'ConcurrentDatabaseReload ' ~ maildivvy_clamav_concurrent_reload in maildivvy_clamav_effective.stdout_lines"
+      - "'StreamMaxLength ' ~ maildivvy_clamav_stream_max in maildivvy_clamav_effective.stdout_lines"
+      - "'MaxFileSize ' ~ maildivvy_clamav_file_max in maildivvy_clamav_effective.stdout_lines"
+      - maildivvy_clamav_effective.stdout_lines | select('match', '^(Move|Remove|Copy)') | list == []
+    fail_msg: "{{ maildivvy_clamav_effective.stdout_lines }}"
+    quiet: true
+
+- name: Read the socket and its directory
+  ansible.builtin.command:
+    argv: [stat, -c, '%n %F %a %U %G', "{{ maildivvy_clamav_socket_dir }}", "{{ maildivvy_clamav_socket }}"]
+  register: maildivvy_clamav_socket_read
+  changed_when: false
+
+- name: The socket is the group's alone, in a directory of the daemon's own
+  ansible.builtin.assert:
+    that:
+      - maildivvy_clamav_socket_read.stdout_lines[0] ==
+        maildivvy_clamav_socket_dir ~ ' directory 750 ' ~ maildivvy_clamav_user ~ ' ' ~ maildivvy_clamav_user
+      - maildivvy_clamav_socket_read.stdout_lines[1] ==
+        maildivvy_clamav_socket ~ ' socket 660 ' ~ maildivvy_clamav_user ~ ' ' ~ maildivvy_clamav_user
+    fail_msg: "{{ maildivvy_clamav_socket_read.stdout_lines }}"
+    quiet: true
+
+# The step's proof (docs/architecture.md § Installation, step 10): EICAR through the
+# product's own client, as the mail owner, over the socket it will use.
+- name: Scan EICAR, a clean message and one byte over the limit, as the mail owner
+  ansible.builtin.command:
+    argv: [runuser, -u, vmail, --, env, PYTHONPATH=/opt/maildivvy/lib, PYTHONDONTWRITEBYTECODE=1,
+           python3, -c, "{{ maildivvy_clamav_probe }}", "{{ maildivvy_clamav_eicar }}",
+           "{{ maildivvy_clamav_stream_max }}", "{{ maildivvy_clamav_file_max }}"]
+  register: maildivvy_clamav_probe_read
+  changed_when: false
+
+- name: The verdicts and the limits the running daemon answers with
+  vars:
+    probe: "{{ maildivvy_clamav_probe_read.stdout | from_json }}"
+  ansible.builtin.assert:
+    that:
+      - probe.eicar.verdict == 'infected'
+      - "'FOUND' in probe.eicar.detail"
+      - probe.clean.verdict == 'clean'
+      - probe.gated.verdict == 'unscanned'          # our own gate, before the socket
+      - "'nobody looked' in probe.gated.detail"
+      - probe.over.verdict == 'unscanned'           # the daemon's own limit, read back
+      - "'size limit exceeded' in probe.over.detail"
+      - probe.limit_matches                         # the gate is the lower of the two set here
+      - probe.version is not none                   # health reads the running daemon
+    fail_msg: "{{ maildivvy_clamav_probe_read.stdout }}"
+    quiet: true
+
+- name: Read the community signatures the feed updater wrote
+  ansible.builtin.shell:
+    cmd: >-
+      find {{ maildivvy_clamav_database_dir }} -maxdepth 1 -newer {{ maildivvy_clamav_database_dir }}/main.cvd
+      -type f ! -name 'main.*' ! -name 'daily.*' ! -name 'bytecode.*' ! -name 'freshclam.dat'
+      -printf '%u %f\n' | sort
+  register: maildivvy_clamav_community
+  changed_when: false
+
+- name: They are beside the official databases and owned by the same account
+  ansible.builtin.assert:
+    that:
+      - maildivvy_clamav_community.stdout_lines | length > 0
+      - maildivvy_clamav_community.stdout_lines | reject('match', maildivvy_clamav_user ~ ' ') | list == []
+    fail_msg: "community signatures: {{ maildivvy_clamav_community.stdout_lines }}"
+    quiet: true
+  when: maildivvy_clamav_community_feed

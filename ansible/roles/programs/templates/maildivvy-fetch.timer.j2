@@ -1,0 +1,22 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# Every `maildivvy_fetch_minutes`, three by default. The period is also
+# what the interface shows as "look again by", so it is read from this
+# unit, never written a second time.
+[Unit]
+Description=Maildivvy: collect mail every {{ maildivvy_fetch_minutes | int }} min
+
+[Timer]
+# ⛔ A CALENDAR, NOT OnUnitActiveSec=, BECAUSE Persistent= HAS AN EFFECT ON NOTHING ELSE
+# (systemd 259's own manual). A machine that was down over a slot collects as soon as it
+# is up instead of waiting out another whole period.
+OnCalendar=*:0/{{ maildivvy_fetch_minutes | int }}
+Persistent=true
+AccuracySec=10s
+# ⚠️ Jitter, so twenty mailboxes at one provider are not all polled at the same second
+# of every slot - and well inside the slot, or a run lands in the next one. A
+# provider declares LOGIN-DELAY 300 and a refusal would read as a changed password.
+RandomizedDelaySec={{ maildivvy_fetch_jitter }}
+Unit=maildivvy-fetch.service
+
+[Install]
+WantedBy=timers.target

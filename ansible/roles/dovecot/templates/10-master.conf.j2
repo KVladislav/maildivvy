@@ -1,0 +1,42 @@
+# Maildivvy, install step 8. Replaces the distribution's file of this name; the
+# original is in conf.d.stock/.
+#
+# IMAP and nothing else: submission is Postfix's, delivery the pipeline's.
+protocols = imap
+
+service imap-login {
+  # Cleartext IMAP is closed by port 0, not by `ssl = required`, which still answers on
+  # 143 and refuses at the wrong layer.
+  inet_listener imap {
+    port = 0
+  }
+  # Implicit TLS only. The firewall keeps 993 closed until publication (step 19, 0001).
+  inet_listener imaps {
+    port = 993
+    ssl = yes
+  }
+}
+
+service auth {
+  # The pipeline, running as vmail, reads the userdb here.
+  unix_listener auth-userdb {
+    mode = 0660
+    user = vmail
+    group = vmail
+  }
+  # Postfix authenticates submission against the same passdb (step 9). Its account
+  # exists since step 7, or Dovecot refuses to start.
+  unix_listener {{ maildivvy_dovecot_postfix_auth }} {
+    mode = 0660
+    user = postfix
+    group = postfix
+  }
+}
+
+service anvil {
+  unix_listener anvil {
+    mode = 0660
+    user = vmail
+    group = vmail
+  }
+}

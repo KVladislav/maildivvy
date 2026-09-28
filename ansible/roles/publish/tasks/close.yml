@@ -1,0 +1,42 @@
+# Close 993 and 465 at the firewall and forget the publication.
+#
+# What steps 18 and 19 run when a proof fails: the install then stops with the mail ports
+# closed and says why. ufw deletes a rule by its specification without stopping the
+# firewall. The rate
+# limits stay: they limit nothing on a closed port. The record is removed, so health reads
+# the ports as unpublished and an old outside result can never vouch for a later opening.
+
+- name: Read ufw's rule records
+  ansible.builtin.command: cat /etc/ufw/user.rules /etc/ufw/user6.rules
+  register: maildivvy_publish_rules_now
+  changed_when: false
+
+- name: Delete the publication's rules, both families
+  ansible.builtin.command:
+    argv: [ufw, delete, allow, proto, tcp, from, any, to, any, port, "{{ item }}"]
+  loop: "{{ maildivvy_publish_ports }}"
+  when: >-
+    ('### tuple ### allow tcp ' ~ item ~ ' 0.0.0.0/0 any 0.0.0.0/0 in') in maildivvy_publish_rules_now.stdout
+    or ('### tuple ### allow tcp ' ~ item ~ ' ::/0 any ::/0 in') in maildivvy_publish_rules_now.stdout
+
+- name: Forget the publication
+  ansible.builtin.file:
+    path: "{{ maildivvy_publish_record }}"
+    state: absent
+
+- name: Read the kernel's user input chains
+  ansible.builtin.shell: |
+    set -e
+    iptables -w -S ufw-user-input
+    ip6tables -w -S ufw6-user-input
+  register: maildivvy_publish_closed
+  changed_when: false
+
+- name: No rule accepts 993 or 465 from anywhere, over IPv4 or IPv6
+  ansible.builtin.assert:
+    that:
+      - maildivvy_publish_closed.stdout_lines
+        | select('match', '^-A ufw6?-user-input -p tcp -m tcp --dport (' ~ maildivvy_publish_ports | join('|') ~ ') -j ACCEPT$')
+        | list | length == 0
+    fail_msg: "a mail port is still accepted: {{ maildivvy_publish_closed.stdout_lines }}"
+    quiet: true

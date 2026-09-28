@@ -1,0 +1,21 @@
+# Maildivvy, install step 8. Replaces the distribution's file of this name, which flags
+# two folders `\Sent`: a client that picked the other one would file its sent mail
+# where the Sent hook never looks. Exactly one here; the
+# original is in conf.d.stock/.
+namespace inbox {
+  mailbox Drafts {
+    special_use = \Drafts
+  }
+  mailbox Junk {
+    special_use = \Junk
+  }
+  mailbox Trash {
+    special_use = \Trash
+  }
+  # Created and subscribed at the first login: an APPEND to a folder that does not
+  # exist is refused, so the Sent hook could never fire for a new account.
+  mailbox Sent {
+    special_use = \Sent
+    auto = subscribe
+  }
+}

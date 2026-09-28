@@ -1,0 +1,15 @@
+# Derived from the settings; not settings themselves.
+maildivvy_published_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
+maildivvy_published_key: /etc/ssl/private/{{ maildivvy_cert_name }}.key
+# staging never shares production's storage path
+maildivvy_lego_path: "{{ maildivvy_lego_dir }}{{ '/staging' if maildivvy_cert_mode == 'acme-staging' else '' }}"
+maildivvy_acme_server: "{{ 'letsencrypt-staging' if maildivvy_cert_mode == 'acme-staging' else 'letsencrypt' }}"
+maildivvy_acme_dns_api_url: "{{ maildivvy_acme_dns_api_urls[maildivvy_acme_dns_provider] | default('') }}"
+maildivvy_lego_source_cert: "{{ maildivvy_lego_path }}/certificates/{{ maildivvy_cert_name }}.crt"
+maildivvy_lego_expected: lego version {{ maildivvy_lego_version }} linux/{{ maildivvy_arch.stdout }}
+# the first version kept deSEC's one token here; the credentials directory replaces it
+maildivvy_first_version_token: "{{ maildivvy_lego_dir }}/desec-token"
+maildivvy_self_signed_warning:
+  - "WARNING: THIS MACHINE HAS A SELF-SIGNED CERTIFICATE for {{ maildivvy_cert_name }}."
+  - "cert_mode is self-signed: no client trusts it and nothing renews it. It is for a test machine only."
+  - "Set cert_mode to acme (the default) with the DNS credentials, or to provided, for a real one."

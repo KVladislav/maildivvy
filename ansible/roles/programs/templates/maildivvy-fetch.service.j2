@@ -1,0 +1,41 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# The fetch runner: one mpop per external mailbox (docs/architecture.md § The path of a
+# message, Collect). It runs as the mail owner, because it hands every retrieved message
+# to the delivery filter, which files it in the domain's archive.
+[Unit]
+Description=Maildivvy: collect mail from every external mailbox
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/fetch/runner.py
+After=network-online.target postgresql.service dovecot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=vmail
+Group=vmail
+ExecStart={{ maildivvy_opt }}/bin/maildivvy-fetch
+# A run that overruns the timer's period is not killed here: the next run takes the
+# try-lock, finds it held and skips that mailbox. mpop itself is bounded by
+# the runner's own wall-clock timeout, which is what this allows for.
+TimeoutStartSec={{ maildivvy_fetch_run_timeout }}
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# ⛔ NOT THE FETCH STATE ALONE, AND BELIEVING THAT COST 21 SCHEDULED RUNS THAT
+# DELIVERED NOTHING. mpop's delivery command is our filter, the filter runs dovecot-lda,
+# and a child inherits this namespace: with the store left out the LDA fails
+# `Read-only file system` on every message while mpop, and then the unit, report success.
+# Every one of these is written on an ordinary run; each exists before the
+# unit first starts, made by step 2 and by the layout above.
+ReadWritePaths={{ maildivvy_var }}/fetch {{ maildivvy_store }} {{ maildivvy_index }}
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+# It binds nothing and opens no privileged port: it keeps no capability at all, in
+# either set, because one set alone is dropped with no message naming it.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

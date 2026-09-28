@@ -1,0 +1,37 @@
+# Maildivvy, install step 8. Replaces the distribution's file of this name (mbox under
+# /home); the original is in conf.d.stock/.
+
+mail_driver = maildir
+mail_path = %{home}/Maildir
+# Explicit: empty puts INBOX at <mail_path>/.INBOX, and doveadm search then answers
+# nothing, which reads as an empty mailbox.
+mail_inbox_path = %{home}/Maildir
+
+# Maildir++: a folder `Sent/<x>` is the directory `.Sent.<x>`, whatever the IMAP
+# separator. A `.` in a name part is stored as `^2e` and `^`
+# as `^5e`. Never change it on a machine that holds mail: the names of
+# existing folders' directories would shift under them.
+mailbox_list_layout = maildir++
+mailbox_list_storage_escape_char = ^
+
+# The store owner's fixed ids, the same on every rebuild.
+mail_uid = {{ maildivvy_vmail_uid }}
+mail_gid = {{ maildivvy_vmail_gid }}
+
+# A `,S=` size in a file name that disagrees with the file makes the message unreadable.
+# `mail_compress` is never enabled: a compressed message is no longer
+# the one file every holder's name points at.
+maildir_broken_filename_sizes = yes
+
+mail_plugins {
+  acl = yes
+  fts = yes
+  fts_flatcurve = yes
+}
+
+# The stock file declared the inbox namespace; this one replaces it, so it declares it.
+# Blocks of one name merge: 15-mailboxes.conf adds the folders.
+namespace inbox {
+  inbox = yes
+  separator = /
+}

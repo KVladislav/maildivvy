@@ -1,0 +1,243 @@
+# Install step 9: Postfix's configuration. Step 7 installed the package, so the
+# `postfix` account exists and Dovecot's SASL listener is owned by it.
+#
+# ⛔ Postfix has no include mechanism and `main.cf.d` is not a directory it reads: every
+# setting here is written by `postconf`, which edits the named ones and leaves the
+# distribution's files otherwise as they are. Nothing is appended.
+#
+# What the step leaves: submission on 465 alone in wrapper mode, SASL through Dovecot's
+# socket, and no other listener - nothing on 25 at all, and `sendmail` for root alone;
+# both transports `error`, so a sender sends only through its own per-sender
+# map; the five maps keyed by sender and never by host; the rewrite in the SMTP client;
+# the provider's certificate verified by name before its password is sent.
+# 465 stays closed to the network by the firewall until publication (step 19).
+
+- name: Install Postfix's lookup maps and the SASL client's mechanisms
+  ansible.builtin.apt:
+    name: "{{ maildivvy_postfix_packages }}"
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Read Postfix's version
+  ansible.builtin.command:
+    argv: [postconf, -h, mail_version]
+  register: maildivvy_postfix_version
+  changed_when: false
+
+- name: Postfix is 3.10, the version this configuration is written and read back against
+  ansible.builtin.assert:
+    that: maildivvy_postfix_version.stdout is match('3\.10\.')
+    fail_msg: "Postfix {{ maildivvy_postfix_version.stdout }}; the configuration is 3.10's"
+    quiet: true
+
+# --- the database role -------------------------------------------
+
+- name: Give the daemon's role LOGIN, which step 6 withheld until its user existed
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
+    stdin: |
+      DO $$
+      BEGIN
+          IF NOT (SELECT rolcanlogin FROM pg_roles WHERE rolname = '{{ maildivvy_postfix_db_role }}') THEN
+              ALTER ROLE {{ maildivvy_postfix_db_role }} LOGIN;
+              RAISE NOTICE 'granted login';
+          END IF;
+      END
+      $$;
+  register: maildivvy_postfix_login
+  changed_when: "'granted login' in maildivvy_postfix_login.stderr"
+
+# ⚠️ INSIDE THE CHROOT. `submissions` runs chrooted, so `smtpd` resolves the map's
+# `passfile=/etc/postfix/…` against the queue directory, while `postmap` and the SMTP
+# client resolve it for real. One file at both paths, not two copies that drift; without
+# it every lookup fails `fe_sendauth: no password supplied`.
+- name: Make the directory the passfile lives in, inside the chroot
+  ansible.builtin.file:
+    path: "{{ maildivvy_postfix_real_passfile | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Give the role its password in a passfile owned by the account Postfix runs as
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ maildivvy_postfix_db_role }}",
+           "{{ maildivvy_postfix_real_passfile }}", postfix,
+           --db, "{{ maildivvy_postfix_db_name }}", --host, "{{ maildivvy_postfix_db_host }}"]
+  register: maildivvy_postfix_password
+  changed_when: (maildivvy_postfix_password.stdout | from_json).changed
+
+- name: Read the passfile back by owner, mode and shape, never printing it
+  ansible.builtin.command:
+    argv: [sh, -c, 'stat -c "%U %a" "$1" && awk -F: "END { print NR, NF }" "$1" && cut -d: -f1-4 "$1"', -,
+           "{{ maildivvy_postfix_real_passfile }}"]
+  register: maildivvy_postfix_passfile_read
+  changed_when: false
+  failed_when: >-
+    maildivvy_postfix_passfile_read.rc != 0 or maildivvy_postfix_passfile_read.stdout_lines !=
+    ['postfix 600', '1 5',
+     maildivvy_postfix_db_host ~ ':5432:' ~ maildivvy_postfix_db_name ~ ':' ~ maildivvy_postfix_db_role]
+
+- name: The unchrooted path is a symlink to that one file
+  ansible.builtin.file:
+    src: "{{ maildivvy_postfix_real_passfile }}"
+    dest: "{{ maildivvy_postfix_passfile }}"
+    state: link
+    owner: root
+    group: root
+    follow: false
+
+# --- the five lookup maps ---------------------------------------------
+
+- name: Write the five lookup maps, one view each
+  ansible.builtin.template:
+    src: map.cf.j2
+    dest: "{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}{{ item.name }}.cf"
+    owner: root
+    group: postfix
+    mode: "0640"
+  loop: "{{ maildivvy_postfix_maps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: maildivvy_postfix_maps_written
+
+# --- the certificate ---------------------------------------------
+
+- name: The account Postfix runs as joins ssl-cert, now that the package has made it
+  ansible.builtin.user:
+    name: postfix
+    groups: [ssl-cert]
+    append: true
+  register: maildivvy_postfix_group
+
+# The hook republishes the pair and reloads every consumer that is installed; Postfix is
+# now one of them. It is lego's, so there is nothing to re-run on a self-signed machine.
+- name: Run the certificate's deploy hook again, now that Postfix reads the key
+  ansible.builtin.command:
+    argv: ["{{ maildivvy_postfix_cert_program }}", deploy]
+  when: maildivvy_cert_mode != 'self-signed'
+  changed_when: true
+
+# ⚠️ the shell's own `test`, never /usr/bin/test: Ubuntu 26.04's coreutils are uutils',
+# whose `test -r` answers from the owner and group alone and ignores the supplementary
+# group that is the whole point here (measured 2026-09-20; `cat` reads the file).
+- name: The published certificate and key are readable by the account Postfix runs as
+  ansible.builtin.command:
+    argv: [runuser, -u, postfix, --, sh, -c, 'test -r "$1"', -, "{{ item }}"]
+  loop: ["{{ maildivvy_postfix_cert }}", "{{ maildivvy_postfix_key }}"]
+  changed_when: false
+
+# --- main.cf and master.cf ------------------
+
+- name: Set what the product owns in main.cf and master.cf
+  maildivvy_postconf:
+    main: "{{ maildivvy_postfix_main }}"
+    services: "{{ maildivvy_postfix_services }}"
+    absent: "{{ maildivvy_postfix_absent }}"
+  register: maildivvy_postfix_written
+
+# ⛔ Before the restart, never after it: it reports a syntax error while the old service
+# is still running, and a restart on a broken master.cf leaves nothing listening.
+- name: The whole configuration parses (postfix check)
+  ansible.builtin.command:
+    argv: [postfix, check]
+  changed_when: false
+
+- name: Restart Postfix for the new configuration
+  ansible.builtin.systemd:
+    name: postfix
+    state: restarted
+  when: maildivvy_postfix_written.changed or maildivvy_postfix_maps_written.changed
+        or maildivvy_postfix_group.changed or maildivvy_postfix_password.changed
+
+- name: Postfix runs and starts at boot
+  ansible.builtin.systemd:
+    name: postfix
+    state: started
+    enabled: true
+
+# --- the step's own proofs ----------------------------------------------------------------
+
+# Appending would make every one of these print `overriding earlier entry` for ever
+- name: Read main.cf back, with the warnings a duplicated setting prints
+  ansible.builtin.command:
+    argv: [postconf, -n]
+  register: maildivvy_postfix_effective
+  changed_when: false
+
+- name: No setting is in main.cf twice
+  ansible.builtin.assert:
+    that: "'overriding earlier entry' not in maildivvy_postfix_effective.stderr"
+    fail_msg: "{{ maildivvy_postfix_effective.stderr }}"
+    quiet: true
+
+- name: Read each setting back from the daemon's own view of it
+  ansible.builtin.command:
+    argv: [postconf, -h, "{{ item.key }}"]
+  loop: "{{ maildivvy_postfix_main | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: maildivvy_postfix_read
+  changed_when: false
+
+- name: Each setting reads as written
+  ansible.builtin.assert:
+    that: item.stdout == item.item.value | string
+    fail_msg: "{{ item.item.key }} reads {{ item.stdout }}, not {{ item.item.value }}"
+    quiet: true
+  loop: "{{ maildivvy_postfix_read.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Read the listeners the daemon holds
+  ansible.builtin.shell:
+    cmd: ss -ltnH | awk '{print $4}' | sort -u
+  register: maildivvy_postfix_ports
+  changed_when: false
+
+# The distribution's bare `smtp inet` would bind the LAN address as well,
+# and the predecessor's loopback listener relayed for any local process
+- name: Nothing listens on 25, and 465 is served
+  ansible.builtin.assert:
+    that:
+      - maildivvy_postfix_ports.stdout_lines | select('search', ':25$') | list == []
+      - maildivvy_postfix_ports.stdout_lines | select('search', ':465$') | list == ['0.0.0.0:465']
+      - maildivvy_postfix_ports.stdout_lines | select('search', ':587$') | list == []
+    fail_msg: "{{ maildivvy_postfix_ports.stdout_lines }}"
+    quiet: true
+
+# ⛔ `postmap -q` exits 1 BOTH for "no such key" and for "the database refused us". The
+# correct answer for a name that does not exist is rc 1 with NO OUTPUT; a `fatal: query
+# error` with rc 1 is the whole of Postfix being unable to look anything up, so what is
+# read is stderr, never the exit code.
+- name: Ask every map for a name that cannot exist
+  ansible.builtin.command:
+    argv: [postmap, -q, nobody@maildivvy-install.invalid,
+           "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}{{ item.name }}.cf"]
+  loop: "{{ maildivvy_postfix_maps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: maildivvy_postfix_probe
+  changed_when: false
+  failed_when: maildivvy_postfix_probe.rc not in [0, 1]
+
+- name: Every map reached the database and answered a correct miss
+  ansible.builtin.assert:
+    that:
+      - item.rc == 1
+      - item.stdout == ''
+      - item.stderr == ''
+    fail_msg: "{{ item.item.name }}: rc {{ item.rc }}, stderr {{ item.stderr }}"
+    quiet: true
+  loop: "{{ maildivvy_postfix_probe.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: The role logs in as itself with its own passfile, as the account Postfix runs as
+  ansible.builtin.command:
+    argv: [runuser, -u, postfix, --, env, "PGPASSFILE={{ maildivvy_postfix_passfile }}",
+           psql, -X, -w, -At, -h, "{{ maildivvy_postfix_db_host }}", -U, "{{ maildivvy_postfix_db_role }}",
+           -d, "{{ maildivvy_postfix_db_name }}", -c, "SELECT count(*) FROM postfix_sasl_password"]
+  changed_when: false

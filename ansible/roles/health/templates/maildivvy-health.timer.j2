@@ -1,0 +1,15 @@
+# Managed by Ansible (roles/health). Install step 17.
+# Every few minutes, so the report's own timestamp can say the
+# checks have stopped: a report three runs old reads UNKNOWN.
+[Unit]
+Description=Maildivvy: check every subsystem every 5min
+
+[Timer]
+OnCalendar={{ maildivvy_health_calendar }}
+# a missed run is replaced by the next one; nothing is owed
+Persistent=false
+AccuracySec=10s
+Unit={{ maildivvy_health_unit }}
+
+[Install]
+WantedBy=timers.target

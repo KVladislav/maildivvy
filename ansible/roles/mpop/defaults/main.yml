@@ -1,0 +1,20 @@
+# mpop from the author's release, pinned by version and by a sha256 literal: upstream
+# publishes a detached signature and no checksums file. 1.4.23 is the
+# first release whose `keep` takes a duration.
+maildivvy_mpop_version: 1.4.23
+maildivvy_mpop_sha256: 02fc2ff44f62b8fbf427ed6d8b16e0d374751198254fb1e6ad36eb6d9a938017
+maildivvy_mpop_release_url: https://marlam.de/mpop/releases
+
+# GnuTLS, GNU SASL and IDN as the distribution's build offered them; no desktop
+# keyring and no POP3 server.
+maildivvy_mpop_configure:
+  - --with-tls=gnutls
+  - --with-libgsasl
+  - --with-libidn
+  - --without-libsecret
+  - --without-mpopd
+# Installed for the build only, and purged after it with whatever they brought.
+maildivvy_mpop_build_packages: [build-essential, pkg-config, libgnutls28-dev, libgsasl-dev, libidn2-dev]
+
+# The binary the fetch runner executes.
+maildivvy_mpop: /usr/local/bin/mpop

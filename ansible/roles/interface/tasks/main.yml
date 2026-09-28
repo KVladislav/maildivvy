@@ -1,0 +1,240 @@
+# Install step 15: the administration interface behind the distribution's reverse proxy.
+#
+# ⛔ NO PYTHON PROCESS OF OURS HANDLES TLS: a TLS handshake closed without a
+# request poisons the OpenSSL error queue of the CPython worker that read it, and that
+# worker then drops its next fresh connections until the process restarts
+# (python/cpython#81891, measured on the predecessor). The proxy is nginx, from the
+# distribution's main pocket.
+#
+# What the step leaves: the interface on a `0660` unix socket only the proxy's group
+# opens, saying READY=1 after its bind; nginx terminating TLS 1.2 at least with
+# the product's certificate on 443, which the firewall has scoped to the administrator
+# networks since step 3; and the certificate's deploy hook reloading the proxy, which is
+# how nginx re-reads a renewed pair.
+
+# --- the proxy's package and its access to the key ----------------------------------------
+
+- name: Install the reverse proxy, the distribution's
+  ansible.builtin.apt:
+    name: "{{ maildivvy_interface_packages }}"
+    install_recommends: false
+    lock_timeout: 600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# ⛔ the proxy holds the certificate, so the proxy's user is the one in ssl-cert; the
+# interface's user joins nothing at all (read in the direction of).
+- name: The account the proxy runs as joins ssl-cert
+  ansible.builtin.user:
+    name: "{{ maildivvy_interface_proxy_user }}"
+    groups: "{{ maildivvy_interface_proxy_groups }}"
+    append: true
+
+# The hook republishes the pair and reloads every consumer that is installed; the proxy
+# is now one of them. It is lego's, so there is nothing to re-run on a self-signed machine.
+- name: Run the certificate's deploy hook again, now that the proxy reads the key
+  ansible.builtin.command:
+    argv: ["{{ maildivvy_interface_cert_program }}", deploy]
+  when: maildivvy_cert_mode != 'self-signed'
+  changed_when: true
+
+- name: The published pair is readable by the account the proxy runs as
+  ansible.builtin.command:
+    # ⚠️ the shell's own `test`, never /usr/bin/test: Ubuntu 26.04's coreutils are
+    # uutils', whose `test -r` answers from the owner and group alone and ignores the
+    # supplementary group that is the whole point here.
+    argv: [runuser, -u, "{{ maildivvy_interface_proxy_user }}", --, sh, -c, 'test -r "$1"', -, "{{ item }}"]
+  loop: ["{{ maildivvy_interface_cert }}", "{{ maildivvy_interface_key }}"]
+  changed_when: false
+
+# --- the interface's socket directory, at every boot --------------------------
+
+# /run is tmpfs: a directory made once by the install is gone at the first reboot, and
+# the unit would then die 226/NAMESPACE naming no path. systemd-tmpfiles-setup runs at
+# sysinit.target, before any of this, and `d` also corrects a directory already there.
+- name: The socket's directory is made at every boot
+  ansible.builtin.copy:
+    dest: "{{ maildivvy_interface_tmpfiles }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Maildivvy, install step 15. The administration interface binds its socket here;
+      # /run is tmpfs, so the directory is made again at every boot.
+      # ⛔ The parent is root's and the interface owns only its own directory:
+      # rspamd's socket directory is in the same parent.
+      d {{ maildivvy_interface_run_dir }} 0755 root root -
+      d {{ maildivvy_interface_socket_dir }} 0755 {{ maildivvy_interface_user }} {{ maildivvy_interface_user }} -
+  register: maildivvy_interface_tmpfiles_written
+
+- name: Make it now, as it will be made at the next boot
+  ansible.builtin.command:
+    argv: [systemd-tmpfiles, --create, "{{ maildivvy_interface_tmpfiles }}"]
+  changed_when: maildivvy_interface_tmpfiles_written is changed
+
+# --- the interface's unit -------------------------------------------------------------------
+
+- name: Install the interface's unit
+  ansible.builtin.template:
+    src: maildivvy-admin.service.j2
+    dest: "/etc/systemd/system/{{ maildivvy_interface_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_interface_unit_written
+
+- name: Tell systemd the unit changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: maildivvy_interface_unit_written is changed
+
+# ⚠️ a long-running program of ours, like the milter: the timers' programs pick up new
+# code at their next run, this one holds what it imported at start.
+- name: Is any of the code newer than the running interface?
+  ansible.builtin.command:
+    argv: [sh, -c,
+           'started=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$1")" +%s 2>/dev/null || echo 0);
+            find "$2" "$3" -newermt "@${started:-0}" -print -quit', -,
+           "{{ maildivvy_interface_unit }}", "{{ maildivvy_interface_program }}",
+           "{{ maildivvy_interface_opt }}/lib/maildivvy"]
+  register: maildivvy_interface_stale
+  changed_when: false
+
+- name: Restart the interface for a unit or code that changed
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_interface_unit }}"
+    state: restarted
+  when: maildivvy_interface_unit_written is changed or maildivvy_interface_stale.stdout != ''
+
+- name: The interface runs and starts at boot
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_interface_unit }}"
+    enabled: true
+    state: started
+
+# `Type=notify`, so the unit reads active only once the bind is done; the socket
+# is read back anyway, because a unit that started and could not bind reads active too.
+- name: Wait for the socket to appear
+  ansible.builtin.wait_for:
+    path: "{{ maildivvy_interface_socket }}"
+    state: present
+    timeout: 30
+
+- name: Read the socket back
+  ansible.builtin.command:
+    argv: [stat, -c, "%F %U:%G %a", "{{ maildivvy_interface_socket }}"]
+  register: maildivvy_interface_socket_stat
+  changed_when: false
+
+- name: It is a 0660 socket owned by the interface and the proxy's group
+  ansible.builtin.assert:
+    that:
+      - maildivvy_interface_socket_stat.stdout == 'socket ' ~ maildivvy_interface_user
+        ~ ':' ~ maildivvy_interface_proxy_group ~ ' 660'
+    fail_msg: "{{ maildivvy_interface_socket_stat.stdout }}"
+    quiet: true
+
+# ⛔ and nothing of ours is on a port: TLS moved out of the application, and with it
+# every listener it had.
+- name: Read the machine's TCP listeners and who holds them
+  ansible.builtin.command:
+    argv: [ss, -Hltnp]
+  register: maildivvy_interface_listeners
+  changed_when: false
+
+- name: The application opens no TCP port at all
+  ansible.builtin.assert:
+    that: maildivvy_interface_listeners.stdout is not search('maildivvy-admin')
+    fail_msg: "{{ maildivvy_interface_listeners.stdout }}"
+    quiet: true
+
+# --- the proxy's site -----------------------------------------------------------------------
+
+- name: Write the site
+  ansible.builtin.template:
+    src: maildivvy-admin.nginx.conf.j2
+    dest: "{{ maildivvy_interface_sites_available }}/{{ maildivvy_interface_site }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: maildivvy_interface_site_written
+
+- name: Enable it
+  ansible.builtin.file:
+    src: "{{ maildivvy_interface_sites_available }}/{{ maildivvy_interface_site }}"
+    dest: "{{ maildivvy_interface_sites_enabled }}/{{ maildivvy_interface_site }}"
+    state: link
+  register: maildivvy_interface_site_enabled
+
+# ⛔ the distribution's own site listens on port 80 on every address. This machine serves
+# one site, on 443, and the firewall opens nothing else (step 3).
+- name: Remove the distribution's default site
+  ansible.builtin.file:
+    path: "{{ maildivvy_interface_default_site }}"
+    state: absent
+  register: maildivvy_interface_default_removed
+
+# ⛔ before any reload: a syntax error is reported while the running proxy is still the
+# old one, and a reload onto a broken configuration leaves 443 unanswered.
+- name: The whole proxy configuration parses
+  ansible.builtin.command:
+    argv: [nginx, -t]
+  changed_when: false
+
+- name: The proxy runs and starts at boot
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_interface_proxy_unit }}"
+    enabled: true
+    state: started
+
+# nginx re-reads its configuration and its certificate on a reload, which is why the
+# deploy hook's verb for it is `reload` and not `restart`.
+- name: Reload the proxy onto the new site
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_interface_proxy_unit }}"
+    state: reloaded
+  when: maildivvy_interface_site_written is changed
+    or maildivvy_interface_site_enabled is changed
+    or maildivvy_interface_default_removed is changed
+
+# --- the step's own proofs ------------------------------------------------------------------
+
+- name: Read the configuration back out of the proxy itself
+  ansible.builtin.command:
+    argv: [nginx, -T]
+  register: maildivvy_interface_effective
+  changed_when: false
+
+- name: It serves the product's pair, with the TLS floor stated
+  ansible.builtin.assert:
+    that:
+      - "'ssl_protocols ' ~ maildivvy_interface_tls_protocols ~ ';' in maildivvy_interface_effective.stdout"
+      - "'ssl_certificate ' ~ maildivvy_interface_cert ~ ';' in maildivvy_interface_effective.stdout"
+      - "'ssl_certificate_key ' ~ maildivvy_interface_key ~ ';' in maildivvy_interface_effective.stdout"
+      - maildivvy_interface_effective.stdout is not search('(?m)^\\s*listen\\s+80\\b')
+    fail_msg: "the proxy is not serving what this step wrote"
+    quiet: true
+
+# ⛔ readiness is proved by a REAL REQUEST, never by a connection that is opened and
+# closed: a known route answers 200 and a missing one 404 as the control.
+- name: Ask the interface for a page, and for one that is not there
+  ansible.builtin.command:
+    # ⛔ by name, over TLS, verified - never `-k` and never by address. The
+    # name is resolved to this machine for the request, since the interface is not
+    # published and the installer's own resolver need not know it.
+    argv: "{{ ['curl', '--silent', '--show-error', '--output', '/dev/null',
+               '--write-out', '%{http_code}', '--resolve',
+               maildivvy_cert_name ~ ':' ~ maildivvy_interface_port ~ ':127.0.0.1']
+              + maildivvy_interface_anchor
+              + ['https://' ~ maildivvy_cert_name ~ item] }}"
+  loop: ["/", "/no-such-page"]
+  register: maildivvy_interface_answers
+  changed_when: false
+
+- name: The proxy answered from the application, and a missing route is a 404
+  ansible.builtin.assert:
+    that:
+      - maildivvy_interface_answers.results[0].stdout == '200'
+      - maildivvy_interface_answers.results[1].stdout == '404'
+    fail_msg: "{{ maildivvy_interface_answers.results | map(attribute='stdout') | list }}"
+    quiet: true

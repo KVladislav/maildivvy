@@ -1,0 +1,42 @@
+# Managed by Ansible (roles/interface). Install step 15.
+# The one site this machine's proxy serves: TLS for the administration interface, and
+# the application behind it on a unix socket. The distribution's own
+# default site, which listens on port 80, is removed by the step.
+server {
+    # ⛔ 443 alone, and no port 80 anywhere: the firewall opens this port to the
+    # administrator networks only (step 3), and the interface is never published.
+    # IPv6 is not served: nothing of this machine is.
+    listen {{ maildivvy_interface_port }} ssl;
+    server_name {{ maildivvy_cert_name }};
+
+    # The product's certificate, named explicitly: this endpoint verifies by the
+    # client-facing name against the system trust store.
+    ssl_certificate {{ maildivvy_interface_cert }};
+    ssl_certificate_key {{ maildivvy_interface_key }};
+    # ⛔ the floor is stated here, once. The interface's TLS moved to this configuration,
+    # so this line is the whole of the interface's TLS floor.
+    ssl_protocols {{ maildivvy_interface_tls_protocols }};
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 10m;
+
+    server_tokens off;
+    client_max_body_size 1m;
+
+    access_log /var/log/nginx/{{ maildivvy_interface_site }}.access.log;
+    error_log /var/log/nginx/{{ maildivvy_interface_site }}.error.log;
+
+    location / {
+        # the socket is 0660 and this proxy's group is the only one that opens it
+        proxy_pass http://unix:{{ maildivvy_interface_socket }}:;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        # ⛔ `$remote_addr`, never `$proxy_add_x_forwarded_for`: the second APPENDS to
+        # the header the browser sent, so anybody could put an address of their choosing
+        # in front of their own. This overwrites it, and the application trusts the
+        # header only because it arrives on this proxy's socket.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60s;
+    }
+}

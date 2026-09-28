@@ -1,0 +1,359 @@
+# Install step 5: the certificate. ssl-cert and the deploy hook come before the first
+# issuance; lego is the pinned upstream release, checked against its
+# checksums file; DNS-01 through any provider lego supports, its credentials
+# on stdin, each kept root-only for renewal and handed to lego as a file (#); republished out of lego's store; a daily renewal timer whose first
+# run is read from its journal.
+#
+# cert_mode provided publishes the operator's certificate, chain and key, which step 1
+# has already checked; nothing renews it, and health warns a month before it expires.
+# cert_mode self-signed (a test machine only, behind the test flag) replaces the
+# issuance by a self-signed certificate. Both use the same paths and modes, so every
+# consumer works unchanged.
+
+- name: Check what issuance and renewal need, before anything changes
+  when: maildivvy_cert_mode in ['acme', 'acme-staging']
+  block:
+    - name: The CA's directory answers over HTTPS
+      ansible.builtin.uri:
+        url: "{{ maildivvy_acme_directories[maildivvy_cert_mode] }}"
+        timeout: 15
+      changed_when: false
+
+    # known for the tested providers only; another's API is first reached by lego itself
+    - name: The DNS provider's API answers over HTTPS
+      when: maildivvy_acme_dns_api_url != ''
+      ansible.builtin.uri:
+        url: "{{ maildivvy_acme_dns_api_url }}"
+        timeout: 15
+        status_code: [200, 401, 403]
+      changed_when: false
+
+    - name: Each public resolver lego checks propagation against answers on port 53
+      ansible.builtin.command:
+        argv: [dig, "@{{ item.rsplit(':', 1)[0] }}", -p, "{{ item.rsplit(':', 1)[1] }}", +time=5, +tries=2, +short, SOA, .]
+      loop: "{{ maildivvy_acme_dns_resolvers }}"
+      register: maildivvy_resolver_probe
+      changed_when: false
+      failed_when: maildivvy_resolver_probe.rc != 0 or maildivvy_resolver_probe.stdout == ''
+
+    - name: The certificate name resolves from this machine's resolver, as clients need
+      ansible.builtin.command: getent ahosts {{ maildivvy_cert_name | quote }}
+      changed_when: false
+      register: maildivvy_cert_name_resolves
+      failed_when: maildivvy_cert_name_resolves.rc != 0
+
+- name: The ssl-cert group exists before any certificate is issued
+  ansible.builtin.getent:
+    database: group
+    key: ssl-cert
+
+- name: lego's store is 0700 root:root
+  ansible.builtin.file:
+    path: "{{ maildivvy_lego_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: /etc/maildivvy exists
+  ansible.builtin.file:
+    path: /etc/maildivvy
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the certificate configuration; no secret, readable by health (mode, name, paths)
+  ansible.builtin.template:
+    src: certificate.json.j2
+    dest: "{{ maildivvy_cert_config }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install maildivvy-cert, the deploy hook listing every consumer
+  ansible.builtin.copy:
+    src: maildivvy_cert.py
+    dest: "{{ maildivvy_cert_program }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+# --- lego, from the checksum-verified upstream release ------------------
+
+- name: Read the architecture
+  ansible.builtin.command: dpkg --print-architecture
+  register: maildivvy_arch
+  changed_when: false
+
+- name: Read the installed lego's version
+  ansible.builtin.command: "{{ maildivvy_lego }} --version"
+  register: maildivvy_lego_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install the pinned lego release
+  when: maildivvy_lego_installed.stdout | default('') != maildivvy_lego_expected
+  vars:
+    maildivvy_lego_archive: lego_v{{ maildivvy_lego_version }}_linux_{{ maildivvy_arch.stdout }}.tar.gz
+    maildivvy_lego_base: "{{ maildivvy_lego_release_url }}/v{{ maildivvy_lego_version }}"
+  block:
+    - name: Make a download directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -lego
+      register: maildivvy_lego_tmp
+
+    - name: Download the release archive
+      ansible.builtin.get_url:
+        url: "{{ maildivvy_lego_base }}/{{ maildivvy_lego_archive }}"
+        dest: "{{ maildivvy_lego_tmp.path }}/{{ maildivvy_lego_archive }}"
+        mode: "0600"
+
+    - name: Download the release's checksums file
+      ansible.builtin.get_url:
+        url: "{{ maildivvy_lego_base }}/lego_{{ maildivvy_lego_version }}_checksums.txt"
+        dest: "{{ maildivvy_lego_tmp.path }}/checksums.txt"
+        mode: "0600"
+
+    - name: The archive matches its one checksums line, anchored, and the pin
+      maildivvy_checksum:
+        checksums: "{{ maildivvy_lego_tmp.path }}/checksums.txt"
+        file: "{{ maildivvy_lego_tmp.path }}/{{ maildivvy_lego_archive }}"
+        name: "{{ maildivvy_lego_archive }}"
+        sha256: "{{ maildivvy_lego_sha256[maildivvy_arch.stdout] }}"
+
+    - name: Unpack lego only
+      ansible.builtin.unarchive:
+        src: "{{ maildivvy_lego_tmp.path }}/{{ maildivvy_lego_archive }}"
+        dest: "{{ maildivvy_lego_tmp.path }}"
+        remote_src: true
+        include: [lego]
+
+    - name: Install lego
+      ansible.builtin.copy:
+        src: "{{ maildivvy_lego_tmp.path }}/lego"
+        dest: "{{ maildivvy_lego }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+  always:
+    - name: Remove the download directory
+      ansible.builtin.file:
+        path: "{{ maildivvy_lego_tmp.path }}"
+        state: absent
+      when: maildivvy_lego_tmp.path is defined
+
+- name: Read lego's version back
+  ansible.builtin.command: "{{ maildivvy_lego }} --version"
+  register: maildivvy_lego_readback
+  changed_when: false
+
+- name: lego is the pinned release
+  ansible.builtin.assert:
+    that: maildivvy_lego_readback.stdout == maildivvy_lego_expected
+    fail_msg: "{{ maildivvy_lego }} reports {{ maildivvy_lego_readback.stdout }}, not {{ maildivvy_lego_expected }}"
+    quiet: true
+
+# --- the certificate --------------------------------------------------------------
+
+- name: Remove the first version's token file, replaced by the credentials directory
+  ansible.builtin.file:
+    path: "{{ maildivvy_first_version_token }}"
+    state: absent
+
+- name: Remove every DNS credential, since this mode issues nothing
+  when: maildivvy_cert_mode not in ['acme', 'acme-staging']
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: ["{{ maildivvy_credentials_dir }}", "{{ maildivvy_credentials_env }}"]
+
+- name: Issue with lego over DNS-01
+  when: maildivvy_cert_mode in ['acme', 'acme-staging']
+  block:
+    # The names are checked against `lego dnshelp -c <provider>` by the program; the
+    # values are handed over on stdin and never shown
+    - name: Store the DNS provider's credentials root-only, handed over on stdin
+      ansible.builtin.command:
+        argv: ["{{ maildivvy_cert_program }}", store-credentials]
+        stdin: "{{ {'credentials': maildivvy_acme_dns_credentials} | to_json }}"
+      register: maildivvy_credentials_store
+      changed_when: maildivvy_credentials_store.stdout_lines | select('match', '^(stored|removed) ') | list | length > 0
+      no_log: true
+
+    # the store's own lines hold names, never values; the provider's line says whether
+    # Maildivvy's tests issue through it
+    - name: Say which credentials are stored and whether the DNS provider is tested
+      ansible.builtin.debug:
+        msg: "{{ maildivvy_credentials_store.stdout_lines }}"
+
+    - name: Read the credential files and their list
+      ansible.builtin.find:
+        paths: "{{ maildivvy_credentials_dir }}"
+        file_type: any
+      register: maildivvy_credential_files
+
+    - name: Read the list lego is given
+      ansible.builtin.stat:
+        path: "{{ maildivvy_credentials_env }}"
+        get_checksum: false
+      register: maildivvy_credentials_env_stat
+
+    - name: Every credential file and their list are 0600 root:root
+      ansible.builtin.assert:
+        that:
+          - maildivvy_credential_files.files | length > 0
+          - maildivvy_credential_files.files | rejectattr('mode', 'eq', '0600') | list == []
+          - maildivvy_credential_files.files | rejectattr('pw_name', 'eq', 'root') | list == []
+          - maildivvy_credentials_env_stat.stat.exists
+          - maildivvy_credentials_env_stat.stat.mode == '0600'
+          - maildivvy_credentials_env_stat.stat.pw_name == 'root'
+        quiet: true
+
+    - name: Read lego's certificate, if it has one
+      ansible.builtin.stat:
+        path: "{{ maildivvy_lego_source_cert }}"
+      register: maildivvy_lego_cert
+
+    - name: Issue the certificate; the deploy hook publishes it
+      ansible.builtin.command:
+        argv: ["{{ maildivvy_cert_program }}", run]
+      when: not maildivvy_lego_cert.stat.exists
+      register: maildivvy_issuance
+
+    # lego prints its deploy hook's lines among its own: they are read, not only lego's
+    # exit code, and printed, so the run says what each consumer got
+    - name: The deploy hook published the pair and said what it did with each consumer
+      when: maildivvy_issuance is not skipped
+      ansible.builtin.assert:
+        that:
+          - ("published " ~ maildivvy_published_cert ~ " and " ~ maildivvy_published_key) in maildivvy_issuance.stdout_lines
+        fail_msg: "lego issued, and its output has no line from the deploy hook: {{ maildivvy_issuance.stdout_lines }}"
+        success_msg: "{{ maildivvy_issuance.stdout_lines | select('match', '^(published|reload|restart|skipped) ') | list }}"
+        quiet: false
+
+    - name: Read lego's certificate and the published one
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["{{ maildivvy_lego_source_cert }}", "{{ maildivvy_published_cert }}"]
+      register: maildivvy_cert_pair
+
+    - name: Republish when the published certificate is not lego's
+      ansible.builtin.command:
+        argv: ["{{ maildivvy_cert_program }}", deploy]
+      when: maildivvy_cert_pair.results[0].stat.checksum | default('a') != maildivvy_cert_pair.results[1].stat.checksum | default('b')
+
+# Checked in step 1 already; the program checks again, since it is also how the
+# operator replaces the certificate later
+- name: Publish the operator's certificate, chain and key
+  when: maildivvy_cert_mode == 'provided'
+  ansible.builtin.command:
+    argv: ["{{ maildivvy_cert_program }}", install-provided]
+  register: maildivvy_provided_install
+  changed_when: maildivvy_provided_install.stdout.startswith('published')
+
+- name: Make the self-signed certificate (test machine only)
+  when: maildivvy_cert_mode == 'self-signed'
+  block:
+    - name: Publish a self-signed certificate for the certificate name, at the ACME paths
+      ansible.builtin.command:
+        argv: ["{{ maildivvy_cert_program }}", self-sign]
+      register: maildivvy_self_sign
+      changed_when: maildivvy_self_sign.stdout.startswith('created')
+
+    - name: "WARNING: THIS MACHINE HAS A SELF-SIGNED CERTIFICATE"
+      ansible.builtin.debug:
+        msg: "{{ maildivvy_self_signed_warning }}"
+
+# --- read back ----------------------------------------------------------------------
+
+- name: Read the published certificate and key
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: ["{{ maildivvy_published_cert }}", "{{ maildivvy_published_key }}"]
+  register: maildivvy_published
+
+- name: Certificate 0644 root:root, key 0640 root:ssl-cert
+  ansible.builtin.assert:
+    that:
+      - maildivvy_published.results[0].stat.mode == '0644'
+      - maildivvy_published.results[0].stat.pw_name == 'root' and maildivvy_published.results[0].stat.gr_name == 'root'
+      - maildivvy_published.results[1].stat.mode == '0640'
+      - maildivvy_published.results[1].stat.pw_name == 'root' and maildivvy_published.results[1].stat.gr_name == 'ssl-cert'
+    quiet: true
+
+- name: Read the names the certificate carries, and whether the key is its own
+  ansible.builtin.shell: |
+    set -eu
+    openssl x509 -noout -ext subjectAltName -in {{ maildivvy_published_cert | quote }} | tail -n +2 | tr -d ' '
+    a=$(openssl x509 -noout -pubkey -in {{ maildivvy_published_cert | quote }} | sha256sum)
+    b=$(openssl pkey -pubout -in {{ maildivvy_published_key | quote }} | sha256sum)
+    [ "$a" = "$b" ] && echo key-matches
+  register: maildivvy_cert_names
+  changed_when: false
+
+- name: The certificate names the client-facing name, not the hostname, and matches its key
+  ansible.builtin.assert:
+    that:
+      - ("DNS:" ~ maildivvy_cert_name) in maildivvy_cert_names.stdout_lines[0].split(',')
+      - maildivvy_cert_names.stdout_lines[-1] == 'key-matches'
+    fail_msg: "{{ maildivvy_published_cert }} carries {{ maildivvy_cert_names.stdout_lines[0] }}, not DNS:{{ maildivvy_cert_name }}"
+    quiet: true
+
+- name: A production certificate verifies against the system trust store
+  ansible.builtin.command: >-
+    openssl verify -purpose sslserver -untrusted {{ maildivvy_published_cert | quote }}
+    {{ maildivvy_published_cert | quote }}
+  when: maildivvy_cert_mode == 'acme'
+  changed_when: false
+
+# --- the renewal timer ---------------------------------------------------
+
+- name: Install the renewal service and its daily timer
+  ansible.builtin.template:
+    src: "renew.{{ item }}.j2"
+    dest: /etc/systemd/system/{{ maildivvy_cert_renew_unit }}.{{ item }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [service, timer]
+
+- name: Enable and start the timer
+  ansible.builtin.systemd_service:
+    name: "{{ maildivvy_cert_renew_unit }}.timer"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# A proof read on every run, as the timer's daily run: it changes nothing unless a
+# certificate is due, which the timer would have renewed anyway.
+- name: Run the renewal through systemd, not by hand
+  ansible.builtin.command: systemctl start {{ maildivvy_cert_renew_unit }}.service
+  changed_when: false
+
+- name: Read the renewal's last result and invocation
+  ansible.builtin.command: systemctl show -p Result -p InvocationID {{ maildivvy_cert_renew_unit }}.service
+  register: maildivvy_renew_show
+  changed_when: false
+
+- name: Read that run from the journal
+  ansible.builtin.command: >-
+    journalctl --no-pager -o cat
+    _SYSTEMD_INVOCATION_ID={{ maildivvy_renew_show.stdout_lines | select('match', '^InvocationID=') | first | regex_replace('^InvocationID=', '') }}
+  register: maildivvy_renew_journal
+  changed_when: false
+
+- name: The renewal ran and said what it did
+  ansible.builtin.assert:
+    that:
+      - "'Result=success' in maildivvy_renew_show.stdout_lines"
+      - >-
+        (maildivvy_cert_mode in ['self-signed', 'provided']
+            and (maildivvy_cert_mode ~ ' mode: no ACME renewal') in maildivvy_renew_journal.stdout)
+        or (maildivvy_cert_mode in ['acme', 'acme-staging'] and ('Skip renewal' in maildivvy_renew_journal.stdout
+            or 'Server responded with a certificate' in maildivvy_renew_journal.stdout))
+    fail_msg: "the renewal's last run: {{ maildivvy_renew_show.stdout_lines }}; journal: {{ maildivvy_renew_journal.stdout }}"
+    quiet: true

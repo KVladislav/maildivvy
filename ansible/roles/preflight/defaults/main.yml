@@ -1,0 +1,11 @@
+# Packages the install needs, installed non-interactively once the settings pass.
+# clamav-base is installed apart, without Recommends.
+maildivvy_base_packages:
+  - xfsprogs           # not in the server default set
+  - ssl-cert           # owns the ssl-cert group and /etc/ssl/private's mode
+  - python3-psycopg2   # not python3-psycopg, which is psycopg 3
+  - bind9-dnsutils     # dig, to ask the public resolvers lego checks against
+
+# The range the container block (step 4) treats as containers: Docker's default pool.
+# It must not overlap an administrator network; preflight refuses one that does.
+maildivvy_container_pool: 172.16.0.0/12

@@ -1,0 +1,17 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# Once a minute by default, for every domain. A one-minute delay against a
+# three-minute fetch is invisible, and the fan-out stays outside the delivery path.
+[Unit]
+Description=Maildivvy: fan out every {{ maildivvy_pass_interval }}
+
+[Timer]
+OnCalendar={{ maildivvy_pass_calendar }}
+# ⚠️ NO CATCH-UP, and no jitter either: a tick that fails leaves its cursor where it
+# was, so a missed run costs a minute and never a message, and a pile of runs at boot
+# would only repeat work the next tick does anyway.
+Persistent=false
+AccuracySec=10s
+Unit=maildivvy-pass.service
+
+[Install]
+WantedBy=timers.target

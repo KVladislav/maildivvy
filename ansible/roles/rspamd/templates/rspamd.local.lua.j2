@@ -1,0 +1,99 @@
+--[[
+⛔ WHO SENT A COLLECTED MESSAGE: the address that reached the PROVIDER, read out of the
+`Received` header the provider's own server wrote. Without this the last hop rspamd sees
+is the provider's POP3 server, and SPF, the ASN and every IP list judge the provider
+rather than the sender.
+
+⚠️ BY THE HOST THE HEADER NAMES AFTER `by`, NEVER BY POSITION. The boundary between what
+the provider vouches for and what the sender wrote is the provider's own header:
+everything below it was written by the sender and proves nothing, and nothing below it
+can be forged above it. Pinning by position breaks whenever a provider's own spam scanner
+re-injects a message, which adds a header with no address and moves the sender down one
+hop. A provider header that names no address is such a re-injection or an internal
+hand-off, so the rule keeps looking below it rather than giving up.
+
+⚠️ THE ADDRESS IS READ OUT OF THE HEADER'S TEXT, not out of rspamd's parsed table: a mail
+server behind NAT writes `from [<public address>] (helo=[<private address>])` for an
+authenticated submission, and the parser takes the HELO literal as the sender - no ASN
+and no SPF at all. A literal that is not an address is a refusal, logged, never a guess.
+
+⚠️ A SUBMISSION IS NOT A DELIVERY, AND WHAT ONE MEANS IS PER PROVIDER:
+
+  TRUST_LOGIN     the provider vouches for the sender, so the client is pinned and the
+                  task marked authenticated, and SPF and DMARC are skipped. Right where
+                  the provider does not let an account send under an address it does not
+                  own.
+  JUDGE_PROVIDER  the provider's own address stays in place and SPF and DMARC run
+                  against it. Right on a shared server, where a login is any customer
+                  rather than us, because the customers' domains authorise that server.
+
+⛔ A PROVIDER THAT IS NOT LISTED IS NOT PINNED: its mail is judged against its POP3
+server and the rule says so in the log. Adding a provider is adding its hosts to
+`maildivvy_rspamd_provider_hosts`, after reading a real chain of its mail.
+
+This file is written by install step 11. rspamd loads it from `$LOCAL_CONFDIR` and from
+nowhere else, which is why it is mounted on its own.
+]]--
+
+local rspamd_ip = require "rspamd_ip"
+local rspamd_logger = require "rspamd_logger"
+local lua_util = require "lua_util"
+
+local TRUST_LOGIN = 'trust_login'
+local JUDGE_PROVIDER = 'judge_provider'
+
+-- The hosts each provider writes after `by` - where mail from outside arrives, and where
+-- its own users submit - and what a submission there means.
+local PROVIDER_HOSTS = {
+{%- for host, policy in (maildivvy_rspamd_provider_hosts | dictsort) %}
+  ['{{ host | lower }}'] = {{ 'TRUST_LOGIN' if policy == 'trust_login' else 'JUDGE_PROVIDER' }},
+{%- endfor %}
+}
+
+local function pin_sender(task)
+  local received = task:get_header_full('Received') or {}
+  for i, header in ipairs(received) do
+    local text = ' ' .. (header.decoded or header.value or '') .. ' '
+    local by = text:match('%sby%s+([%w%.%-]+)')
+    local policy = by and PROVIDER_HOSTS[by:lower()]
+    if policy then
+      local written = text:match('^(.-)%sby%s') or ''
+      local literal = written:match('%[([^%]]+)%]')
+      if literal then
+        literal = literal:gsub('^[Ii][Pp][Vv]6:', '')
+        local address = rspamd_ip.from_string(literal)
+        if not (address and address:is_valid()) then
+          rspamd_logger.errx(task, 'Received %s by %s names %s, which is not an address; '
+              .. 'sender not pinned', i, by, literal)
+          return false
+        end
+        local submission = text:match('%swith%s+[Ee][Ss][Mm][Tt][Pp][Ss]?[Aa][%s;]') ~= nil
+        if submission and policy == JUDGE_PROVIDER then
+          -- left where it is on purpose: SPF and DMARC judge the provider's own server
+          return true, 1.0, { 'hop' .. i, by, 'submission judged at the provider' }
+        end
+        task:set_from_ip(address)
+        local name = written:match('^%s*from%s+([%w%.%-]+)') or string.format('[%s]', literal)
+        task:set_hostname(name)
+        task:set_helo(name)
+        if submission then
+          task:set_user('submission@' .. by)
+          return true, 1.0, { 'hop' .. i, by, 'submission, the login trusted' }
+        end
+        return true, 1.0, { 'hop' .. i, by }
+      end
+      -- a provider header with no address: a re-injection or an internal hand-off, so
+      -- the sender is further down
+    end
+  end
+  rspamd_logger.errx(task, 'sender not pinned: no Received header by a listed provider host')
+  return false
+end
+
+rspamd_config:register_symbol({
+  name = 'MAILDIVVY_SENDER_PINNED',
+  type = 'prefilter',
+  priority = lua_util.symbols_priorities.top + 1,
+  group = 'maildivvy',
+  callback = pin_sender,
+})

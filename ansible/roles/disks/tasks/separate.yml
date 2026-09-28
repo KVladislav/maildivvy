@@ -1,0 +1,205 @@
+# Install step 2, separate mode: the store and index as xfs with reflink off on the
+# disks preflight identified (by device at the first install, by UUID after it),
+# mounted by UUID and owned by vmail; the swap disk if there is one.
+
+# --- the store and index filesystems -------------------------------------------
+
+- name: Prove xfs defaults to reflink=1 on a throwaway file, so reflink=0 is a real change
+  ansible.builtin.shell: |
+    set -eu
+    dir=$(mktemp -d)
+    trap 'rm -rf "$dir"' EXIT
+    truncate -s 512M "$dir/control"
+    mkfs.xfs -q "$dir/control"
+    xfs_info "$dir/control"
+  register: maildivvy_reflink_control
+  changed_when: false
+  when: >-
+    maildivvy_filesystems | map(attribute='role') | map('extract', maildivvy_preflight.disks)
+    | selectattr('state', 'eq', 'blank') | list | length > 0
+
+- name: The control reads reflink=1
+  ansible.builtin.assert:
+    that: "'reflink=1' in maildivvy_reflink_control.stdout"
+    fail_msg: xfs's default is not reflink=1 on this release; -m reflink=0 would prove nothing
+    quiet: true
+  when: maildivvy_reflink_control is not skipped
+
+- name: Make the store and index filesystems, xfs with reflink off
+  ansible.builtin.command:
+    argv: [mkfs.xfs, -m, reflink=0, -L, "{{ disk.label }}", "{{ disk.path }}"]
+  vars:
+    disk: "{{ maildivvy_preflight.disks[item.role] }}"
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.role }}"
+  when: disk.state == 'blank'
+  register: maildivvy_mkfs
+
+- name: Let udev see the new filesystems
+  ansible.builtin.command: udevadm settle
+  when: maildivvy_mkfs is changed
+
+- name: Read each filesystem's UUID from the device itself
+  ansible.builtin.command:
+    argv: [blkid, -p, -s, UUID, -o, value, "{{ maildivvy_preflight.disks[item.role].path }}"]
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.role }}"
+  register: maildivvy_uuids
+  changed_when: false
+
+- name: Create the mount points
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Mount each filesystem by UUID, never by device name
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^\S+\s+{{ item.item.path }}\s'
+    line: "UUID={{ item.stdout }} {{ item.item.path }} xfs defaults 0 2"
+  loop: "{{ maildivvy_uuids.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  register: maildivvy_fstab
+
+- name: Tell systemd the fstab changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: maildivvy_fstab is changed
+
+- name: Read which mount points are mounted, one target per call
+  ansible.builtin.command:
+    argv: [findmnt, -n, -o, SOURCE, --mountpoint, "{{ item.path }}"]
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: maildivvy_mounted
+  changed_when: false
+  failed_when: maildivvy_mounted.rc not in [0, 1]
+
+- name: Mount what is not mounted, from the fstab
+  ansible.builtin.command:
+    argv: [mount, "{{ item.item.path }}"]
+  loop: "{{ maildivvy_mounted.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: item.rc == 1
+
+- name: Own each mount root vmail 0700, after mounting
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: vmail
+    group: vmail
+    mode: "0700"
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# --- swap, only when a swap disk is set ------------------------------
+
+- name: Swap disk
+  when: "'swap' in maildivvy_preflight.disks"
+  vars:
+    swap: "{{ maildivvy_preflight.disks.swap }}"
+  block:
+    - name: Make the swap area
+      ansible.builtin.command:
+        argv: [mkswap, -L, "{{ swap.label }}", "{{ swap.path }}"]
+      when: swap.state == 'blank'
+      register: maildivvy_mkswap
+
+    - name: Let udev see the swap area
+      ansible.builtin.command: udevadm settle
+      when: maildivvy_mkswap is changed
+
+    - name: Read the swap area's UUID
+      ansible.builtin.command:
+        argv: [blkid, -p, -s, UUID, -o, value, "{{ swap.path }}"]
+      register: maildivvy_swap_uuid
+      changed_when: false
+
+    - name: Use the swap disk by UUID
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^UUID={{ maildivvy_swap_uuid.stdout }}\s'
+        line: "UUID={{ maildivvy_swap_uuid.stdout }} none swap sw,pri={{ maildivvy_swap_priority }} 0 0"
+
+    - name: Read the active swap areas
+      ansible.builtin.command:
+        argv: [swapon, "--show=NAME,UUID", --noheadings, --raw]
+      register: maildivvy_swaps
+      changed_when: false
+
+    - name: Turn the swap disk on
+      ansible.builtin.command:
+        argv: [swapon, "UUID={{ maildivvy_swap_uuid.stdout }}"]
+      when: maildivvy_swap_uuid.stdout not in maildivvy_swaps.stdout
+
+    - name: Turn the installer's swap file off
+      ansible.builtin.command:
+        argv: [swapoff, /swap.img]
+      when: "'/swap.img' in maildivvy_swaps.stdout"
+
+    - name: Take the installer's swap file out of the fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^/swap\.img\s'
+        state: absent
+
+    - name: Remove the installer's swap file
+      ansible.builtin.file:
+        path: /swap.img
+        state: absent
+
+- name: The filesystems by UUID, for the record later runs find them by
+  ansible.builtin.set_fact:
+    maildivvy_disk_facts:
+      mode: separate
+      uuids: >-
+        {{ dict(maildivvy_uuids.results | map(attribute='item.role')
+                | zip(maildivvy_uuids.results | map(attribute='stdout')))
+           | combine({'swap': maildivvy_swap_uuid.stdout} if maildivvy_swap_uuid.stdout | default('') else {}) }}
+
+# --- read back -------------------------------------------------------------------
+
+- name: Read each filesystem's features with xfs_info, never xfs_db
+  ansible.builtin.command:
+    argv: [xfs_info, "{{ item.path }}"]
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: maildivvy_xfs_info
+  changed_when: false
+
+- name: Each reads reflink=0
+  ansible.builtin.assert:
+    that: "'reflink=0' in item.stdout"
+    fail_msg: "{{ item.item.path }} has reflink on"
+    quiet: true
+  loop: "{{ maildivvy_xfs_info.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Read each mount back, one target per call
+  ansible.builtin.command:
+    argv: [findmnt, -n, -o, "UUID,FSTYPE", --mountpoint, "{{ item.item.path }}"]
+  loop: "{{ maildivvy_uuids.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  register: maildivvy_mounts
+  changed_when: false
+
+- name: Each is mounted from its own filesystem, as xfs
+  ansible.builtin.assert:
+    that: item.stdout.split() == [item.item.stdout, 'xfs']
+    fail_msg: "{{ item.item.item.path }} is not mounted from UUID {{ item.item.stdout }}: {{ item.stdout }}"
+    quiet: true
+  loop: "{{ maildivvy_mounts.results }}"
+  loop_control:
+    label: "{{ item.item.item.path }}"

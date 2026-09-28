@@ -1,0 +1,71 @@
+# The programs role: docs/architecture.md § Users, groups and files. The product fixes
+# its own layout; none of this is a setting.
+
+maildivvy_opt: /opt/maildivvy
+maildivvy_etc: /etc/maildivvy
+maildivvy_var: /var/lib/maildivvy
+
+# The mail disks of step 2, named here because the units' ReadWritePaths= is what makes
+# them writable at all. They are src/maildivvy/lib/store.py's
+# STORE_ROOT and INDEX_ROOT; a unit test holds the two spellings together.
+maildivvy_store: /srv/maildivvy/store
+maildivvy_index: /srv/maildivvy/index
+
+# The host group that names the rspamd image's gid, so the mail uid can open its
+# socket. 11333 is rspamd 4.1.5's; the image is pinned in step 11.
+maildivvy_rspamd_gid: 11333
+
+# The interface's own library, from the distribution. It goes with the code rather than
+# with step 15, because the code in /opt/maildivvy is what imports it and the tests of
+# the application run before the proxy exists.
+maildivvy_program_packages: [python3-flask]
+
+# vmail itself is step 2's, with its fixed ids; these are its groups.
+maildivvy_vmail_groups: [clamav, maildivvy-rspamd]
+
+# Allocated system users, each with its own group and exactly these others.
+maildivvy_program_users:
+  - {name: maildivvy-milter, groups: [clamav]}   # 0017: the milter scans at submission
+  - {name: maildivvy-admin, groups: []}          # 0015: no certificate, TLS is the proxy's
+  - {name: maildivvy-health, groups: [clamav, maildivvy-rspamd, systemd-journal]}
+
+# One /etc/maildivvy/<consumer>/ each, 0750 root:<group>: the group of the user that
+# reads its db.conf, so no program reads another role's file. The names
+# are src/maildivvy/lib/config.py's CONSUMERS, in its order.
+maildivvy_consumers:
+  - {name: pipeline, group: vmail}               # fetch runner, delivery filter, pass, request handlers
+  - {name: senthook, group: vmail}               # the Sent hook's own least-privileged role
+  - {name: milter, group: maildivvy-milter}
+  - {name: admin, group: maildivvy-admin}
+  - {name: health, group: maildivvy-health}
+  - {name: owner, group: root}                   # the schema applier and the backup, as root
+
+# The fetch runner's schedule is defaults/main.yml's `maildivvy_fetch_minutes`,
+# written by the timer as a calendar, the only form Persistent= acts on. The
+# jitter spreads many mailboxes at one provider across the slot, well inside even a
+# one-minute one. The run timeout is how long one run of every mailbox may take before
+# systemd kills it; the runner's own timeout bounds each mpop at 900 s,
+# so this only has to be wider than a run of them.
+maildivvy_fetch_jitter: 20s
+maildivvy_fetch_run_timeout: 3600
+
+# The pass's schedule (once a minute per domain) and how long one run over
+# every domain may take. A run that overruns takes each cursor row with FOR UPDATE, so
+# the next run queues behind it per (domain, mailbox) rather than reading a range twice.
+maildivvy_pass_interval: 1min
+maildivvy_pass_calendar: "*:0/1"
+maildivvy_pass_run_timeout: 3600
+
+# The hook (tasks/units.yml, run at step 13's place): each program task adds its own
+# units and configuration here.
+#   maildivvy_program_files: {src: <template>, dest, owner, group, mode}
+#   maildivvy_program_units: {src: <unit template>, enabled: <true: enabled and started>}
+# A unit is installed as /etc/systemd/system/<src's name without .j2>.
+maildivvy_program_files: []
+maildivvy_program_units:
+  # The fetch runner: the service is started by its timer, never enabled itself.
+  - {src: maildivvy-fetch.service.j2}
+  - {src: maildivvy-fetch.timer.j2, enabled: true}
+  # The pass: the same shape, started by its own timer.
+  - {src: maildivvy-pass.service.j2}
+  - {src: maildivvy-pass.timer.j2, enabled: true}

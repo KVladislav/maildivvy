@@ -1,0 +1,13 @@
+# ⛔ A UNIX SOCKET AND NOTHING ELSE. The scanner must not be reachable over the network
+# even inside the container's own namespace, because a published port crosses the
+# firewall. The delivery filter and the milter open this socket
+# through the bind mount, as members of the group whose gid is the image's own.
+#
+# ⚠️ A NAME, NEVER A NUMBER: rspamd resolves `owner=` and `group=` through the password
+# database, and a numeric id answers `cannot parse unix socket definition` and then an
+# `rcl parse error`, in a restart loop.
+bind_socket = "/run/rspamd/rspamd.sock mode=0660 owner={{ maildivvy_rspamd_user }} group={{ maildivvy_rspamd_user }}";
+
+# The worker would otherwise accept File, Path and Shm message sources, which make it
+# read a file by name for whoever reaches the socket. We hand it bytes and nothing else.
+allow_file_and_shm_inputs = false;

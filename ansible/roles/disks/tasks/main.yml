@@ -1,0 +1,98 @@
+# Install step 2: the vmail user with its fixed ids, then the store and index where the
+# disk mode puts them, owned by vmail, and the record later runs find them by.
+# Separate mode: xfs with reflink off on the disks preflight identified, mounted by UUID,
+# and the swap disk if there is one. One-disk mode: directories on the filesystem that
+# holds /srv/maildivvy.
+
+# --- vmail, before anything is written to the store --------------
+
+# preflight has refused a vmail whose ids differ from the settings
+- name: Create the vmail group with its fixed gid
+  ansible.builtin.group:
+    name: vmail
+    gid: "{{ maildivvy_vmail_gid | int }}"
+    system: true
+
+- name: Create the vmail user with its fixed uid, no home and no shell
+  ansible.builtin.user:
+    name: vmail
+    uid: "{{ maildivvy_vmail_uid | int }}"
+    group: vmail
+    system: true
+    create_home: false
+    home: /nonexistent
+    shell: /usr/sbin/nologin
+
+- name: Create /srv/maildivvy
+  ansible.builtin.file:
+    path: "{{ maildivvy_srv }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Separate disks
+  ansible.builtin.import_tasks: separate.yml
+  when: maildivvy_preflight.mode == 'separate'
+
+- name: One disk
+  ansible.builtin.import_tasks: single.yml
+  when: maildivvy_preflight.mode == 'single'
+
+- name: /etc/maildivvy exists
+  ansible.builtin.file:
+    path: /etc/maildivvy
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# the only way later runs find the disks; readable by health, which judges by the mode
+- name: Record the disk mode and the filesystems by UUID
+  ansible.builtin.copy:
+    dest: /etc/maildivvy/disks.json
+    content: "{{ maildivvy_disk_facts | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+# --- read back -------------------------------------------------------------------
+
+- name: Read the vmail user back
+  ansible.builtin.getent:
+    database: passwd
+    key: vmail
+
+- name: vmail has the fixed uid and gid
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.getent_passwd.vmail[1] | int == maildivvy_vmail_uid | int
+      - ansible_facts.getent_passwd.vmail[2] | int == maildivvy_vmail_gid | int
+    quiet: true
+
+- name: Read the disk record back
+  ansible.builtin.slurp:
+    src: /etc/maildivvy/disks.json
+  register: maildivvy_disk_record_read
+
+- name: The record names the mode and the filesystems this run found
+  ansible.builtin.assert:
+    that: maildivvy_disk_record_read.content | b64decode | from_json == maildivvy_disk_facts
+    quiet: true
+
+- name: Read each data directory's owner and mode
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop: "{{ maildivvy_filesystems }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: maildivvy_roots
+
+- name: Each data directory is vmail:vmail 0700
+  ansible.builtin.assert:
+    that:
+      - item.stat.pw_name == 'vmail' and item.stat.gr_name == 'vmail' and item.stat.mode == '0700'
+    quiet: true
+  loop: "{{ maildivvy_roots.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"

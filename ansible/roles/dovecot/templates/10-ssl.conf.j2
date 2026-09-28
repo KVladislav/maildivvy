@@ -1,0 +1,9 @@
+# Maildivvy, install step 8. Replaces the distribution's file of this name, which names
+# a certificate of its own; the original is in conf.d.stock/.
+#
+# The product certificate (step 5), which its deploy hook republishes and reloads
+# Dovecot for. TLS 1.2 at least, and no cleartext authentication.
+ssl = required
+ssl_server_cert_file = {{ maildivvy_dovecot_cert }}
+ssl_server_key_file = {{ maildivvy_dovecot_key }}
+ssl_min_protocol = TLSv1.2

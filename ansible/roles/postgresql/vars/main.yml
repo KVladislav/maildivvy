@@ -1,0 +1,49 @@
+# Install step 6: docs/architecture.md § Database roles and § Database schema. The
+# product fixes its database's names; none of this is a setting.
+
+maildivvy_db_name: maildivvy
+maildivvy_db_owner: maildivvy_owner
+maildivvy_db_port: 5432
+
+# The owner's connection (the schema applier and the backup, run as root): the unix
+# socket, the password only in the passfile it names.
+maildivvy_owner_conf: /etc/maildivvy/owner/db.conf
+maildivvy_owner_passfile: /etc/maildivvy/owner/pgpass
+
+maildivvy_schema_program: /opt/maildivvy/bin/maildivvy-schema
+
+# One role per consumer, each with its own password in its own passfile (#), in /etc/maildivvy/<consumer>/ beside a db.conf with no password: db.conf
+# `0640 root:<group>`, pgpass `0600 <reader>`. The consumer
+# names are src/maildivvy/lib/config.py's; the directories are the programs role's.
+# Each role is then queried as itself: a permitted read and a denied one.
+maildivvy_db_consumers:
+  - {consumer: pipeline, role: maildivvy_pipeline, reader: vmail, group: vmail,
+     permitted: "SELECT credential FROM external_mailbox", denied: "SELECT token_hash FROM session"}
+  # The Sent hook's own role: it names a sent message and nothing more. It may
+  # not read the provider credential the pipeline reads, and it holds no DELETE.
+  - {consumer: senthook, role: maildivvy_senthook, reader: vmail, group: vmail,
+     permitted: "SELECT label FROM domain", denied: "SELECT credential FROM external_mailbox"}
+  - {consumer: milter, role: maildivvy_milter, reader: maildivvy-milter, group: maildivvy-milter,
+     permitted: "SELECT sender FROM milter_sender", denied: "SELECT address FROM external_mailbox"}
+  - {consumer: admin, role: maildivvy_admin, reader: maildivvy-admin, group: maildivvy-admin,
+     permitted: "SELECT address FROM external_mailbox", denied: "SELECT credential FROM external_mailbox"}
+  - {consumer: health, role: maildivvy_health, reader: maildivvy-health, group: maildivvy-health,
+     permitted: "SELECT address FROM external_mailbox", denied: "SELECT credential FROM external_mailbox"}
+
+# The daemons' roles read their views only. Their users do not exist until
+# steps 7 and 8, so they are made NOLOGIN here, and the Dovecot and Postfix steps give
+# them LOGIN and a passfile their daemon reads. Until then they are queried as
+# themselves through SET ROLE.
+maildivvy_db_daemon_roles:
+  - {role: maildivvy_dovecot, permitted: "SELECT password FROM mailbox_opens", denied: "SELECT login FROM account"}
+  - {role: maildivvy_postfix, permitted: "SELECT mvalue FROM postfix_sasl_password",
+     denied: "SELECT credential FROM external_mailbox"}
+
+# pg_hba.conf is first-match: these come before the stock `local all all peer`, or any
+# system user named like a role opens the database with no password. The
+# owner logs in over the unix socket only.
+maildivvy_pg_hba: |
+  local   {{ maildivvy_db_name }}   postgres                        peer
+  local   {{ maildivvy_db_name }}   all                             scram-sha-256
+  host    {{ maildivvy_db_name }}   {{ maildivvy_db_owner }}   0.0.0.0/0   reject
+  host    {{ maildivvy_db_name }}   {{ maildivvy_db_owner }}   ::/0        reject

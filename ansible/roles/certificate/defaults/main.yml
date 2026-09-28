@@ -1,0 +1,46 @@
+# The certificate mode: acme (production CA, the default), acme-staging (tests
+# only: the staging CA, its own storage path), provided (the operator's own
+# certificate, chain and key, checked and published; nothing renews it) or self-signed
+# (a test machine only, and only with maildivvy_insecure_test_certificate: true).
+# Preflight checks the setting.
+maildivvy_cert_mode: acme
+
+# lego from the upstream release, pinned by version and sha256 per architecture, and
+# checked against the release's checksums file with an anchored match.
+maildivvy_lego_version: 5.4.1
+maildivvy_lego_sha256:
+  amd64: ebb33f1bead5a7c99dd46f1c5734b44cf1eab5b5c12faf397cd14d50a5916419
+  arm64: 8494c06bde449ac4d65c726b7ea50d67ac61f422e698c9b78b47778445b098f2
+maildivvy_lego_release_url: https://github.com/go-acme/lego/releases/download
+
+# DNS-01: lego's code for the DNS provider; its credential names are read from
+# `lego dnshelp -c <provider>`, and each value reaches lego only as <NAME>_FILE.
+# The propagation wait outlasts deSEC's negative-cache TTL, polled every 30 s against
+# public resolvers; another provider's zone may need another wait.
+maildivvy_acme_dns_provider: desec
+maildivvy_acme_dns_propagation_timeout: 3900
+maildivvy_acme_dns_polling_interval: 30
+maildivvy_acme_dns_resolvers: ["1.1.1.1:53", "8.8.8.8:53"]
+maildivvy_acme_email: "-"
+# What the machine must reach for issuance and renewal, checked before anything changes
+# in this step: the CA's directory, and the DNS provider's API over HTTPS where
+# its address is known (the tested providers').
+maildivvy_acme_directories:
+  acme: https://acme-v02.api.letsencrypt.org/directory
+  acme-staging: https://acme-staging-v02.api.letsencrypt.org/directory
+maildivvy_acme_dns_api_urls:
+  desec: https://desec.io/api/v1/
+
+# provided mode: the operator's files on this machine, checked in step 1
+maildivvy_provided_cert: null
+maildivvy_provided_chain: null
+maildivvy_provided_key: null
+
+# The product's fixed layout.
+maildivvy_lego: /usr/local/bin/lego
+maildivvy_cert_program: /usr/local/sbin/maildivvy-cert
+maildivvy_cert_config: /etc/maildivvy/certificate.json
+maildivvy_lego_dir: /etc/lego
+maildivvy_credentials_dir: /etc/lego/credentials
+maildivvy_credentials_env: /etc/maildivvy/certificate.env
+maildivvy_cert_renew_unit: maildivvy-cert-renew
