@@ -162,3 +162,23 @@ def test_the_key_is_reached_by_the_proxys_user_and_by_nothing_of_ours():
     users = yaml.safe_load((PROGRAMS / "vars" / "main.yml").read_text())["maildivvy_program_users"]
     admin = [user for user in users if user["name"] == values["maildivvy_interface_user"]]
     assert admin and admin[0]["groups"] == []
+
+
+def test_the_unit_hides_nothing_of_the_health_report_it_reads():
+    # the Health screen reads health.json; `ProtectSystem=strict` leaves /var/lib readable,
+    # so nothing here may take it away: no path made inaccessible or replaced by a tmpfs,
+    # and no private view of /var
+    health = yaml.safe_load((ROOT / "ansible" / "roles" / "health" / "vars" / "main.yml")
+                            .read_text())
+    from maildivvy.health import settings
+    assert health["maildivvy_health_dir"] == str(settings.STATE_DIR)
+    text = unit()
+    assert "ProtectSystem=strict" in text
+    for hiding in ("InaccessiblePaths=", "TemporaryFileSystem=", "BindPaths=",
+                   "BindReadOnlyPaths=", "ProtectSystem=full", "PrivateUsers=",
+                   "StateDirectory=", "DynamicUser="):
+        assert hiding not in text, hiding
+    # and the health role leaves the directory and the file readable by any user
+    tasks = (ROOT / "ansible" / "roles" / "health" / "tasks" / "main.yml").read_text()
+    assert 'path: "{{ maildivvy_health_dir }}"' in tasks.split("mode: \"0755\"")[0]
+    assert "maildivvy_health_report_file.stat.mode == '0644'" in tasks

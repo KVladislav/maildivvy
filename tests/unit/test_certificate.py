@@ -261,7 +261,7 @@ def test_lego_is_run_with_the_credential_files_never_the_values(tmp_path):
     env = cert.lego_env(values, {"PATH": "/usr/bin", "DESEC_TOKEN": TOKEN, "DESEC_TOKEN_FILE": "/elsewhere"})
     assert argv == [
         values["lego"], "--log.format", "text", "run", "--accept-tos", "--server", "letsencrypt",
-        "--dns", "desec", "--dns.resolvers", "1.1.1.1:53,8.8.8.8:53",
+        "--dns", "desec", "--dns.resolvers", "1.1.1.1:53,8.8.8.8:53", "--dns.propagation.disable-rns",
         "--domains", NAME, "--path", values["lego_path"],
         "--deploy-hook", values["deploy_hook"],
     ]
@@ -272,6 +272,18 @@ def test_lego_is_run_with_the_credential_files_never_the_values(tmp_path):
         "DESEC_POLLING_INTERVAL": "30",
     }
     assert "renew" not in argv  # lego 5 has no renew subcommand; run decides
+
+
+def test_lego_waits_for_the_record_at_the_authoritative_nameservers_not_at_public_resolvers(tmp_path):
+    """A production install's finding: lego 5.4.1 asks the public resolvers first, and one
+    asked before the DNS provider has published the record caches its absence for the
+    zone's negative TTL (an hour at deSEC), so the first issuance waited that out or failed.
+    The authoritative nameservers cache nothing; lego still checks them, and only them."""
+    values, _ = config(tmp_path)
+    argv = cert.lego_argv(values)
+    assert "--dns.propagation.disable-rns" in argv
+    assert "--dns.propagation.disable-ans" not in argv and "--dns.propagation.wait" not in argv
+    assert argv.index("--dns.propagation.disable-rns") > argv.index("run")    # a flag of `run`
 
 
 def test_a_contact_address_is_passed_when_there_is_one(tmp_path):

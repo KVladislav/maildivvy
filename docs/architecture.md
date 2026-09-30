@@ -65,6 +65,7 @@ Each is a separate process with its own operating-system user and database role:
   together, runs the operator's store copy, and resumes.
 - **health**: checks fifteen subsystems every five minutes and keeps a JSON report for
   the operator's monitoring, and when asked, a Prometheus textfile for node_exporter.
+  The administration interface reads the same report, with its age, and runs nothing.
   Every service is judged by exercising it, never by its unit state.
 - **installer**: `maildivvy-install`, run as root from the unpacked release. It checks the
   release against its manifest, reads the installed version, installs, runs the same

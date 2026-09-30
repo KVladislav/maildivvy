@@ -94,11 +94,33 @@ client on the internet does. A vantage point is invalid when:
 
 - it is inside the machine's own network. Without hairpin NAT it reads the public address
   as closed whether publication works or not, and the probe cannot tell;
-- its network answers the probed ports itself, as some networks do. The probe sees a
+- its network answers the mail ports itself, as some networks do. The probe sees a
   connection with no TLS, no banner, or a certificate that is not ours, and reports
   INVALID;
 - it is inside an administrator network. There 443 answers, which the probe reports as a
   FAIL, because 443 must be unreachable from the internet.
+
+### When your public address serves something else on 443
+
+Maildivvy's administration interface must never answer from outside. Your public
+address's 443 may still belong to another service, when your router forwards it to
+another machine: a web server, or even an SSH server. The probe tells the two apart. On
+443 it fails when something answers:
+
+- with the machine's certificate for the mail hostname;
+- with the same certificate 993 and 465 served;
+- with Maildivvy's sign-in page, behind another certificate or in the clear.
+
+Anything else on 443 is another service, and the check passes. Its reading says
+`answers, and not as this machine` and what answered: another certificate, or no TLS at
+all. Read it to be sure the service is yours. This holds only when 993 and 465 completed
+TLS with the machine's certificate in the same run. Without that, the probe cannot tell
+your other service from the vantage point's network answering 443 itself, and reports
+INVALID.
+
+The machine keeps 443 closed to everyone but the administrator networks at its own
+firewall, and health's firewall check reads that rule. The outside probe confirms it
+from outside.
 
 ### Running it and recording the result
 
@@ -110,8 +132,9 @@ python3 maildivvy_outside_probe.py <mail hostname> [--address <public address>] 
 certificate your clients' trust store does not know, add `--cafile` with a copy of
 `/etc/ssl/certs/<mail hostname>.crt`.
 
-It checks that 993 and 465 complete TLS with the machine's certificate; that 443 and the
-other ports not meant to be published do not answer; and that an unauthenticated SMTP
+It checks that 993 and 465 complete TLS with the machine's certificate; that the ports
+not meant to be published do not answer, and 443 does not answer as this machine (see
+above); and that an unauthenticated SMTP
 dialogue on 465 is refused `554 5.7.1` at `RCPT TO`, not earlier. It exits 0 for PASS, 2
 for FAIL, 3 for INVALID. Then copy `probe-result.json` to the machine and record it:
 
@@ -158,9 +181,32 @@ sudo runuser -u maildivvy-health -- /opt/maildivvy/bin/maildivvy-health
   after 15 minutes: `--cached` then adds an UNKNOWN `freshness` check to every subsystem,
   so a stale PASS reads UNKNOWN and a stale FAIL stays FAIL.
 - To move a bound from its default, write `<key>=<whole number>` lines in
-  `/etc/maildivvy/health.conf`, readable by `maildivvy-health` and by your collector. The
-  keys are the defaults in `src/maildivvy/health/settings.py`. A key the program does not
-  know stops it, rather than being ignored.
+  `/etc/maildivvy/health.conf`, readable by `maildivvy-health`, by your collector and by
+  the interface's user `maildivvy-admin`; it holds no secret, so `0644` does. The keys are
+  the defaults in `src/maildivvy/health/settings.py`. A key the program does not know
+  stops it, rather than being ignored.
+
+### In the administration interface
+
+The interface's **Health** screen, last in the sidebar, shows the report the timer last
+wrote: every subsystem with its state, and every check with its reading and, when not
+PASS, what is wrong. It reads `health.json` as `--cached` does and runs nothing, so it
+says what the timer last found, never what is true this second; it always shows the
+report's time and age. A report older than 15 minutes (the `stale_minutes` bound) is
+shown as stale, every subsystem then reading UNKNOWN at best and a FAIL staying FAIL, and
+a report that is missing or damaged is shown as no report at all. Each state has its own
+colour, with its word beside it: FAIL red, WARN amber, UNKNOWN indigo, PASS green.
+
+Every page's top bar carries the same reading in a few words, linking to the screen:
+`Health: PASS · 3 minutes ago`, `Health: FAIL · stale, 42 minutes old` for a stale
+report (never PASS), or `Health: no report`, in red like a FAIL, since then nothing is
+known.
+
+The overview lists under **Needs attention** every subsystem that is FAIL, with the
+report's time, and a report that is stale or cannot be read. WARN and UNKNOWN are not
+listed there, since a fresh machine reads UNKNOWN until mail flows: the overview's
+**Health** row counts them. The interface is not monitoring: it alerts nobody, so keep
+your monitoring connected as below.
 
 Health fails an IMAP login from 127.0.0.1 every five minutes, for a login that cannot
 exist. That line in Dovecot's log is health, not an attack.

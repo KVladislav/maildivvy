@@ -744,6 +744,26 @@ def test_the_screen_shows_one_line_per_step_what_needs_the_operator_and_the_fail
     assert "localhost                  : ok=5    changed=1    unreachable=0    failed=1" in text
 
 
+def test_the_screen_shows_the_line_the_guide_promises_at_the_end_of_step_19():
+    """A production install's finding: the guide says step 19 ends with a line the screen
+    never showed, since it was the task's name, and the screen shows messages, not names."""
+    import re
+    import yaml
+
+    # docs/public/ here, docs/ in the public tree
+    guide = next(p for p in (REPO / "docs" / "public" / "installation.md", REPO / "docs" / "installation.md")
+                 if p.exists()).read_text()
+    promised = re.search(r"Step 19 ends\s+with `([^`]+)`", guide).group(1)
+    tasks = yaml.safe_load((REPO / "ansible" / "roles" / "publish" / "tasks" / "main.yml").read_text())
+    last = tasks[-1]
+    assert "ansible.builtin.debug" in last, last
+    said = json.dumps({"msg": last["ansible.builtin.debug"]["msg"]}, indent=4)
+    shown = "\n".join(screen_of(f"TASK [publish : {last['name']}] ***\nok: [localhost] => {said}\n"
+                                "\nPLAY RECAP ***\n"))
+    assert "step 19: publication" in shown
+    assert f'"{promised}' in shown, shown          # the message's own first line, not a name
+
+
 def test_a_loop_item_failure_is_shown_with_its_message():
     shown = screen_of('TASK [disks : x] ***\nfailed: [localhost] (item=store) => {"msg": "no"}\n')
     assert "failed (item=store): no" in shown

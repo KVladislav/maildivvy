@@ -49,7 +49,9 @@ SECTIONS = (
     ("mailboxes", "Mailboxes", "mailboxes", True),
     ("fetch", "Fetch", None, False),
     ("withheld", "Withheld messages", "withheld", False),
-    ("events", "Journal", None, False),
+    ("events", "Journal", None, True),
+    # the machine rather than its mail: health's last report, read as a file
+    ("health", "Health", None, False),
 )
 
 # ⛔ ONE QUERY PER RENDER for all five counts: one per link would be five
@@ -115,7 +117,32 @@ th, td { border-bottom: 1px solid #ddd; padding: .35rem .75rem; text-align: left
 .badge { border: 1px solid #666; padding: 0 .35rem; }
 label { display: block; margin: .75rem 0 .25rem; }
 footer { padding: 1.5rem; color: #444; }
+header a.health { text-decoration: none; }
 """
+
+# Health's four states in colour: (text, background, border), each pair readable
+# at WCAG AA or better. The state's word is always printed too, so colour is never the
+# only signal. FAIL is the one solid badge; PASS is calm; UNKNOWN is not PASS's colour.
+# Only a badge that names a health state carries a `state-*` class: the People list's
+# badges keep their plain look.
+STATE_COLOURS = {
+    "PASS": ("#14532d", "#dcfce7", "#15803d"),
+    "WARN": ("#713f12", "#fef3c7", "#b45309"),
+    "UNKNOWN": ("#3730a3", "#e0e7ff", "#4338ca"),
+    "FAIL": ("#ffffff", "#b91c1c", "#7f1d1d"),
+}
+STYLE += "".join(
+    f".badge.state-{state.lower()} {{ color: {text}; background: {background}; "
+    f"border-color: {border};{' font-weight: bold;' if state == 'FAIL' else ''} }}\n"
+    for state, (text, background, border) in STATE_COLOURS.items())
+# The Health screen's two banners take the same palette: a stale report is WARN, and no
+# report at all is FAIL. Only a banner that names a state is coloured; the break-glass
+# and shown-once banners keep the plain `.banner`.
+STYLE += "".join(
+    f".banner.state-{state.lower()} {{ color: {text}; background: {background}; "
+    f"border-color: {border}; }}\n"
+    for state, (text, background, border) in STATE_COLOURS.items()
+    if state in ("WARN", "FAIL"))
 
 SHELL = """<!doctype html>
 <html lang="en">
@@ -124,6 +151,9 @@ SHELL = """<!doctype html>
 {%- if identity %}
 <header>
   <a class="product" href="{{ url_for('overview') }}">Maildivvy</a>
+  {%- if health %}
+  <a class="health badge state-{{ health.tone|lower }}" href="{{ health.url }}">Health: {{ health.words }}{% if health.detail %} &middot; {{ health.detail }}{% endif %}</a>
+  {%- endif %}
   <span class="who">Signed in as {{ identity.login }}</span>
   <form method="post" action="{{ url_for('sign_out') }}">
     <button type="submit">Sign out {{ identity.login }}</button>
@@ -203,10 +233,27 @@ def sign_in_throttle():
 
 # --- pages ---------------------------------------------------------------------------------
 
+def header_health():
+    """The header's health status, or None where no Health screen is served.
+
+    It is the Health screen's own reading of the report, read once per request, so the
+    header and the screen cannot say two things; it costs one read of a small file.
+    """
+    if "health" not in current_app.view_functions:
+        return None
+    # imported here, not at the top: the screen module imports this one for the shell
+    from maildivvy.admin.screens import health
+
+    return {**health.status(), "url": url_for("health")}
+
+
 def page(title, body, identity=None, status=200, nav=None, done=None):
     inner = render_template_string(body, identity=identity, **g.get("render", {}))
+    # ⛔ only a signed-in page has the shell's header, so only it reads the report; the
+    # sign-in page has no shell and says nothing about the machine
     html = render_template_string(SHELL, title=title, style=STYLE, identity=identity,
-                                  body=Markup(inner), nav=nav, done=done)
+                                  body=Markup(inner), nav=nav, done=done,
+                                  health=header_health() if identity else None)
     return current_app.response_class(add_csrf_fields(html), status=status,
                                       mimetype="text/html")
 
@@ -560,11 +607,11 @@ def create_app(etc=ETC, consumer=auth.CONSUMER):
                       MAILDIVVY_THROTTLE=throttle.Throttle())
     register(app)
     # imported here, not at the top: a screen module imports this one for the shell
-    from maildivvy.admin.screens import (accounts, domains, events, external, fetch,
+    from maildivvy.admin.screens import (accounts, domains, events, external, fetch, health,
                                          mailboxes, maintenance, moderation, overview)
 
     for screens in (overview, domains, external, fetch, accounts, mailboxes, moderation,
-                    maintenance, events):
+                    maintenance, events, health):
         screens.register(app)
     guard_every_endpoint(app)
     return app

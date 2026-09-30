@@ -21,10 +21,10 @@ from flask import Flask
 from maildivvy.admin import app as application
 from maildivvy.admin import journal
 from maildivvy.admin.screens import (accounts, common, domains, events, external, fetch,
-                                     mailboxes, maintenance, moderation, overview)
+                                     health, mailboxes, maintenance, moderation, overview)
 
 SCREENS = (overview, domains, external, fetch, accounts, mailboxes, moderation,
-           maintenance, events)
+           maintenance, events, health)
 SOURCE = Path(application.__file__).resolve().parent
 
 
@@ -51,12 +51,13 @@ def templates():
 
 # --- the shell and the sidebar -----------------------------------------
 
-def test_the_sidebar_is_the_declared_list_in_its_order_with_its_two_separators():
+def test_the_sidebar_is_the_declared_list_in_its_order_with_its_separators():
     titles = [title for _, title, _, _ in application.SECTIONS]
     assert titles == ["Overview", "External mailboxes", "Domains", "People", "Mailboxes",
-                      "Fetch", "Withheld messages", "Journal"]
+                      "Fetch", "Withheld messages", "Journal", "Health"]
+    # Health, the machine rather than its mail, stands apart at the end
     after = [title for _, title, _, separator in application.SECTIONS if separator]
-    assert after == ["Overview", "Mailboxes"]
+    assert after == ["Overview", "Mailboxes", "Journal"]
 
 
 def test_a_link_is_built_from_the_routes_name_and_never_from_a_path():
@@ -900,7 +901,8 @@ def test_the_cap_and_the_empty_result_each_have_their_own_sentence():
 
 def test_the_detail_and_the_pipelines_reason_are_rendered_as_text():
     # neither is marked safe anywhere: Jinja escapes both
-    for name in ("events", "mailboxes", "moderation", "accounts", "external", "overview"):
+    for name in ("events", "mailboxes", "moderation", "accounts", "external", "overview",
+                 "health"):
         text = (SOURCE / "screens" / f"{name}.py").read_text()
         assert "|safe" not in text, name
         assert "Markup(" not in text, name

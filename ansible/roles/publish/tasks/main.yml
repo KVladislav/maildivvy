@@ -175,15 +175,18 @@
           - "{{ ansible_failed_result.stderr_lines | default([]) }}"
           - "{{ ansible_failed_result.msg | default('') }}"
 
+# The screen shows a step's messages, never a task's name: the line the installation
+# guide promises is the message's own first line.
 - name: "PUBLISHED: NOW PROVE IT FROM OUTSIDE"
   ansible.builtin.debug:
     msg:
+      - "PUBLISHED: NOW PROVE IT FROM OUTSIDE."
       - "993 and 465 are open at this machine's firewall. {{ (maildivvy_publish_network.stdout_lines
          | select('match', '^  [A-Z]+ publication: ') | first).strip() }}"
       - "Publication reads UNKNOWN until an outside probe's result is recorded, and again once it is
          older than health's publication_days."
-      - "From a machine OUTSIDE this network (not the LAN, not a network that answers 993, 465 or
-         443 itself), with this repository's tools/outside-probe/:"
+      - "From a machine OUTSIDE this network (not the LAN, not a network that answers 993 or 465
+         itself), with this repository's tools/outside-probe/:"
       - "    python3 maildivvy_outside_probe.py {{ maildivvy_cert_name }} [--address <public address>]{{
          '' if maildivvy_cert_mode | default('acme') == 'acme'
          else ' --cafile <a copy of /etc/ssl/certs/' ~ maildivvy_cert_name ~ '.crt>' }} > probe-result.json"

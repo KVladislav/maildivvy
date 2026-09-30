@@ -16,8 +16,13 @@ It asserts, and prints as one dated JSON document:
 - 993 and 465 complete a TLS handshake presenting the certificate for <mail name>,
   verified by the system's trust store, or by --cafile for a test machine whose
   certificate is self-signed or from a staging CA;
-- the administration port (443) and every port not meant to be published are
-  unreachable;
+- every port not meant to be published is unreachable, and the administration port
+  (443) is unreachable or answers as another service: neither with our certificate,
+  nor with the leaf 993 and 465 served, nor with Maildivvy's sign-in page behind
+  another certificate or none. Another service on the public 443 (a router that
+  forwards it to another machine) passes only where 993 and 465 completed a verified
+  handshake from the same vantage point; without that it may be the vantage
+  network's own, and the result is INVALID;
 - an unauthenticated SMTP dialogue on 465 reaches RCPT TO and is refused THERE with
   554 5.7.1. A refusal at an earlier stage fails the expectation: it is not a pass.
 
@@ -26,7 +31,7 @@ The result also names the SHA-256 of the leaf certificate 993 and 465 each serve
 refuses to record a result for any leaf but its own published one.
 
 Result: PASS, FAIL, or INVALID when the vantage point is not a valid one: a network that
-answers the probed ports itself - a connection accepted with no TLS, no banner, or a
+answers the mail ports itself - a connection accepted with no TLS, no banner, or a
 certificate that is not ours. Its exit code is 0, 2 or 3. An INVALID result proves
 nothing and the machine refuses to record it. A vantage point inside the machine's own
 network is invalid too, and the probe cannot see that: without hairpin NAT it reads the
@@ -52,6 +57,9 @@ ADMIN_PORT = 443
 CLOSED = (22, 25, 80, 110, 143, 587, 995, 3310, 4190, 5432, 11332, 11333, 11334)
 EXIT = {"PASS": 0, "FAIL": 2, "INVALID": 3}
 EHLO = "maildivvy-outside-probe.invalid"
+# The administration interface's sign-in page, and what the title of each of its pages says
+SIGN_IN = "/sign-in"
+INTERFACE_MARK = b" - Maildivvy</title>"
 SENDER = "maildivvy-outside-probe@example.org"
 
 
@@ -193,18 +201,85 @@ def check_submissions(address, port, host, context, timeout):
     return Check("submissions", "PASS", f"{port}: TLS with our certificate for {host}; {reading}", leaf)
 
 
-def check_admin(address, port, host, context, timeout):
-    """The administration port must not answer; if something does, it is either the machine
-    (our certificate: the port is published) or the vantage network's own."""
+def unverified():
+    """A TLS context that accepts any certificate: to read what a port serves, never to trust it."""
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def read_all(stream, limit=65536):
+    """What the other end says until it closes, goes quiet, or `limit` bytes."""
+    said = b""
+    try:
+        while len(said) < limit:
+            chunk = stream.recv(4096)
+            if not chunk:
+                break
+            said += chunk
+    except OSError:
+        pass
+    return said
+
+
+def what_answers(address, port, host, timeout):
+    """(the leaf it served or None, whether it serves Maildivvy's interface) of a port that
+    answered and is not verified as ours: TLS taken as it comes, else the clear; either way
+    asked for the interface's sign-in page, whose title names Maildivvy."""
+    request = f"GET {SIGN_IN} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+    leaf = None
+    try:
+        sock = connect(address, port, timeout)
+    except Unreachable:
+        return None, False
+    try:
+        with unverified().wrap_socket(sock, server_hostname=host) as tls:
+            leaf = leaf_sha256(tls)
+            tls.sendall(request)
+            return leaf, INTERFACE_MARK in read_all(tls)
+    except OSError:
+        sock.close()
+    try:
+        with connect(address, port, timeout) as plain:
+            plain.sendall(request)
+            return leaf, INTERFACE_MARK in read_all(plain)
+    except (Unreachable, OSError):
+        return leaf, False
+
+
+def check_admin(address, port, host, context, timeout, ours=frozenset()):
+    """The administration port must not answer as this machine. With our certificate, the
+    leaf 993 and 465 served (`ours`), or Maildivvy's sign-in page behind another certificate
+    or none, the interface is published. Anything else that answers is another service: on
+    a network that forwards the public 443 elsewhere that is fine, where 993 and 465 proved
+    this machine from here; where they did not, it may be the vantage network's own."""
     try:
         with handshake(address, port, host, context, timeout):
             pass
     except Unreachable as err:
         return Check("administration port", "PASS", f"{port} not reachable ({err})")
     except Invalid as err:
-        return Check("administration port", "INVALID", f"{port} {err}")
-    return Check("administration port", "FAIL", f"{port} answers with our certificate for {host}: "
-                                                "the administration interface is published")
+        why = str(err)
+    else:
+        return Check("administration port", "FAIL", f"{port} answers with our certificate for {host}: "
+                                                    "the administration interface is published")
+    leaf, interface = what_answers(address, port, host, timeout)
+    if leaf is not None and leaf in ours:
+        return Check("administration port", "FAIL", f"{port} serves the certificate 993 and 465 served "
+                                                    f"(sha256 {leaf}): the administration interface "
+                                                    "is published")
+    if interface:
+        return Check("administration port", "FAIL", f"{port} {why}, and serves Maildivvy's administration "
+                                                    "interface: it is published, behind another "
+                                                    "certificate or none")
+    if not ours:
+        return Check("administration port", "INVALID", f"{port} {why}")
+    served = f" (sha256 {leaf})" if leaf else ""
+    return Check("administration port", "PASS", f"{port} answers, and not as this machine: it {why}, "
+                                                f"and serves no Maildivvy page{served}; another service "
+                                                "holds this address's port, not the administration "
+                                                "interface")
 
 
 def reachable(address, port, timeout):
@@ -244,9 +319,11 @@ def result(host, address, checks):
 
 
 def probe(host, address, context, ports=PORTS, admin_port=ADMIN_PORT, closed=CLOSED, timeout=10.0):
-    checks = [check_imaps(address, ports["imaps"], host, context, timeout),
-              check_submissions(address, ports["submissions"], host, context, timeout),
-              check_admin(address, admin_port, host, context, timeout),
+    mail = [check_imaps(address, ports["imaps"], host, context, timeout),
+            check_submissions(address, ports["submissions"], host, context, timeout)]
+    # a leaf is kept only from a handshake verified as ours: this machine, reached from here
+    ours = {check.leaf_sha256 for check in mail if check.leaf_sha256 and check.state != "INVALID"}
+    checks = [*mail, check_admin(address, admin_port, host, context, timeout, ours),
               check_closed(address, list(closed), timeout)]
     return result(host, address, checks)
 

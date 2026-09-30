@@ -28,7 +28,7 @@
         status_code: [200, 401, 403]
       changed_when: false
 
-    - name: Each public resolver lego checks propagation against answers on port 53
+    - name: Each public resolver lego finds the zone through answers on port 53
       ansible.builtin.command:
         argv: [dig, "@{{ item.rsplit(':', 1)[0] }}", -p, "{{ item.rsplit(':', 1)[1] }}", +time=5, +tries=2, +short, SOA, .]
       loop: "{{ maildivvy_acme_dns_resolvers }}"

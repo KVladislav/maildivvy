@@ -86,7 +86,8 @@ settings: leave them out, since `/etc/maildivvy/install.yml` refuses them.
   300 s and the run stops as *unreachable*. Fix the setting and run again. An install run
   on the machine itself proves it by your own new SSH login instead (§ 3).
 - **Outbound access**, during the install and afterwards: the Ubuntu archive; the ACME
-  CA and your DNS provider's API over HTTPS; public resolvers on port 53; the lego and
+  CA and your DNS provider's API over HTTPS; public resolvers and your zone's
+  nameservers on port 53; the lego and
   mpop release downloads (`github.com`, `marlam.de`); the container registry for the
   rspamd image and `hub.docker.com`'s tag listing; ClamAV's and Sanesecurity's signature
   mirrors, and the DNS record `current.cvd.clamav.net`; and each mail provider's POP3 and
@@ -142,13 +143,23 @@ the first issuance and at every renewal, so the machine keeps the provider's cre
   stored in its own root-only file under `/etc/lego/credentials/`. lego is given each
   file's path, as `<NAME>_FILE` in `/etc/maildivvy/certificate.env`, and reads the file
   itself. No credential is ever in a command line, a service's environment or a log.
-- The wait for the record to propagate is at most 3900 seconds, polled every 30
-  seconds against public resolvers. That suits deSEC, whose zones cache a missing record
-  for up to an hour. Another provider's zone may need another value:
-  `maildivvy_acme_dns_propagation_timeout` and `maildivvy_acme_dns_polling_interval`,
-  role defaults you may override in the settings file (§ 2).
+- lego waits for the record at your zone's own nameservers, polled every 30 seconds for
+  at most 3900 seconds. It does not wait for public resolvers: one asked before your
+  provider has published the record remembers that the record is missing, for as long
+  as your zone says a missing record may be cached (up to an hour at deSEC). Another
+  provider may need another wait: `maildivvy_acme_dns_propagation_timeout` and
+  `maildivvy_acme_dns_polling_interval`, role defaults you may override in the settings
+  file (§ 2).
 - An issuance takes several minutes, most of it waiting for propagation. Step 5 sitting
   on "Issue the certificate" is normal.
+- **If the first issuance fails**, lego says why, and the run stops at step 5. The usual
+  cause is timing. Your provider had not yet published the record everywhere when
+  Let's Encrypt looked, or a resolver on the way remembered it as missing. Such a
+  failure can hold the next try back by the time your zone lets a missing record be
+  cached: up to an hour at deSEC. Wait that long, then run the installer again. The
+  re-run is safe: every step before 5 finds its work done, and step 5 issues only while
+  the machine has no certificate. Do not retry in a loop: Let's Encrypt allows five
+  failed validations per name per hour.
 
 **Your own certificate** (`provided`). You give the certificate, its chain (the issuing
 CA's certificates) and its private key, as files on the machine. Copy them there first,
@@ -260,6 +271,7 @@ with [minisign](https://jedisct1.github.io/minisign/) (in Ubuntu's archive):
 
 <!-- runnable: shell -->
 ```
+sudo apt-get update
 sudo apt install minisign
 minisign -V -m maildivvy-<version>.tar.gz -P <release signing key>
 ```
@@ -430,7 +442,9 @@ in order. Every step reads its own result back before the next starts.
   cause and run again: a step that finds its work done proves it and changes nothing.
 - **Step 1** fails once with every problem in the settings and the disks listed.
 - **Step 3** can stop the run as *unreachable* (§ 1, administrator networks).
-- **Step 5** issues the certificate, which can take several minutes.
+- **Step 5** issues the certificate, which can take several minutes. If the issuance
+  fails, wait up to an hour and run again
+  ([the certificate](#the-certificate), if the first issuance fails).
 - **Step 17** runs health through its unit. It accepts every subsystem PASS or WARN, and
   UNKNOWN only where a fresh machine has no data yet (no external mailbox, no delivery,
   no mail to search). It prints each WARN it accepted.

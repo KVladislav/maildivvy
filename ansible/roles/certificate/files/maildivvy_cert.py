@@ -241,7 +241,11 @@ def lego_argv(config):
     argv = [config["lego"], "--log.format", "text", "run", "--accept-tos", "--server", config["server"]]
     if config.get("email") and config["email"] != "-":
         argv += ["--email", config["email"]]
+    # lego asks the resolvers for the zone and its nameservers, and the record's
+    # propagation at the authoritative nameservers alone: a public resolver asked before
+    # the provider publishes it caches the absence for the zone's negative TTL
     argv += ["--dns", config["dns_provider"], "--dns.resolvers", ",".join(config["resolvers"]),
+             "--dns.propagation.disable-rns",
              "--domains", config["cert_name"], "--path", config["lego_path"],
              "--deploy-hook", config["deploy_hook"]]
     return argv

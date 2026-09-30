@@ -191,8 +191,14 @@ def write_textfile(directory, whole):
     replace_whole(Path(directory) / TEXTFILE, to_prometheus(whole))
 
 
+# The checks a reader of the file adds of its own: the file could not be read at all, or it
+# is older than the schedule allows. The interface tells the two apart by these names.
+REPORT_FILE = "report file"
+FRESHNESS = "freshness"
+
+
 def unreadable(path, why, now):
-    return Report(now, [Subsystem("health", [Check("report file", UNKNOWN, str(path), why)])])
+    return Report(now, [Subsystem("health", [Check(REPORT_FILE, UNKNOWN, str(path), why)])])
 
 
 def read_json(path, now, stale_after):
@@ -212,6 +218,8 @@ def read_json(path, now, stale_after):
         if not isinstance(data, dict) or data.get("complete") is not True:
             raise ValueError("the report does not say it is complete")
         taken_at = datetime.datetime.fromisoformat(data["taken_at"])
+        if taken_at.tzinfo is None:          # a run writes UTC; a time with no zone has no age
+            raise ValueError("the report's time names no zone")
         subsystems = [Subsystem(s["name"], [Check(c["name"], c["state"], c["reading"], c["problem"])
                                             for c in s["checks"]])
                       for s in data["subsystems"]]
@@ -226,7 +234,7 @@ def read_json(path, now, stale_after):
         if age < datetime.timedelta(0):
             why = "the last reading is dated in the future: the clock or the file is wrong"
         for subsystem in whole.subsystems:
-            subsystem.checks.append(Check("freshness", UNKNOWN, reading, why))
+            subsystem.checks.append(Check(FRESHNESS, UNKNOWN, reading, why))
         if not whole.subsystems:
-            whole.subsystems.append(Subsystem("health", [Check("freshness", UNKNOWN, reading, why)]))
+            whole.subsystems.append(Subsystem("health", [Check(FRESHNESS, UNKNOWN, reading, why)]))
     return whole

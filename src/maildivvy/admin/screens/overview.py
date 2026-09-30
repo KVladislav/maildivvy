@@ -14,10 +14,17 @@ tab.
 
 The readings of a fetch row are `screens/fetch.py`'s own, imported: a second spelling of
 "credential refused" here would drift from the one the fetch screen shows.
+
+⚠️ **Health's report is the one reading here that was written earlier**: its
+timer writes it every few minutes. So it is read as the page renders, with its own time
+beside everything said from it, and a report that is stale or cannot be read is itself a
+worry - never a quiet "nothing needs anybody". A FAIL in the report is listed; WARN and
+UNKNOWN are counted on the Health row, because a fresh machine reads UNKNOWN until mail
+flows and a WARN does not need a person now. The readings are `screens/health.py`'s own.
 """
 
 from maildivvy.admin import app
-from maildivvy.admin.screens import common, fetch
+from maildivvy.admin.screens import common, fetch, health
 
 # ⚠️ One row of an external mailbox's own columns per worry: a refused credential is the
 # fetch status OR the check status, because a password can be refused by either.
@@ -67,7 +74,8 @@ BOXES = ("SELECT (SELECT count(*) FROM mailbox) AS mailboxes, "
          "(SELECT count(*) FROM domain) AS archives")
 LAST_ACT = "SELECT at, actor, action, target FROM audit ORDER BY id DESC LIMIT 1"
 
-NOTHING = ("Nothing needs anybody right now: no provider password has been refused, no "
+NOTHING = ("Nothing needs anybody right now: health's current report holds no FAIL, no "
+           "provider password has been refused, no "
            "mailbox is frozen, nothing is withheld, and the pipeline has performed "
            "everything it was asked for in the last day.")
 
@@ -75,8 +83,21 @@ PAGE = """
 <h1>Overview</h1>
 
 <h2>Needs attention</h2>
-{%- if worries or withheld.waiting or failures.count %}
+{%- if worries or withheld.waiting or failures.count or health.failing
+      or health.condition != 'current' %}
 <ul>
+{%- if health.condition == 'unreadable' %}
+<li><a href="{{ url_for('health') }}">No health report could be read</a>:
+{{ health.why }}. Nothing here says the machine is well.</li>
+{%- elif health.condition == 'stale' %}
+<li><a href="{{ url_for('health') }}">Health's report of {{ health.taken }}</a> is
+{{ health.why }}.</li>
+{%- endif %}
+{%- for failed in health.failing %}
+<li><a href="{{ url_for('health') }}"><code>{{ failed.name }}</code> is FAIL</a> in
+health's report of {{ health.taken }}: <code>{{ failed.check }}</code> &mdash;
+{{ failed.problem }}</li>
+{%- endfor %}
 {%- for worry in worries %}
 <li>{{ worry.words }}
   <a href="{{ url_for('external_mailbox', external_id=worry.id) }}"><code>{{ worry.address }}</code></a>
@@ -145,6 +166,15 @@ not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
       {{ last_act.at }}.{% else %}Nothing written yet.{% endif %}</td>
   <td></td>
 </tr>
+<tr>
+  <td><a href="{{ url_for('health') }}">Health</a></td>
+  <td>{% if health.condition == 'unreadable' %}No report could be read.
+      {%- else %}{{ health.counts }} in the report of {{ health.taken }},
+      {% if health.condition == 'stale' %}stale: {{ health.age }}
+      {%- if health.age != 'dated in the future' %} old{% endif %}.
+      {%- else %}{{ health.age }} old.{% endif %}{% endif %}</td>
+  <td></td>
+</tr>
 </table>
 """
 
@@ -186,6 +216,7 @@ def register(app_):
                    (worry_of(row) for row in common.rows(conn, WORRIES)) if worry]
         last_run = external["last_run"]
         return app.render("Overview", PAGE, section="overview", worries=worries,
+                          health=health.configured(),
                           withheld=common.one(conn, WITHHELD),
                           failures=failures_of(common.one(conn, FAILURES),
                                                common.one(conn, NEWEST_FAILURE)),
