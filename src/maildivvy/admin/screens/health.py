@@ -6,7 +6,7 @@ screen only reads the file it keeps. So the report's time and age are always sho
 report that has stopped being current is never shown as fine: a stale one - older than
 health's own bound, or dated in the future - is judged with health's own UNKNOWN
 `freshness` check in every subsystem, so a stale PASS reads UNKNOWN and a stale FAIL stays
-FAIL, and the screen says so once, in a banner; a missing, unreadable, truncated or
+FAIL, and the screen says so once, in a flash; a missing, unreadable, truncated or
 incomplete one is no report at all, UNKNOWN, with its reason.
 
 Every signed-in page carries the same reading, a few words in its header (`status()`),
@@ -36,48 +36,62 @@ HEALTH_TIMER = "/etc/systemd/system/maildivvy-health.timer"
 # the order a report's counts are said in, the worst last, as health orders its states
 ORDER = report.STATES
 
+# ⚠️ The design's voices (amending palette of its own): PASS is `ok`, WARN
+# `attn`, FAIL `bad`, soft as every badge is, and UNKNOWN `off`, grey. The word is always
+# printed beside the colour, so a screen in greyscale loses nothing.
+VOICES = {report.PASS: "ok", report.WARN: "attn", report.FAIL: "bad", report.UNKNOWN: "off"}
+
+# The page head's lede is the whole state and the report's time, with the timer's period.
+# A stale report is an amber flash with the clock, no report a red one with the alert,
+# each said once above the subsystems. Each subsystem is a box: its name and state in
+# the head, its checks a table beneath.
 PAGE = """
-<h1>Health</h1>
-{%- if health.condition == 'unreadable' %}
-<p class="banner state-fail">No health report could be read: {{ health.why }}. Nothing on this screen
-says the machine is well.</p>
-<p>The report is <code>{{ path }}</code>, written by health's timer as its own user.</p>
-{%- else %}
-{%- if health.condition == 'stale' %}
-<p class="banner state-warn">This report is {{ health.why }}. Every subsystem below reads UNKNOWN at
-best; a FAIL in it is still a FAIL.</p>
-{%- endif %}
-<p>The whole reads <span class="badge state-{{ health.state|lower }}">{{ health.state }}</span> in the report of
+{%- set heading %}Health{% endset %}
+{%- set lede %}
+{%- if health.condition != 'unreadable' -%}
+The whole reads <span class="badge {{ voice[health.state] }}">{{ health.state }}</span> in the report of
 {{ health.taken }}
 {%- if health.condition == 'current' %}, {{ health.age }} old.
 {%- if health.period %} The next is due by the health timer's own period ({{ health.period }}).
 {%- else %} The health timer's period could not be read from the machine.{% endif %}
 A report older than {{ health.bound }} is stale.
-{%- else %}.{% endif %}</p>
-<table>
-<tr><th>Subsystem</th><th>State</th><th>Checks</th></tr>
-{%- for subsystem in health.subsystems %}
-<tr>
-  <td><code>{{ subsystem.name }}</code></td>
-  <td><span class="badge state-{{ subsystem.state|lower }}">{{ subsystem.state }}</span></td>
-  <td>
-  {%- for check in subsystem.checks %}
-    <div class="check"><span class="badge state-{{ check.state|lower }}">{{ check.state }}</span>
-      <code>{{ check.name }}</code>: {{ check.reading }}
-      {%- if check.problem %}<div class="problem">{{ check.problem }}</div>{% endif %}</div>
-  {%- endfor %}
-  </td>
-</tr>
-{%- else %}
-<tr><td colspan="3">The report holds no subsystem.</td></tr>
-{%- endfor %}
-</table>
+{%- else %}.{% endif %}
+{%- endif %}{% endset %}
+{%- if health.condition == 'unreadable' %}
+{%- set unread %}No health report could be read: {{ health.why }}. Nothing on this screen
+says the machine is well.{% endset %}
+{{ refused(unread) }}
+{%- elif health.condition == 'stale' %}
+{%- set stale %}This report is {{ health.why }}. Every subsystem below reads UNKNOWN at
+best; a FAIL in it is still a FAIL.{% endset %}
+{{ flash('attn', 'clock', stale) }}
 {%- endif %}
-<footer>This screen shows what health's timer last found, never a reading taken now; for
+<div class="stack">
+{%- if health.condition == 'unreadable' %}
+<p>The report is <code>{{ path }}</code>, written by health's timer as its own user.</p>
+{%- else %}
+{%- for subsystem in health.subsystems %}
+<section class="box"><div class="box-head"><h2><code>{{ subsystem.name }}</code></h2>\
+<span class="badge {{ voice[subsystem.state] }}">{{ subsystem.state }}</span></div>
+<div class="table-wrap"><table>
+<tbody class="checks">
+{%- for check in subsystem.checks %}
+<tr><td class="state"><span class="badge {{ voice[check.state] }}">{{ check.state }}</span></td>
+  <td class="wrap"><code>{{ check.name }}</code>: {{ check.reading }}
+  {%- if check.problem %}<span class="row-sub">{{ check.problem }}</span>{% endif %}</td></tr>
+{%- endfor %}
+</tbody>
+</table></div></section>
+{%- else %}
+<section class="box"><div class="box-body"><p>The report holds no subsystem.</p></div></section>
+{%- endfor %}
+{%- endif %}
+<p class="muted">This screen shows what health's timer last found, never a reading taken now; for
 one, run <code>maildivvy-health</code> on the machine as its own user. A check is
 <code>PASS</code>, <code>WARN</code>, <code>UNKNOWN</code> or <code>FAIL</code>, and a
 subsystem takes its worst check. <code>UNKNOWN</code> means a reading could not be taken;
-it is never a <code>PASS</code>.</footer>
+it is never a <code>PASS</code>.</p>
+</div>
 """
 
 
@@ -185,6 +199,16 @@ NO_REPORT = {"state": report.UNKNOWN, "tone": report.FAIL, "words": "no report",
              "detail": None}
 
 
+def voice_of(tone):
+    """The header badge's classes for a tone: the state's voice, and for FAIL the solid red.
+
+    ⛔ The solid badge is the one exception to the design's Red Inside the Fence:
+    red is kept for a worded state, a danger zone or a refusal, and a failing machine is
+    the one thing every page must shout. On the Health screen itself FAIL stays soft.
+    """
+    return VOICES[tone] + (" solid" if tone == report.FAIL else "")
+
+
 def status():
     """The header's few words: the whole state and the report's age, from `configured()`.
 
@@ -211,4 +235,5 @@ def register(app_):
     @app_.get("/health")
     def health():
         return app.render("Health", PAGE, section="health", health=configured(),
-                          path=current_app.config.get("MAILDIVVY_HEALTH_REPORT", REPORT))
+                          path=current_app.config.get("MAILDIVVY_HEALTH_REPORT", REPORT),
+                          voice=VOICES)

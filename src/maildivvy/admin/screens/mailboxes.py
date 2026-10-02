@@ -75,31 +75,29 @@ NO_PERSON = "That person is not there."
 
 SHAPE = """
 {%- macro mailbox_head(columns) -%}
-<tr><th>Mailbox</th>
+<thead><tr><th>Mailbox</th>
 {%- if 'person' in columns %}<th>Person</th>{% endif %}
-{%- if 'domain' in columns %}<th>Domain</th>{% endif %}
-<th>Status</th><th>Total mails</th><th>Actions</th></tr>
+{%- if 'domain' in columns %}<th>Domain</th>{% endif -%}
+<th>Status</th><th class="num">Total mails</th><th class="acts">Actions</th></tr></thead>
 {%- endmacro -%}
 {%- macro mailbox_status(box) -%}
 {%- if box.reading.waiting -%}
-{{ box.reading.waiting }}<div class="look-again">{{ box.reading.look_again }}</div>
+{{ box.reading.waiting }}<span class="row-sub">{{ box.reading.look_again }}</span>
 {%- else -%}
-{%- if box.reading.failed %}<div class="field-refusal">the pipeline could not do it:
-{{ box.reading.failed }}</div>{% endif -%}
-{%- if box.kind == 'archive' %}<span class="badge">active</span>
-{%- elif box.account_state == 'blocked' %}<span class="badge">blocked</span>
-<a href="{{ url_for('account', account_id=box.account_id) }}">set on the person &mdash; mail still arrives</a>
-{%- else %}<span class="badge">active</span>{% endif -%}
+{%- if box.kind == 'archive' %}<span class="badge ok">active</span>
+{%- elif box.account_state == 'blocked' %}<span class="badge attn">blocked</span><span class="row-sub"><a href="{{ url_for('account', account_id=box.account_id) }}">set on the person &mdash; mail still arrives</a></span>
+{%- else %}<span class="badge ok">active</span>{% endif -%}
+{{- pipeline_failed(box.reading.failed) -}}
 {%- endif -%}
 {%- endmacro -%}
 {%- macro mailbox_acts(box) -%}
-{%- if box.reading.waiting %}waiting for the pipeline
+{%- if box.reading.waiting %}<span class="muted">waiting for the pipeline</span>
 {%- elif box.kind == 'archive' -%}
-<a href="{{ url_for('archive_listing', domain_id=box.domain_id) }}">Archive listing</a>
-&middot; <a href="{{ url_for('events', target=box.label, back='mailboxes') }}">Journal</a>
+<a class="btn btn-sm" href="{{ url_for('archive_listing', domain_id=box.domain_id) }}">Archive listing</a>
+<a class="btn btn-sm btn-link" href="{{ url_for('events', target=box.label, back='mailboxes') }}">Journal</a>
 {%- else -%}
-<a href="{{ url_for('top_up', mailbox_id=box.id) }}">Top up</a>
-&middot; <a href="{{ url_for('events', target=box.address, back='mailboxes') }}">Journal</a>
+<a class="btn btn-sm" href="{{ url_for('top_up', mailbox_id=box.id) }}">Top up</a>
+<a class="btn btn-sm btn-link" href="{{ url_for('events', target=box.address, back='mailboxes') }}">Journal</a>
 {%- endif -%}
 {%- endmacro -%}
 {%- macro mailbox_row(box, columns) -%}
@@ -119,124 +117,126 @@ SHAPE = """
   <td><a href="{{ url_for('domain', domain_id=box.domain_id) }}"><code>{{ box.label }}</code></a></td>
   {%- endif %}
   <td>{{ mailbox_status(box) }}</td>
-  <td>{{ box.total }}</td>
-  <td>{{ mailbox_acts(box) }}</td>
+  <td class="num">{{ box.total }}</td>
+  <td class="acts">{{ mailbox_acts(box) }}</td>
 </tr>
 {%- endmacro -%}
 """
 
 LIST_PAGE = SHAPE + """
-<h1>Mailboxes</h1>
-<p>A mailbox is one person in one domain. It has no state, no password and no settings of
+{%- set heading %}Mailboxes{% endset %}
+{%- set lede %}A mailbox is one person in one domain. It has no state, no password and no settings of
 its own: it is open exactly when its person is active, and one password opens every
 mailbox a person holds. Each domain's own archive appears first, as a row of the same
-shape.</p>
-<p><a class="primary" href="{{ url_for('add_mailbox') }}">Give someone a mailbox</a></p>
-<table>
+shape.{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_mailbox') }}">Give someone a mailbox</a>{% endset %}
+<section class="box"><div class="table-wrap"><table>
 {{ mailbox_head(columns) }}
+<tbody>
 {%- for box in boxes %}
 {{ mailbox_row(box, columns) }}
 {%- else %}
 <tr><td colspan="6">No domain yet, so there is nothing to give a mailbox in.</td></tr>
 {%- endfor %}
-</table>
+</tbody>
+</table></div></section>
 """
 
 ADD_PAGE = """
-<p class="crumbs"><a href="{{ url_for('mailboxes') }}">Mailboxes</a> / Give someone a mailbox</p>
-<h1>Give someone a mailbox</h1>
-{%- if refusal and not field %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<p>It delivers only mail that arrives from now on. Earlier mail is a top-up afterwards.</p>
-<form method="post" action="{{ url_for('add_mailbox') }}">
-  <label for="domain_id">Domain</label>
-  <select id="domain_id" name="domain_id">
+{%- set heading %}Give someone a mailbox{% endset %}
+{%- set lede %}It delivers only mail that arrives from now on. Earlier mail is a top-up afterwards.{% endset %}
+{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / Give someone a mailbox{% endset %}
+<form class="narrow" method="post" action="{{ url_for('add_mailbox') }}">
+{{ refused(refusal) }}
+<section class="box"><div class="box-body">
+<div class="field"><label for="domain_id">Domain</label>
+  <select id="domain_id" name="domain_id" class="mid">
     <option value="">&mdash;</option>
     {%- for row in domains %}
     <option value="{{ row.id }}" {{ 'selected' if typed.domain_id == row.id|string }}>{{ row.label }}</option>
     {%- endfor %}
   </select>
-  {%- if field == 'domain_id' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="account_id">Person</label>
-  <select id="account_id" name="account_id">
+  {%- if fault == 'domain_id' %}<p class="help warn">{{ refusal }}</p>{% endif %}</div>
+<div class="field"><label for="account_id">Person</label>
+  <select id="account_id" name="account_id" class="mid">
     <option value="">&mdash;</option>
     {%- for row in people %}
     <option value="{{ row.id }}" {{ 'selected' if typed.account_id == row.id|string }}>{{ row.login }}</option>
     {%- endfor %}
   </select>
-  {%- if field == 'account_id' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
   {%- if narrowed %}
-  <p>Only people with no mailbox in that domain are offered: the model allows exactly one
-  per person per domain.</p>
+  <p class="help">Only people with no mailbox in that domain are offered: the model allows exactly
+  one per person per domain.</p>
   {%- endif %}
-  <p><button type="submit">Give the mailbox</button>
-     <a href="{{ url_for('mailboxes') }}">Cancel, nothing changes</a></p>
+  {%- if fault == 'account_id' %}<p class="help warn">{{ refusal }}</p>{% endif %}</div>
+</div></section>
+<div class="form-foot"><button class="btn btn-primary" type="submit">Give the mailbox</button>\
+<a class="btn" href="{{ url_for('mailboxes') }}">Cancel, nothing changes</a></div>
 </form>
 """
 
 CARD_PAGE = SHAPE + """
-<p class="crumbs"><a href="{{ url_for('mailboxes') }}">Mailboxes</a> /
-  <code>{{ box.address }}</code></p>
-<h1><code>{{ box.address }}</code></h1>
-<p><a href="{{ url_for('top_up', mailbox_id=box.id) }}">Top up</a> &middot;
-   <a href="{{ url_for('events', target=box.address, back='mailboxes') }}">Journal for this mailbox</a></p>
-<p><a href="{{ url_for('account', account_id=box.account_id) }}"><code>{{ box.login }}</code></a>
+{%- set heading %}<code>{{ box.address }}</code>{% endset %}
+{%- set lede %}<a href="{{ url_for('account', account_id=box.account_id) }}"><code>{{ box.login }}</code></a>
 holds it; their password and their state are set on their own page.
 {% if box.account_state == 'blocked' %}Closed &mdash; the person is blocked, mail still
 arrives.{% else %}Open.{% endif %}
-{{ box.total }} message(s) held. Connected at {{ box.as_of }}.</p>
-{%- if box.reading.waiting %}
-<p class="notice">{{ box.reading.waiting }}. {{ box.reading.look_again }}.</p>
-{%- elif box.reading.failed %}
-<p class="refusal">the pipeline could not do it: {{ box.reading.failed }}</p>
+{{ box.total }} message(s) held. Connected at {{ box.as_of }}.{% endset %}
+{%- set actions %}<a class="btn" href="{{ url_for('top_up', mailbox_id=box.id) }}">Top up</a> \
+<a class="btn" href="{{ url_for('events', target=box.address, back='mailboxes') }}">Journal for this mailbox</a>{% endset %}
+{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / <code>{{ box.address }}</code>{% endset %}
+{%- if box.reading.waiting or box.reading.failed %}
+{{ pipeline_flash(box.reading) }}
 {%- endif %}
-
-<h2>Comment on <code>{{ box.login }}</code></h2>
-<p>The person's own note, shown wherever they are. Not journaled.</p>
-<form method="post" action="{{ url_for('account_comment', account_id=box.account_id) }}">
-  <textarea name="comment" rows="3" cols="60">{{ box.comment or '' }}</textarea>
-  <p><button type="submit">Save comment</button></p>
-</form>
-
-<h2>Deliver one message by id</h2>
-<p>The one act that puts back a message the person deleted on purpose. The
+<div class="stack">
+{%- set title %}Comment on <code>{{ box.login }}</code>{% endset %}
+{%- set note %}<div class="field"><textarea name="comment" rows="3" aria-label="Comment">\
+{{ box.comment or '' }}</textarea></div>{% endset %}
+{%- set deliver_about %}The one act that puts back a message the person deleted on purpose. The
 <a href="{{ url_for('archive_listing', domain_id=box.domain_id) }}">archive listing</a>
 shows the ids. <a href="{{ url_for('top_up', mailbox_id=box.id) }}">Top up over a range
-instead</a>.</p>
-{%- if form == 'deliver' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('deliver_one_message', mailbox_id=box.id) }}">
-  <label for="message_id">Message id</label>
-  <input id="message_id" name="message_id" value="{{ typed.message_id }}">
-  {%- if form == 'deliver' and refusal %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <p><button type="submit">Deliver it</button></p>
-</form>
-
-<h2>Transfer to another person</h2>
-<p>This hands over every message <code>{{ box.login }}</code> holds in
+instead</a>.{% endset %}
+{%- set deliver %}
+{{- refused(refusal if form == 'deliver') }}
+{{ field('Message id', 'message_id', typed.message_id, class_='mono-input short',
+         warn=refusal if form == 'deliver') }}
+{%- endset %}
+{%- set transfer_about %}This hands over every message <code>{{ box.login }}</code> holds in
 <code>{{ box.label }}</code>, including what they sent: {{ box.total }} message(s).
 Nothing is copied, and any open session on this mailbox is closed first. The person keeps
-their other domains.</p>
-{%- if form == 'transfer' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-{%- if free %}
-<form method="post" action="{{ url_for('transfer_mailbox', mailbox_id=box.id) }}">
-  <label for="to_account_id">To</label>
-  <select id="to_account_id" name="to_account_id">
+their other domains.{% endset %}
+{%- set transfer %}
+{{- refused(refusal if form == 'transfer') }}
+<div class="field"><label for="to_account_id">To</label>
+  <select id="to_account_id" name="to_account_id" class="mid">
     <option value="">&mdash;</option>
     {%- for row in free %}
     <option value="{{ row.id }}">{{ row.login }}</option>
     {%- endfor %}
   </select>
-  <p><button type="submit">Transfer it</button></p>
-</form>
+  {%- if form == 'transfer' and refusal %}<p class="help warn">{{ refusal }}</p>{% endif %}</div>
+{%- endset %}
+<section class="box"><div class="box-body settings">
+{{ setting(url_for('account_comment', account_id=box.account_id), title,
+           "The person's own note, shown wherever they are. Not journaled.", note,
+           'Save comment') }}
+{{ setting(url_for('deliver_one_message', mailbox_id=box.id), 'Deliver one message by id',
+           deliver_about, deliver, 'Deliver it') }}
+{%- if free %}
+{{ setting(url_for('transfer_mailbox', mailbox_id=box.id), 'Transfer to another person',
+           transfer_about, transfer, 'Transfer it') }}
 {%- else %}
-<p>Nobody is free to take it: everybody with an account already has a mailbox in
-<code>{{ box.label }}</code>.</p>
+{%- set nobody %}{{ refused(refusal if form == 'transfer') }}<p>Nobody is free to take it: everybody with an
+account already has a mailbox in <code>{{ box.label }}</code>.</p>{% endset %}
+{{ setting(none, 'Transfer to another person', transfer_about, nobody, none) }}
 {%- endif %}
+</div></section>
 
-<div class="danger">
-<h2>Danger zone</h2>
-<p>Removing this mailbox takes {{ box.total }} name(s) out of it. The archive keeps every
-message.</p>
-<p><a href="{{ url_for('delete_mailbox', mailbox_id=box.id) }}">Remove this mailbox&hellip;</a></p>
+{%- set sentence %}Removing this mailbox takes {{ box.total }} name(s) out of it. The archive keeps
+every message.{% endset %}
+{%- set control %}<a class="btn btn-danger" href="{{ url_for('delete_mailbox', mailbox_id=box.id) }}">\
+Remove this mailbox&hellip;</a>{% endset %}
+{{ danger_zone(sentence, none, control) }}
 </div>
 """
 
@@ -246,21 +246,27 @@ ARCHIVE_CARD_HINT = """
 """
 
 DELETE_PAGE = """
-<h1>Remove <code>{{ box.address }}</code>?</h1>
-<p>The archive of <code>{{ box.label }}</code> keeps every message. What goes is this
-person's copy of them.</p>
-<table>
-<tr><th>Names removed</th><td>{{ numbers.names }}</td></tr>
-<tr><th>Mailboxes removed</th><td>1</td></tr>
-<tr><th>People who lose access here</th><td>1</td></tr>
-<tr><th>Messages removed</th><td>0 &mdash; the archive keeps everything</td></tr>
-</table>
-<p>It is recoverable by giving the mailbox again and topping up, but the folders this
+{%- set heading %}Remove <code>{{ box.address }}</code>?{% endset %}
+{%- set lede %}The archive of <code>{{ box.label }}</code> keeps every message. What goes is this
+person's copy of them.{% endset %}
+{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / \
+<a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a> / Remove{% endset %}
+<div class="stack narrow">
+<section class="danger-zone">
+<div class="box-head"><h2>What goes</h2></div>
+<div class="box-body">
+<div class="kv"><div><b>{{ numbers.names }}</b><span>Names removed</span></div>\
+<div><b>1</b><span>Mailboxes removed</span></div>\
+<div><b>1</b><span>People who lose access here</span></div></div>
+<p>Messages removed: 0 &mdash; the archive keeps everything.</p>
+<p class="muted">It is recoverable by giving the mailbox again and topping up, but the folders this
 person arranged do not come back.</p>
-<form method="post" action="{{ url_for('delete_mailbox', mailbox_id=box.id) }}">
-  <p><button type="submit" class="danger">Remove <code>{{ box.address }}</code></button></p>
-</form>
-<p><a href="{{ url_for('mailbox', mailbox_id=box.id) }}">Cancel, nothing changes</a></p>
+<form class="form-foot" method="post" action="{{ url_for('delete_mailbox', mailbox_id=box.id) }}">\
+<button class="btn btn-danger-solid" type="submit">Remove <code>{{ box.address }}</code></button></form>
+</div>
+</section>
+<p><a href="{{ url_for('mailbox', mailbox_id=box.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
+</div>
 """
 
 
@@ -437,7 +443,8 @@ def register(app_):
         box = needed(conn, mailbox_id, common.timer_period())
         if request.method == "GET":
             return app.render(f"Remove {box['address']}?", DELETE_PAGE, section="mailboxes",
-                              box=box, numbers=common.one(conn, REMOVAL, (mailbox_id,)))
+                              box=box,
+                              numbers=common.one(conn, REMOVAL, (mailbox_id,)))
         asked = common.ask(conn, "delete_mailbox", box["address"],
                            {"mailbox_id": mailbox_id}, g.identity)
         record(conn, "delete_mailbox", box["address"], {"requested": True},
@@ -445,7 +452,7 @@ def register(app_):
         return common.acted("mailboxes", "mailbox_removal_asked")
 
 
-def add_page(conn, typed, refusal=None, field=None):
+def add_page(conn, typed, refusal=None, fault=None):
     """The add form, with the people narrowed to the chosen domain's free ones."""
     domain_id = common.as_int(typed["domain_id"])
     known = domain_id is not None and common.one(
@@ -455,4 +462,4 @@ def add_page(conn, typed, refusal=None, field=None):
     return app.render("Give someone a mailbox", ADD_PAGE, section="mailboxes",
                       status=400 if refusal else 200, typed=typed,
                       domains=common.rows(conn, ALL_DOMAINS), people=people,
-                      narrowed=bool(known), refusal=refusal, field=field)
+                      narrowed=bool(known), refusal=refusal, fault=fault)

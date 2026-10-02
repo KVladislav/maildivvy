@@ -119,14 +119,16 @@
   when: maildivvy_health_textfile_dir | length > 0
 
 # Accepted: PASS; WARN, printed, since the install cannot act on it (a test machine's
-# certificate is `self-signed` and says so); and the checks of maildivvy_health_no_data_yet
-# as UNKNOWN. Every FAIL and every other UNKNOWN is printed with its sentence and stops
-# the install.
+# certificate is `self-signed` and says so); the checks of maildivvy_health_no_data_yet
+# as UNKNOWN; and the FAILs of maildivvy_health_not_stopping, printed as a WARN is (a newer
+# rspamd release). Every other FAIL and every other UNKNOWN is printed with its
+# sentence and stops the install.
 - name: Every subsystem reads PASS or WARN, or UNKNOWN only where no data exists yet
   ansible.builtin.command:
     argv: [python3, -c, "{{ maildivvy_health_proof }}", "{{ maildivvy_health_report }}",
            "{{ maildivvy_health_later_steps | join(',') }}",
-           "{{ maildivvy_health_no_data_yet | join(',') }}"]
+           "{{ maildivvy_health_no_data_yet | join(',') }}",
+           "{{ maildivvy_health_not_stopping | join(',') }}"]
   register: maildivvy_health_proved
   changed_when: false
   failed_when: maildivvy_health_proved.rc != 0
@@ -134,4 +136,4 @@
 - name: What health warns about
   ansible.builtin.debug:
     msg: "{{ maildivvy_health_proved.stdout_lines }}"
-  when: "'WARN' in maildivvy_health_proved.stdout"
+  when: "'WARN' in maildivvy_health_proved.stdout or 'FAIL' in maildivvy_health_proved.stdout"

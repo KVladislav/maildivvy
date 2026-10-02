@@ -81,11 +81,14 @@ NOT_YOURSELF = ("Nobody deletes their own account: another administrator does it
                 "keeps one pair of hands off the act that ends their own access.")
 
 
-# --- what a person's page and the list read ---------------------------------------------------
+# --- what a person's page and the list read (in the design's components) ----------
 
+# ⚠️ A refusal is a flash inside the row or box it belongs to (`common.refused`) and,
+# where one field is at fault, the same sentence in that field's `help warn` line.
 SETTINGS = """
 {%- macro client_settings(logins) -%}
-<h3>What to put in the mail client</h3>
+<section class="box"><div class="box-head"><h2>What to put in the mail client</h2></div>
+<div class="box-body">
 {%- if machine %}
 <p>IMAP and submission are both <code>{{ machine }}</code>, ports
 <code>{{ imap }}</code> and <code>{{ submission }}</code>, implicit TLS on both - not
@@ -101,187 +104,198 @@ password for every one of them.</p>
 {%- else %}
 <p>This person holds no mailbox yet, so there is no login to give them until one is.</p>
 {%- endif %}
+</div></section>
 {%- endmacro -%}
+{%- macro administrator(checked, mine, warn=none) -%}
+<div class="field"><label class="checkline"><input type="checkbox" name="is_admin" value="yes"
+{{- ' checked' if checked }}><div><b>Administrator</b><span>{{ grants }}</span>
+{%- if mine %}<span>Taking it off your own account leaves another administrator, or break-glass, as
+the way back in.</span>{% endif %}</div></label>
+{%- if warn %}<p class="help warn">{{ warn }}</p>{% endif %}</div>
+{%- endmacro -%}
+{%- macro way() -%}<a href="{{ url_for('accounts') }}">People</a>{%- endmacro -%}
 """
 
 LIST_PAGE = """
-<h1>People</h1>
-<p>A person is active or blocked, and that reaches every mailbox they hold at once.
-Nobody can set their own password: an administrator sets it here.</p>
-<p><a class="primary" href="{{ url_for('add_account') }}">Add person</a></p>
-<table>
-<tr><th>Login</th><th>State</th><th>Mailboxes</th><th>Comment</th><th>Actions</th></tr>
+{%- set heading %}People{% endset %}
+{%- set lede %}A person is active or blocked, and that reaches every mailbox they hold at once.
+Nobody can set their own password: an administrator sets it here.{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_account') }}">Add person</a>{% endset %}
+<section class="box"><div class="table-wrap"><table>
+<thead><tr><th>Login</th><th>State</th><th class="num">Mailboxes</th><th>Comment</th>\
+<th class="acts">Actions</th></tr></thead>
+<tbody>
 {%- for row in people %}
 <tr>
   <td><a href="{{ url_for('account', account_id=row.id) }}"><code>{{ row.login }}</code></a>
-      {%- if row.is_admin %} <span class="badge">&#128274; administrator</span>{% endif %}</td>
-  <td>
-  {%- if reading[row.id].waiting %}{{ reading[row.id].waiting }}
-      <div class="look-again">{{ reading[row.id].look_again }}</div>
+      {%- if row.is_admin %} <span class="badge"><svg class="icon"><use href="#i-lock"/></svg> administrator</span>{% endif %}</td>
+  <td class="state">
+  {%- if reading[row.id].waiting %}{{ reading[row.id].waiting }}<span class="row-sub">{{ reading[row.id].look_again }}</span>
   {%- else %}
-    {%- if reading[row.id].failed %}<div class="field-refusal">the pipeline could not do
-    it: {{ reading[row.id].failed }}</div>{% endif %}
-    {%- if row.state == 'blocked' %}<span class="badge">blocked</span>
-      {%- if row.state_at %} since {{ row.state_at }} by <code>{{ row.state_by }}</code>{% endif %}
-    {%- else %}<span class="badge">active</span>{% endif %}
+    {%- if row.state == 'blocked' %}<span class="badge attn">blocked</span>
+      {%- if row.state_at %}<span class="row-sub">since {{ row.state_at }} by <code>{{ row.state_by }}</code></span>{% endif %}
+    {%- else %}<span class="badge ok">active</span>{% endif %}
+    {{- pipeline_failed(reading[row.id].failed) }}
   {%- endif %}</td>
-  <td>{{ row.mailboxes }}</td>
+  <td class="num">{{ row.mailboxes }}</td>
   <td>{{ row.comment or '' }}</td>
-  <td>{% if reading[row.id].waiting %}waiting for the pipeline
-      {%- else %}<a href="{{ url_for('account', account_id=row.id) }}">Open</a>
-      &middot; <a href="{{ url_for('events', target=row.login, back='accounts') }}">Journal</a>{% endif %}</td>
+  <td class="acts">{% if reading[row.id].waiting %}<span class="muted">waiting for the pipeline</span>
+      {%- else %}<a class="btn btn-sm" href="{{ url_for('account', account_id=row.id) }}">Open</a>
+      <a class="btn btn-sm btn-link" href="{{ url_for('events', target=row.login, back='accounts') }}">Journal</a>{% endif %}</td>
 </tr>
 {%- else %}
 <tr><td colspan="5">Nobody yet. A person with no mailbox opens nothing.</td></tr>
 {%- endfor %}
-</table>
+</tbody>
+</table></div></section>
 """
 
-ADD_PAGE = """
-<p class="crumbs"><a href="{{ url_for('accounts') }}">People</a> / Add person</p>
-<h1>Add person</h1>
-{%- if refusal and not field %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('add_account') }}">
-  <label for="login">Login</label>
-  <input id="login" name="login" value="{{ typed.login }}">
-  <span>The part before the <code>@</code>, the same in every domain.</span>
-  {%- if field == 'login' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password" autocomplete="new-password">
-  <label for="password2">Password again</label>
-  <input id="password2" name="password2" type="password" autocomplete="new-password">
-  <span>Leave both empty and one is generated and shown once, on the next page, with the
-  settings for their mail client. At least {{ minimum }} characters if you type one;
-  nothing else is required of it.</span>
-  {%- if field == 'password' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label><input type="checkbox" name="is_admin" value="yes" {{ 'checked' if typed.is_admin }}>
-    Administrator</label>
-  <span>{{ grants }}</span>
-  <p><button type="submit">Add person</button>
-     <a href="{{ url_for('accounts') }}">Cancel, nothing changes</a></p>
+ADD_PAGE = SETTINGS + """
+{%- set heading %}Add person{% endset %}
+{%- set crumbs %}{{ way() }} / Add person{% endset %}
+{%- set login_help %}The part before the <code>@</code>, the same in every domain.{% endset %}
+{%- set password_help %}Leave both empty and one is generated and shown once, on the next page, with
+the settings for their mail client. At least {{ minimum }} characters if you type one; nothing else
+is required of it.{% endset %}
+<form class="narrow" method="post" action="{{ url_for('add_account') }}">
+{{ refused(refusal) }}
+<section class="box"><div class="box-body">
+{{ field('Login', 'login', typed.login, class_='mono-input mid', help=login_help,
+         warn=refusal if fault == 'login') }}
+{{ field('Password', 'password', type='password', class_='mid', autocomplete='new-password') }}
+{{ field('Password again', 'password2', type='password', class_='mid',
+         autocomplete='new-password', help=password_help,
+         warn=refusal if fault == 'password') }}
+{{ administrator(typed.is_admin, false) }}
+</div></section>
+<div class="form-foot"><button class="btn btn-primary" type="submit">Add person</button>\
+<a class="btn" href="{{ url_for('accounts') }}">Cancel, nothing changes</a></div>
 </form>
 """
 
 SHOWN_ONCE = SETTINGS + """
-<p class="crumbs"><a href="{{ url_for('accounts') }}">People</a> / <code>{{ login }}</code></p>
-<h1>{{ headline }}</h1>
-<p class="banner">This is the only time this password is shown. It is stored as a hash,
+{%- set heading %}{{ headline }}{% endset %}
+{%- set crumbs %}{{ way() }} / <code>{{ login }}</code>{% endset %}
+<div class="stack narrow">
+{%- set once %}This is the only time this password is shown. It is stored as a hash,
 it is in no log and in no journal row, and a reload of this page will not bring it back.
-If it is lost, set a new one on the person's page.</p>
-<table>
-<tr><th>Login</th><td><code>{{ login }}</code></td></tr>
-<tr><th>Password</th><td><code class="generated">{{ password }}</code></td></tr>
-</table>
+If it is lost, set a new one on the person's page.{% endset %}
+{{ flash('attn', 'lock', once) }}
+<section class="box"><div class="box-body"><dl class="facts">\
+<dt>Login</dt><dd><code>{{ login }}</code></dd>\
+<dt>Password</dt><dd><code class="generated">{{ password }}</code></dd>\
+</dl></div></section>
 {{ client_settings(logins) }}
-<p><a href="{{ url_for('account', account_id=account_id) }}">Done &mdash; open
-<code>{{ login }}</code></a></p>
+<div class="form-foot"><a class="btn btn-primary" href="{{ url_for('account', account_id=account_id) }}">\
+Done &mdash; open <code>{{ login }}</code></a></div>
+</div>
 """
 
 PERSON_PAGE = SETTINGS + mailboxes.SHAPE + """
-<p class="crumbs"><a href="{{ url_for('accounts') }}">People</a> / <code>{{ row.login }}</code></p>
-<h1><code>{{ row.login }}</code></h1>
-<p><a href="{{ url_for('events', target=row.login, back='accounts') }}">Journal for this person</a></p>
-<p>{% if row.is_admin %}Administrator{% if row.admin_since %} since {{ row.admin_since }}
+{%- set heading %}<code>{{ row.login }}</code>{% endset %}
+{%- set lede %}{% if row.is_admin %}Administrator{% if row.admin_since %} since {{ row.admin_since }}
 {%- endif %}.{% else %}Not an administrator.{% endif %}
-One password opens every mailbox below.</p>
-{%- if reading.waiting %}
-<p class="notice">{{ reading.waiting }}. {{ reading.look_again }}.</p>
-{%- elif reading.failed %}
-<p class="refusal">the pipeline could not do it: {{ reading.failed }}</p>
+One password opens every mailbox below.{% endset %}
+{%- set actions %}<a class="btn" href="{{ url_for('events', target=row.login, back='accounts') }}">\
+Journal for this person</a>{% endset %}
+{%- set crumbs %}{{ way() }} / <code>{{ row.login }}</code>{% endset %}
+{%- if reading.waiting or reading.failed %}
+{{ pipeline_flash(reading) }}
 {%- endif %}
-
-<h2>State</h2>
-{%- if form == 'state' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<p><span class="badge">{{ row.state }}</span>
+<div class="stack">
+<section class="box">
+<div class="box-head"><h2>State</h2></div>
+<div class="box-body">
+{{ refused(refusal if form == 'state') }}
+<p>{% if row.state == 'blocked' %}<span class="badge attn">blocked</span>{% else %}<span class="badge ok">active</span>{% endif %}
 {%- if row.state_at %} since {{ row.state_at }} by <code>{{ row.state_by }}</code>{% endif %}.
 {% if row.state == 'blocked' %}Every mailbox they hold is closed and the login is refused;
 mail still arrives for them. Unblocking opens them all again.
 {%- else %}Blocking closes every mailbox they hold at once, while mail keeps arriving.
 {%- endif %}</p>
-{%- if mine %}
-<p class="notice">This is your own account. Blocking it ends this session at your next
-request.</p>
-{%- endif %}
-<form method="post" action="{{ url_for('account_state', account_id=row.id) }}">
-  <input type="hidden" name="state" value="{{ 'active' if row.state == 'blocked' else 'blocked' }}">
-  <p><button type="submit">{{ 'Unblock' if row.state == 'blocked' else 'Block' }}
-  <code>{{ row.login }}</code></button></p>
-</form>
+<form class="form-foot" method="post" action="{{ url_for('account_state', account_id=row.id) }}">
+<input type="hidden" name="state" value="{{ 'active' if row.state == 'blocked' else 'blocked' }}">
+<button class="btn" type="submit">{{ 'Unblock' if row.state == 'blocked' else 'Block' }} <code>{{ row.login }}</code></button>
+{%- if mine %}<span class="muted">This is your own account. Blocking it ends this session at your
+next request.</span>{% endif %}</form>
+</div>
+</section>
 
-<h2>Mailboxes</h2>
-<table>
+<section class="box">
+<div class="box-head"><h2>Mailboxes</h2><a class="btn btn-sm" \
+href="{{ url_for('add_mailbox', account=row.id) }}">Give a mailbox in another domain</a></div>
+<div class="table-wrap"><table>
 {{ mailbox_head(()) }}
+<tbody>
 {%- for box in boxes %}
 {{ mailbox_row(box, ()) }}
 {%- else %}
 <tr><td colspan="4">No mailbox yet, so this login opens nothing.</td></tr>
 {%- endfor %}
-</table>
-<p><a href="{{ url_for('add_mailbox', account=row.id) }}">Give a mailbox in another domain</a></p>
+</tbody>
+</table></div>
+</section>
 
-<h2>Password</h2>
-{%- if password_saved %}<p class="notice done">{{ password_saved }}</p>{% endif %}
-{%- if form == 'password' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<p>It opens every mailbox above, and this interface too for an administrator. Leave both
-fields empty and one is generated and shown once.</p>
-<form method="post" action="{{ url_for('account_password', account_id=row.id) }}">
-  <label for="password">New password</label>
-  <input id="password" name="password" type="password" autocomplete="new-password">
-  <label for="password2">New password again</label>
-  <input id="password2" name="password2" type="password" autocomplete="new-password">
-  <p><button type="submit" class="primary">Set the password</button></p>
-</form>
-
-<h2>Administrator</h2>
-{%- if form == 'admin' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('account_admin', account_id=row.id) }}">
-  <label><input type="checkbox" name="is_admin" value="yes" {{ 'checked' if row.is_admin }}>
-    Administrator</label>
-  <span>{{ grants }}</span>
-  {%- if mine and row.is_admin %}
-  <span>Taking it off your own account leaves another administrator, or break-glass, as
-  the way back in.</span>
-  {%- endif %}
-  <p><button type="submit">Save the flag</button></p>
-</form>
-
-<h2>Comment</h2>
-<p>A free note about this person, shown on their mailbox cards too. Not journaled.</p>
-<form method="post" action="{{ url_for('account_comment', account_id=row.id) }}">
-  <textarea name="comment" rows="3" cols="60">{{ row.comment or '' }}</textarea>
-  <p><button type="submit">Save comment</button></p>
-</form>
+{%- set about %}It opens every mailbox above, and this interface too for an administrator. Leave
+both fields empty and one is generated and shown once.{% endset %}
+{%- set fields %}
+{{- flash('ok', 'check', password_saved) }}
+{{- refused(refusal if form == 'password') }}
+{{ field('New password', 'password', type='password', class_='mid', autocomplete='new-password') }}
+{{ field('New password again', 'password2', type='password', class_='mid',
+         autocomplete='new-password', warn=refusal if form == 'password') }}
+{%- endset %}
+{%- set flag %}
+{{- refused(refusal if form == 'admin') }}
+{{ administrator(row.is_admin, mine and row.is_admin, refusal if form == 'admin') }}
+{%- endset %}
+{%- set note %}<div class="field"><textarea name="comment" rows="3" aria-label="Comment">\
+{{ row.comment or '' }}</textarea></div>{% endset %}
+<section class="box"><div class="box-body settings">
+{{ setting(url_for('account_password', account_id=row.id), 'Password', about, fields,
+           'Set the password', primary=true) }}
+{{ setting(url_for('account_admin', account_id=row.id), 'Administrator', none, flag,
+           'Save the flag') }}
+{{ setting(url_for('account_comment', account_id=row.id), 'Comment',
+           'A free note about this person, shown on their mailbox cards too. Not journaled.',
+           note, 'Save comment') }}
+</div></section>
 
 {{ client_settings(logins) }}
 
-<div class="danger">
-<h2>Danger zone</h2>
-<p>Deleting <code>{{ row.login }}</code> removes every mailbox and every name they hold,
-immediately. There is no grace period and no disabled-but-present state.</p>
-{%- if form == 'delete' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<p><a href="{{ url_for('delete_account', account_id=row.id) }}">Delete this person, immediately&hellip;</a></p>
+{{ refused(refusal if form == 'delete') }}
+{%- set sentence %}Deleting <code>{{ row.login }}</code> removes every mailbox and every name they
+hold, immediately. There is no grace period and no disabled-but-present state.{% endset %}
+{%- set control %}<a class="btn btn-danger" href="{{ url_for('delete_account', account_id=row.id) }}">\
+Delete this person, immediately&hellip;</a>{% endset %}
+{{ danger_zone(sentence, none, control) }}
 </div>
 """
 
-DELETE_PAGE = """
-<h1>Delete <code>{{ row.login }}</code>?</h1>
+DELETE_PAGE = SETTINGS + """
+{%- set heading %}Delete <code>{{ row.login }}</code>?{% endset %}
+{%- set crumbs %}{{ way() }} / <a href="{{ url_for('account', account_id=row.id) }}">\
+<code>{{ row.login }}</code></a> / Delete{% endset %}
+<div class="stack narrow">
 {%- if refusal %}
-<p class="refusal">{{ refusal }}</p>
-<p><button type="button" disabled>Delete <code>{{ row.login }}</code></button></p>
+{{ refused(refusal) }}
 {%- else %}
-<table>
-<tr><th>Mailboxes removed</th><td>{{ numbers.mailboxes }}</td></tr>
-<tr><th>Names removed</th><td>{{ numbers.names }}</td></tr>
-<tr><th>Messages removed</th><td>0 &mdash; the archives keep everything</td></tr>
-</table>
-<p>It is recoverable by making the person again and topping them up, but the folders they
-arranged and what they had read do not come back.</p>
-<form method="post" action="{{ url_for('delete_account', account_id=row.id) }}">
-  <p><button type="submit" class="danger">Delete <code>{{ row.login }}</code> and
-  everything they hold</button></p>
-</form>
+<section class="danger-zone">
+<div class="box-head"><h2>What goes</h2></div>
+<div class="box-body">
+<div class="kv"><div><b>{{ numbers.mailboxes }}</b><span>Mailboxes removed</span></div>\
+<div><b>{{ numbers.names }}</b><span>Names removed</span></div></div>
+<p>Messages removed: 0 &mdash; the archives keep everything.</p>
+<p class="muted">It is recoverable by making the person again and topping them up, but the folders
+they arranged and what they had read do not come back.</p>
+<form class="form-foot" method="post" action="{{ url_for('delete_account', account_id=row.id) }}">\
+<button class="btn btn-danger-solid" type="submit">Delete <code>{{ row.login }}</code> and
+everything they hold</button></form>
+</div>
+</section>
 {%- endif %}
-<p><a href="{{ url_for('account', account_id=row.id) }}">Cancel, nothing changes</a></p>
+<p><a href="{{ url_for('account', account_id=row.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
+</div>
 """
 
 
@@ -518,7 +532,8 @@ def register(app_):
         return common.acted("accounts", "account_deletion_asked")
 
 
-def add_page(typed, refusal=None, field=None):
+def add_page(typed, refusal=None, fault=None):
+    # ⚠️ `fault`, not `field`: a template value of that name would hide the `field()` shape
     return app.render("Add person", ADD_PAGE, section="accounts",
                       status=400 if refusal else 200, typed=typed, refusal=refusal,
-                      field=field, grants=GRANTS, minimum=validate.PASSWORD_MIN)
+                      fault=fault, grants=GRANTS, minimum=validate.PASSWORD_MIN)

@@ -53,73 +53,95 @@ DISABLED = "disabled — not fetched"
 
 ROWS = external.ROW + " ORDER BY e.address"
 
+# ⚠️ The design's voices: a row's status is a word beside its icon - red for a
+# refused credential, amber for what waits on the pipeline or on a person, green for a
+# fetch that ran - or muted where nothing is fetched. The retry state beneath is amber.
 PAGE = """
-<h1>Fetch</h1>
-<p>Last run {{ last_run or 'never' }}.
+{%- set heading %}Fetch{% endset %}
+{%- set lede %}Last run {{ last_run or 'never' }}.
 {%- if next_by %} Next by {{ next_by }}, the fetch timer's own period ({{ period }}).
-{%- else %} The fetch timer's period could not be read from the machine.{% endif %}</p>
-<table>
-<tr><th>Address</th><th>Domain</th><th>Last fetched</th><th>Status</th><th>Actions</th></tr>
+{%- else %} The fetch timer's period could not be read from the machine.{% endif %}{% endset %}
+{{ refused(refusal) }}
+<div class="stack">
+<section class="box"><div class="table-wrap"><table>
+<thead><tr><th>Address</th><th>Domain</th><th>Last fetched</th><th>Status</th>\
+<th class="acts">Actions</th></tr></thead>
+<tbody>
 {%- for row in mailboxes %}
+{%- set said = reading[row.id] %}
 <tr>
   <td><a href="{{ url_for('external_mailbox', external_id=row.id) }}"><code>{{ row.address }}</code></a>
-      {%- if row.comment %}<div>{{ row.comment }}</div>{% endif %}</td>
+      {%- if row.comment %}<span class="row-sub">{{ row.comment }}</span>{% endif %}</td>
   <td>{% if row.domain_id %}<a href="{{ url_for('domain', domain_id=row.domain_id) }}"><code>{{ row.label }}</code></a>{% else %}&mdash;{% endif %}</td>
-  <td>{{ row.last_fetch_at or 'never' }}</td>
-  <td>
-    <div class="status">{{ reading[row.id].status }}</div>
-    {%- if reading[row.id].detail %}<div class="detail"><code>{{ reading[row.id].detail }}</code></div>{% endif %}
-    <div class="check">{{ reading[row.id].check }}</div>
-    {%- if reading[row.id].retry %}<div class="retry">{{ reading[row.id].retry }}</div>{% endif %}
-    {%- if reading[row.id].skip %}<div class="skip">{{ reading[row.id].skip }}</div>{% endif %}
+  <td>{% if row.last_fetch_at %}{{ row.last_fetch_at }}{% else %}<span class="muted">never</span>{% endif %}</td>
+  <td class="wrap">
+    {%- if said.tone == 'off' %}<span class="muted">{{ said.status }}</span>
+    {%- else %}<span class="state-{{ said.tone }}"><svg class="icon {{ said.tone }}"><use href="#i-{{ said.icon }}"/></svg> {{ said.status }}</span>{% endif %}
+    {%- if said.detail %}<span class="row-sub"><code>{{ said.detail }}</code></span>{% endif %}
+    <span class="row-sub">{{ said.check }}</span>
+    {%- if said.retry %}<span class="row-sub state-attn"><svg class="icon attn"><use href="#i-\
+{{- 'alert' if row.frozen_since else 'clock' }}"/></svg> {{ said.retry }}</span>{% endif %}
+    {%- if said.skip %}<span class="row-sub">{{ said.skip }}</span>{% endif %}
   </td>
-  <td>
-    {%- if row.state != 'active' %}&mdash;
+  <td class="acts">
+    {%- if row.state != 'active' %}<span class="muted">&mdash;</span>
     {%- else %}
       {%- if row.frozen_since %}
-      <form method="post" action="{{ url_for('resume_fetch', external_id=row.id) }}">
-        <button type="submit">Resume&hellip;</button></form>
+      <form method="post" action="{{ url_for('resume_fetch', external_id=row.id) }}">\
+<button class="btn btn-sm" type="submit">Resume&hellip;</button></form>
       {%- endif %}
-      <form method="post" action="{{ url_for('refetch', external_id=row.id) }}">
-        <button type="submit">Refetch now</button></form>
-    {%- endif %}
+      <form method="post" action="{{ url_for('refetch', external_id=row.id) }}">\
+<button class="btn btn-sm" type="submit">Refetch now</button></form>
+    {%- endif -%}
   </td>
 </tr>
 {%- else %}
 <tr><td colspan="5">No external mailbox yet, so nothing is collected.</td></tr>
 {%- endfor %}
-</table>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<footer>A row reads one of: <code>credential refused</code>, <code>ok</code>,
+</tbody>
+</table></div></section>
+<p class="muted">A row reads one of: <code>credential refused</code>, <code>ok</code>,
 <code>no new mail</code>, <code>has not run yet</code>, <code>disabled &mdash; not
 fetched</code>, <code>asked to enable</code>, or an error described from what the
-fetcher recorded: {{ causes }}.</footer>
+fetcher recorded: {{ causes }}.</p>
+</div>
 """
 
 
 # --- what one row reads ---------------------------------------------------
 
+def reads(status, detail, tone, icon):
+    return {"status": status, "detail": detail, "tone": tone, "icon": icon}
+
+
 def status_of(row):
-    """The row's own status line, and the raw detail to print beneath it."""
+    """The row's own status line, the raw detail to print beneath it, and the voice the
+    line speaks in with the icon beside its word - `off` and no icon for a row
+    that is not fetched or has not run yet, whose word is muted, as `provider_of` has it."""
     if row["deleting"]:
-        return "asked to delete", None
+        return reads("asked to delete", None, "attn", "clock")
     if row["state"] != "active":
-        return ("asked to enable" if row["enabling"] else DISABLED), None
+        if row["enabling"]:
+            return reads("asked to enable", None, "attn", "clock")
+        return reads(DISABLED, None, "off", None)
     if row["held_since"]:
         # the antivirus could not be reached, so the mail waits at the provider
-        return (f"held since {row['held_since']} — the antivirus could not be "
-                "reached, so the mail is waiting at the provider"), row["last_fetch_detail"]
+        return reads(f"held since {row['held_since']} — the antivirus could not be "
+                     "reached, so the mail is waiting at the provider",
+                     row["last_fetch_detail"], "attn", "alert")
     status = row["last_fetch_status"]
     if status == "auth_failed":
-        return REFUSED, None          # a refused credential never goes through a cause
+        # a refused credential never goes through a cause
+        return reads(REFUSED, None, "bad", "alert")
     if status == "ok":
-        return "ok", None
+        return reads("ok", None, "ok", "check")
     if status == "no_new_mail":
-        return "no new mail", None
+        return reads("no new mail", None, "ok", "check")
     if status is None:
-        return "has not run yet", None
+        return reads("has not run yet", None, "off", None)
     cause = row["last_fetch_cause"]
-    return CAUSES.get(cause, NO_CAUSE if cause is None else cause), row["last_fetch_detail"]
+    return reads(CAUSES.get(cause, NO_CAUSE if cause is None else cause),
+                 row["last_fetch_detail"], "attn", "alert")
 
 
 def check_of(row):
@@ -168,9 +190,8 @@ def skip_of(row, today=None):
 
 
 def reading_of(row, today=None):
-    status, detail = status_of(row)
-    return {"status": status, "detail": detail, "check": check_of(row),
-            "retry": retry_of(row), "skip": skip_of(row, today)}
+    return {**status_of(row), "check": check_of(row), "retry": retry_of(row),
+            "skip": skip_of(row, today)}
 
 
 # --- the screen ---------------------------------------------------------------------------------

@@ -592,7 +592,8 @@ and the sender-pinning rule.
   the running daemon and scores a probe message as `vmail` before reporting success.
   Nothing repins on a timer. The pin is recorded, without a secret, in
   `/etc/maildivvy/scanner.json` (`0644`, beside `certificate.json`), which is where health
-  reads whether a newer release is due.
+  reads whether a newer release is due. A newer release does not stop an install that
+  still runs the old pin: step 17 prints health's FAIL for it and goes on.
 - **Nothing is published and there is no host networking**: the keys are
   absent from the project and the step reads the container back for them. The normal
   worker binds one unix socket, `/run/maildivvy/rspamd/rspamd.sock`, `0660` owned by the
@@ -910,7 +911,8 @@ What the step leaves:
   `/var/lib/maildivvy/health/upstream.json`: ClamAV's TXT record `current.cvd.clamav.net`
   (a newer release WARNs, and FAILs once it has been newer for more than 7 days),
   and the registry's tags for the pinned rspamd repository (a newer patch on the pinned
-  line FAILs: repin through step 11). An answer that cannot be read is UNKNOWN.
+  line FAILs: repin through step 11; the install's step 17 prints that FAIL and goes on).
+  An answer that cannot be read is UNKNOWN.
 - the bounds (report staleness, free space, memory, certificate days, signature age,
   queue age, the journal and request windows, the fan-out's age, how long collection may
   go without a finished fetch run or a fetched row, the backup's 48 h, the outside
@@ -937,7 +939,10 @@ reads as the pause.
 subsystem PASS or WARN, or UNKNOWN only where the machine holds no mail yet (no external
 mailbox, no delivery row, no message to search for, no fetch run yet). A WARN is printed and accepted: it is
 a signal the install cannot act on (a test machine's `self-signed` certificate is one), not
-a step that did not work. Every FAIL and every other UNKNOWN stops the install. `ban` and
+a step that did not work. So is `spam/repin`'s FAIL, a newer rspamd release on the
+pinned line: it is printed and does not stop the install, since what it asks for is a
+repin (step 11), not a repair; health on the running machine still reads it FAIL.
+Every other FAIL and every other UNKNOWN stops the install. `ban` and
 `network` are read by steps 18 and 19, which make what they check. With a textfile
 directory set, the run must also have written `maildivvy.prom` there, `0644
 maildivvy-health`.

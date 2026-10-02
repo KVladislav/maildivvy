@@ -227,8 +227,9 @@
 - name: Read the community signatures the feed updater wrote
   ansible.builtin.shell:
     cmd: >-
-      find {{ maildivvy_clamav_database_dir }} -maxdepth 1 -newer {{ maildivvy_clamav_database_dir }}/main.cvd
-      -type f ! -name 'main.*' ! -name 'daily.*' ! -name 'bytecode.*' ! -name 'freshclam.dat'
+      find {{ maildivvy_clamav_database_dir }} -maxdepth 1
+      -newer "$(ls -d {{ maildivvy_clamav_database_dir }}/main.c[vl]d | head -n 1)"
+      -type f ! -name 'main[.-]*' ! -name 'daily[.-]*' ! -name 'bytecode[.-]*' ! -name 'freshclam.dat'
       -printf '%u %f\n' | sort
   register: maildivvy_clamav_community
   changed_when: false

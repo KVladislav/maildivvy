@@ -30,6 +30,7 @@ from werkzeug.routing import IntegerConverter, RequestRedirect
 
 from maildivvy.admin import auth, journal, throttle
 from maildivvy.admin.screens import common
+from maildivvy.admin.style import STYLESHEET
 from maildivvy.lib import db
 from maildivvy.lib.config import ETC, ConfigError
 
@@ -92,121 +93,96 @@ CSRF_FIELD = "_csrf"
 CSRF_EXEMPT = frozenset({"sign_in"})
 POST_FORM = re.compile(r'<form\b[^>]*\bmethod="post"[^>]*>', re.IGNORECASE)
 
-STYLE = """
-body { font-family: system-ui, sans-serif; margin: 0; color: #111; background: #fff; }
-header { display: flex; gap: 1rem; align-items: baseline;
-         padding: .75rem 1.5rem; border-bottom: 1px solid #ccc; }
-header .who { margin-right: auto; }
-.frame { display: flex; align-items: flex-start; }
-nav { width: 16rem; padding: 1rem 0; border-right: 1px solid #ccc; }
-nav ul { list-style: none; margin: 0; padding: 0; }
-nav li { padding: .25rem 1.5rem; }
-nav li.sep { border-top: 1px solid #ddd; margin: .5rem 0; padding: 0; }
-nav li.current { font-weight: bold; }
-nav .count { color: #444; }
-main { padding: 1.5rem; max-width: 60rem; flex: 1; }
-table { border-collapse: collapse; margin: 1rem 0; }
-th, td { border-bottom: 1px solid #ddd; padding: .35rem .75rem; text-align: left;
-         vertical-align: top; }
-.notice { border: 1px solid #999; padding: .75rem; margin: 0 0 1rem; }
-.refusal { border: 2px solid #900; padding: .75rem; margin: 0 0 1rem; color: #900; }
-.field-refusal { color: #900; display: block; margin: .25rem 0; }
-.banner { border: 2px solid #111; padding: .75rem; margin: 0 0 1rem; font-weight: bold; }
-.danger { border: 2px solid #900; padding: .75rem; margin: 2rem 0 0; }
-.crumbs { color: #444; margin: 0 0 .5rem; }
-.badge { border: 1px solid #666; padding: 0 .35rem; }
-label { display: block; margin: .75rem 0 .25rem; }
-footer { padding: 1.5rem; color: #444; }
-header a.health { text-decoration: none; }
-"""
+# The seven icons the design draws with, declared once per page and drawn by `<use>`: an
+# icon always stands beside its word, never in its place.
+ICONS = """<svg class="sprite" width="0" height="0" aria-hidden="true">
+  <symbol id="i-alert" viewBox="0 0 16 16"><path d="M8 2.2 14.3 13H1.7L8 2.2Z"/><path d="M8 6.5v3M8 11.6v.2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3L13 4.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.3"/><path d="M8 7.2v4M8 5v.2"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="7" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.3"/><path d="M8 4.5V8l2.3 1.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 16 16"><path d="M9.5 3.5 5 8l4.5 4.5"/></symbol>
+</svg>"""
 
-# Health's four states in colour: (text, background, border), each pair readable
-# at WCAG AA or better. The state's word is always printed too, so colour is never the
-# only signal. FAIL is the one solid badge; PASS is calm; UNKNOWN is not PASS's colour.
-# Only a badge that names a health state carries a `state-*` class: the People list's
-# badges keep their plain look.
-STATE_COLOURS = {
-    "PASS": ("#14532d", "#dcfce7", "#15803d"),
-    "WARN": ("#713f12", "#fef3c7", "#b45309"),
-    "UNKNOWN": ("#3730a3", "#e0e7ff", "#4338ca"),
-    "FAIL": ("#ffffff", "#b91c1c", "#7f1d1d"),
-}
-STYLE += "".join(
-    f".badge.state-{state.lower()} {{ color: {text}; background: {background}; "
-    f"border-color: {border};{' font-weight: bold;' if state == 'FAIL' else ''} }}\n"
-    for state, (text, background, border) in STATE_COLOURS.items())
-# The Health screen's two banners take the same palette: a stale report is WARN, and no
-# report at all is FAIL. Only a banner that names a state is coloured; the break-glass
-# and shown-once banners keep the plain `.banner`.
-STYLE += "".join(
-    f".banner.state-{state.lower()} {{ color: {text}; background: {background}; "
-    f"border-color: {border}; }}\n"
-    for state, (text, background, border) in STATE_COLOURS.items()
-    if state in ("WARN", "FAIL"))
-
+# ⚠️ Two shapes of page. Signed in, the shell: the top bar, the sidebar, and
+# `main` with the crumbs, the page head (its one `h1`, the lede, its actions - at most one
+# of them the primary), the flashes, then the screen's body. Signed out, the card on the
+# grey ground and nothing else.
 SHELL = """<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>{{ title }} - Maildivvy</title><style>{{ style }}</style></head>
-<body>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} - Maildivvy</title><style>{{ style }}</style></head>
 {%- if identity %}
-<header>
-  <a class="product" href="{{ url_for('overview') }}">Maildivvy</a>
-  {%- if health %}
-  <a class="health badge state-{{ health.tone|lower }}" href="{{ health.url }}">Health: {{ health.words }}{% if health.detail %} &middot; {{ health.detail }}{% endif %}</a>
-  {%- endif %}
-  <span class="who">Signed in as {{ identity.login }}</span>
-  <form method="post" action="{{ url_for('sign_out') }}">
-    <button type="submit">Sign out {{ identity.login }}</button>
-  </form>
+<body>
+{{ icons }}
+<header class="topbar">
+  <a class="brand" href="{{ url_for('overview') }}">Maildivvy</a>
+  <div class="session">
+    {%- if health %}
+    <a class="health badge {{ health.voice }}" href="{{ health.url }}">Health: {{ health.words }}{% if health.detail %} &middot; {{ health.detail }}{% endif %}</a>
+    {%- endif %}
+    <span>Signed in as {{ identity.login }}</span>
+    <form method="post" action="{{ url_for('sign_out') }}"><button class="btn btn-sm" type="submit">Sign out {{ identity.login }}</button></form>
+  </div>
 </header>
-{%- endif %}
-<div class="frame">
-{%- if nav %}
-<nav>
+<div class="shell"><nav class="nav" aria-label="Sections">
 <ul>
-{%- for item in nav %}
-  <li class="{{ 'current' if item.current else '' }}">
-    {%- if item.url %}<a href="{{ item.url }}">{{ item.title }}</a>
-    {%- else %}<span>{{ item.title }}</span>{% endif %}
-    {%- if item.count is not none %} <span class="count">{{ item.count }}</span>{% endif %}
+{%- for item in nav or () %}
+  <li>
+    {%- set count %}{% if item.count is not none %} <span class="n">{{ item.count }}</span>{% endif %}{% endset %}
+    {%- if item.url %}<a href="{{ item.url }}"{% if item.current %} aria-current="page"{% endif %}>{{ item.title }}{{ count }}</a>
+    {%- else %}<span>{{ item.title }}{{ count }}</span>{% endif -%}
   </li>
   {%- if item.separator %}<li class="sep"></li>{% endif %}
 {%- endfor %}
 </ul>
 </nav>
-{%- endif %}
 <main>
-{%- if identity and identity.break_glass %}
-<p class="banner">Signed in with the break-glass account. Its use is recorded in the
-journal, and its password is rotated afterwards. Every act in this session is marked.</p>
+{%- if crumbs %}<div class="crumbs">{{ crumbs }}</div>{% endif %}
+<div class="page-head"><div><h1>{{ heading }}</h1>{% if lede %}<p class="lede">{{ lede }}</p>{% endif %}</div>
+{%- if actions %}<div class="actions">{{ actions }}</div>{% endif %}</div>
+{%- if identity.break_glass %}
+{{ flash('attn', 'alert', 'Signed in with the break-glass account. Its use is recorded in the
+journal, and its password is rotated afterwards. Every act in this session is marked.') }}
 {%- endif %}
-{%- if done %}<p class="notice done">{{ done }}</p>{% endif %}
+{%- if done %}
+{{ flash('ok', 'check', done) }}
+{%- endif %}
 {{ body }}
 </main>
 </div>
 </body>
+{%- else %}
+<body><div class="bare-wrap"><section class="card">
+{{ body }}
+</section></div>
+{{ icons }}
+</body>
+{%- endif %}
 </html>
 """
 
 LOGIN = """
 <h1>Maildivvy</h1>
-{%- if message %}<p class="notice">{{ message }}</p>{% endif %}
+{%- if message %}
+{{ flash(tone, 'x' if tone == 'bad' else 'info', message) }}
+{%- endif %}
 <form method="post" action="{{ url_for('sign_in') }}">
-  <label for="login">Login</label>
-  <input id="login" name="login" autocomplete="username" autofocus>
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password" autocomplete="current-password">
+  <div class="field"><label for="login">Login</label>
+  <input id="login" name="login" type="text" class="mono-input" autocomplete="username" autofocus></div>
+  <div class="field"><label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password"></div>
   {%- if next_path %}<input type="hidden" name="next" value="{{ next_path }}">{% endif %}
-  <p><button type="submit">Sign in</button></p>
+  <button class="btn btn-primary" type="submit">Sign in</button>
 </form>
-<footer>A session ends after 15 minutes without a request, and 8 hours after it began.</footer>
+<p class="foot">A session ends after 15 minutes without a request, and 8 hours after it began.</p>
 """
 
-NOT_FOUND = """
-<h1>Not found</h1>
-<p>There is nothing at this address. A removed route answers this too, because its rule
-is gone from the map rather than left behind refusing methods.</p>
-"""
+# the not-found page: its page head alone
+NOT_FOUND = """{% set heading %}Not found{% endset %}
+{%- set lede %}There is nothing at this address. A removed route answers this too, because its
+rule is gone from the map rather than left behind refusing methods.{% endset %}"""
 
 
 # --- the request's connection ----------------------------------------------
@@ -244,15 +220,31 @@ def header_health():
     # imported here, not at the top: the screen module imports this one for the shell
     from maildivvy.admin.screens import health
 
-    return {**health.status(), "url": url_for("health")}
+    said = health.status()
+    return {**said, "voice": health.voice_of(said["tone"]), "url": url_for("health")}
+
+
+# the page head's parts, each a `{% set %}` block of the screen's own template
+HEAD = ("heading", "lede", "actions", "crumbs")
 
 
 def page(title, body, identity=None, status=200, nav=None, done=None):
-    inner = render_template_string(body, identity=identity, **g.get("render", {}))
+    """A whole page: `body` is a template rendered once with the screen's values; the
+    shell (or, signed out, the card) goes around it.
+
+    The page head's parts are the body's own top-level `{% set heading %}`, `lede`,
+    `actions` and `crumbs` blocks, so they are rendered with the body's values and its
+    macros, and the shell places them.
+    """
+    values = {"identity": identity, **g.get("render", {})}
+    current_app.update_template_context(values)
+    rendered = current_app.jinja_env.from_string(body).make_module(values)
+    head = {name: getattr(rendered, name, None) or None for name in HEAD}
     # ⛔ only a signed-in page has the shell's header, so only it reads the report; the
     # sign-in page has no shell and says nothing about the machine
-    html = render_template_string(SHELL, title=title, style=STYLE, identity=identity,
-                                  body=Markup(inner), nav=nav, done=done,
+    html = render_template_string(SHELL, title=title, style=Markup(STYLESHEET),
+                                  icons=Markup(ICONS), identity=identity,
+                                  body=Markup(rendered), nav=nav, done=done, **head,
                                   health=header_health() if identity else None)
     return current_app.response_class(add_csrf_fields(html), status=status,
                                       mimetype="text/html")
@@ -400,6 +392,10 @@ def render(title, template, section=None, status=200, done=TOP, **values):
     saved sentence belongs INSIDE the row it was saved from - the person page's password
     row, where that row's refusals also appear (measured on the
     predecessor's deployed machine). The screen then renders it itself.
+
+    The template names its page head in `{% set %}` blocks: `heading`, the
+    `h1`'s content, which every screen has; `lede`, the muted sentence under it;
+    `actions`, its controls, at most one of them the primary; and `crumbs`, the way here.
     """
     g.render = values
     return page(title, template, identity=g.get("identity"), status=status,
@@ -410,7 +406,9 @@ def render(title, template, section=None, status=200, done=TOP, **values):
 
 def login_page(message, next_path=None, status=200):
     """The login page, with the cookie deleted: what every session that is over gets."""
-    g.render = {"message": message, "next_path": next_path}
+    # a refused or throttled sign-in is a refusal; "please sign in" is information
+    tone = "bad" if message in (auth.REFUSAL, auth.THROTTLED) else "info"
+    g.render = {"message": message, "next_path": next_path, "tone": tone}
     response = page("Sign in", LOGIN, status=status)
     clear_cookie(response)
     return response
@@ -495,6 +493,10 @@ def register(app):
     # A screen links to a section another task has not built yet by NAME: the template
     # asks whether the route exists rather than writing a path that may never be served.
     app.jinja_env.globals["has_route"] = lambda name: name in current_app.view_functions
+    # the shapes several screens and the shell share - a flash, a refusal, a failed
+    # request's line and flash, a field, a danger zone, a setting row - are called from
+    # the templates like `has_route`, with no template loader
+    app.jinja_env.globals.update(common.SHAPES)
 
     @app.errorhandler(404)
     def missing(_error):

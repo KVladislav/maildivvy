@@ -70,13 +70,13 @@ FREE_DOMAINS = ("SELECT id, label FROM domain WHERE external_mailbox_id IS NULL 
 
 # --- the wordings the two screens share ------------------------------------------------------
 
+# ⚠️ The design's voices: what the provider last said (`provider_of`) is a word
+# beside its icon, in green, amber or red, or muted when nothing was ever checked; enabled,
+# disabled and asked are the state switch, whose word beside the knob is the state. Its
+# accessible name is the act it performs, as the button's word was before.
 STATE_BOX = """
-{%- macro provider_says(row) -%}
-{%- if row.checking %}asked to check the password
-{%- elif row.last_test_status == 'ok' %}accepted, checked {{ row.last_test_at }}
-{%- elif row.last_test_status == 'auth_failed' %}refused, since {{ row.last_test_at }}
-{%- elif row.last_test_status == 'error' %}check got no answer ({{ row.last_test_detail or 'no detail' }})
-{%- else %}not checked yet{% endif -%}
+{%- macro provider_icon(said) -%}
+{%- if said.icon %}<svg class="icon {{ said.tone }}"><use href="#i-{{ said.icon }}"/></svg> {% endif -%}
 {%- endmacro -%}
 {%- macro state_words(row) -%}
 {%- if row.deleting %}asked to delete
@@ -86,40 +86,48 @@ STATE_BOX = """
 {%- else %}saved disabled, never enabled{% endif -%}
 {%- endmacro -%}
 {%- macro switch(row) -%}
-{%- if row.deleting %}waiting for the pipeline
-{%- elif row.enabling %}<button type="button" disabled>asked to enable, {{ row.enable_asked_at.strftime('%H:%M') }}</button>
+{%- if row.deleting %}<span class="muted">waiting for the pipeline</span>
+{%- elif row.enabling %}<button class="switch asked" type="button" disabled>\
+<span class="knob"></span>asked to enable, {{ row.enable_asked_at.strftime('%H:%M') }}</button>
 {%- elif row.state == 'active' -%}
-<form method="post" action="{{ url_for('external_disable', external_id=row.id) }}">
-  <button type="submit">Disable</button></form>
+<form method="post" action="{{ url_for('external_disable', external_id=row.id) }}">\
+<button class="switch on" type="submit" aria-label="Disable" title="Disable">\
+<span class="knob"></span>enabled</button></form>
 {%- else -%}
-<form method="post" action="{{ url_for('external_enable', external_id=row.id) }}">
-  <button type="submit">Enable</button></form>
+<form method="post" action="{{ url_for('external_enable', external_id=row.id) }}">\
+<button class="switch" type="submit" aria-label="Enable" title="Enable">\
+<span class="knob"></span>disabled</button></form>
 {%- endif -%}
 {%- endmacro -%}
+{%- macro way() -%}<a href="{{ url_for('external') }}">External mailboxes</a>{%- endmacro -%}
 """
 
 LIST_PAGE = STATE_BOX + """
-<h1>External mailboxes</h1>
-<p><a class="primary" href="{{ url_for('add_external') }}">Add external mailbox</a></p>
-<table>
-<tr><th>Address</th><th>In front of</th><th>State</th><th>At the provider</th><th>Actions</th></tr>
+{%- set heading %}External mailboxes{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_external') }}">Add external mailbox</a>{% endset %}
+<section class="box compact"><div class="table-wrap"><table>
+<thead><tr><th>Address</th><th>In front of</th><th>State</th><th>At the provider</th>\
+<th class="acts">Actions</th></tr></thead>
+<tbody>
 {%- for row in mailboxes %}
 <tr>
-  <td><a href="{{ url_for('external_mailbox', external_id=row.id) }}"><code>{{ row.address }}</code></a>
-      <div>deleted at the provider {{ row.delete_window_days }} days after first seen</div></td>
+  <td><a href="{{ url_for('external_mailbox', external_id=row.id) }}"><code>{{ row.address }}</code></a>\
+<span class="row-sub">deleted at the provider {{ row.delete_window_days }} days after first seen</span></td>
   <td>{% if row.domain_id %}<a href="{{ url_for('domain', domain_id=row.domain_id) }}"><code>{{ row.label }}</code></a>{% else %}&mdash;{% endif %}</td>
-  <td>{{ switch(row) }}<div>{{ state_words(row) }}</div>
-      {%- if row.reading.failed %}<div class="field-refusal">the pipeline could not do it: {{ row.reading.failed }}</div>{% endif %}
-      {%- if row.frozen_since %}<div><a href="{{ url_for('fetch') }}"><span class="badge">frozen</span></a></div>{% endif %}</td>
-  <td>{{ provider_says(row) }}
-      {%- if row.last_fetch_at %}<div>last fetch {{ row.last_fetch_at }}</div>{% endif %}</td>
-  <td>{% if row.deleting %}waiting for the pipeline
+  <td class="state">{{ switch(row) }}<span class="row-sub">{{ state_words(row) }}</span>
+      {{- pipeline_failed(row.reading.failed) }}
+      {%- if row.frozen_since %}<span class="row-sub"><a href="{{ url_for('fetch') }}"><span class="badge attn"><svg class="icon attn"><use href="#i-alert"/></svg> frozen</span></a></span>{% endif %}</td>
+  <td>
+      {%- if row.provider.tone == 'off' %}<span class="muted">{{ row.provider.words }}</span>
+      {%- else %}<span class="state-{{ row.provider.tone }}">{{ provider_icon(row.provider) }}{{ row.provider.words }}</span>{% endif %}
+      {%- if row.last_fetch_at %}<span class="row-sub">last fetch {{ row.last_fetch_at }}</span>{% endif %}</td>
+  <td class="acts">{% if row.deleting %}<span class="muted">waiting for the pipeline</span>
       {%- else %}
         {%- if not row.checking and not row.enabling %}
-        <form method="post" action="{{ url_for('external_check', external_id=row.id) }}">
-          <button type="submit">Check password</button></form>
+        <form method="post" action="{{ url_for('external_check', external_id=row.id) }}">\
+<button class="btn btn-sm" type="submit">Check password</button></form>
         {%- endif %}
-        {%- if has_route('events') %} <a href="{{ url_for('events', target=row.address_canonical, back='external') }}">Journal</a>
+        {%- if has_route('events') %} <a class="btn btn-sm btn-link" href="{{ url_for('events', target=row.address_canonical, back='external') }}">Journal</a>
         {%- else %} Journal{% endif %}
       {%- endif %}</td>
 </tr>
@@ -127,203 +135,206 @@ LIST_PAGE = STATE_BOX + """
 <tr><td colspan="5">No external mailbox yet. Add one: it is saved disabled, checked,
 then enabled.</td></tr>
 {%- endfor %}
-</table>
+</tbody>
+</table></div></section>
 """
 
-ADD_PAGE = """
-<p class="crumbs"><a href="{{ url_for('external') }}">External mailboxes</a> / Add</p>
-<h1>Add external mailbox</h1>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('add_external') }}">
-  <label for="address">Address</label>
-  <input id="address" name="address" value="{{ typed.address }}">
-  {%- if field == 'address' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-
-  <label for="pop3_login">POP3 login</label>
-  <input id="pop3_login" name="pop3_login" value="{{ typed.pop3_login }}">
-  <span>Leave empty to log in with the address itself. Changing it later makes the
-  fetcher treat the mailbox as new and collect its whole window again.</span>
-  {%- if field == 'pop3_login' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-
-  <label for="credential">Provider password</label>
-  <input id="credential" name="credential" type="password" autocomplete="new-password">
-  <span>Stored write-only; never shown again.</span>
-
-  <label for="pop3_host">POP3 host</label>
-  <input id="pop3_host" name="pop3_host" value="{{ typed.pop3_host }}">
-  {%- if field == 'pop3_host' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="pop3_port">POP3 port</label>
-  <input id="pop3_port" name="pop3_port" type="number" min="1" max="65535" value="{{ typed.pop3_port }}">
-  {%- if field == 'pop3_port' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <span>POP3 is implicit TLS on its port, not STARTTLS.</span>
-
-  <label for="smtp_host">SMTP host</label>
-  <input id="smtp_host" name="smtp_host" value="{{ typed.smtp_host }}">
-  {%- if field == 'smtp_host' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="smtp_port">SMTP port</label>
-  <input id="smtp_port" name="smtp_port" type="number" min="1" max="65535" value="{{ typed.smtp_port }}">
-  {%- if field == 'smtp_port' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <span>An SMTP port of 465 is sent with implicit TLS; any other port, such as 587, uses
+ADD_PAGE = STATE_BOX + """
+{%- set heading %}Add external mailbox{% endset %}
+{%- set crumbs %}{{ way() }} / Add{% endset %}
+<form class="narrow" method="post" action="{{ url_for('add_external') }}">
+{{ refused(refusal) }}
+{%- set login_help %}Leave empty to log in with the address itself. Changing it later makes the
+  fetcher treat the mailbox as new and collect its whole window again.{% endset %}
+{%- set pop3_help %}POP3 is implicit TLS on its port, not STARTTLS.{% endset %}
+{%- set smtp_help %}An SMTP port of 465 is sent with implicit TLS; any other port, such as 587, uses
   STARTTLS. Give both hosts by name, not by IP address: the provider's certificate is
-  checked against the name. Nothing checks an SMTP host before it is used.</span>
-
-  <label for="window">Deletion at the provider, days</label>
-  <input id="window" name="window" type="number" min="1" value="{{ typed.window }}">
-  {%- if field == 'window' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <span>Counted from when the fetcher first saw a message, not from the message's date.
+  checked against the name. Nothing checks an SMTP host before it is used.{% endset %}
+{%- set window_help %}Counted from when the fetcher first saw a message, not from the message's date.
   At a provider that offers only a recent window of messages, a window at or above that
-  length deletes nothing.</span>
+  length deletes nothing.{% endset %}
+<section class="box"><div class="box-body">
+{{ field('Address', 'address', typed.address, class_='mono-input',
+         warn=refusal if fault == 'address') }}
+{{ field('POP3 login', 'pop3_login', typed.pop3_login, class_='mono-input', help=login_help,
+         warn=refusal if fault == 'pop3_login') }}
+{{ field('Provider password', 'credential', type='password', autocomplete='new-password',
+         help='Stored write-only; never shown again.') }}
+<div class="inline-fields">
+{{ field('POP3 host', 'pop3_host', typed.pop3_host, class_='mono-input',
+         warn=refusal if fault == 'pop3_host') }}
+{{ field('POP3 port', 'pop3_port', typed.pop3_port, type='number', class_='short', min=1,
+         max=65535, help=pop3_help, warn=refusal if fault == 'pop3_port') }}
+</div>
+<div class="inline-fields">
+{{ field('SMTP host', 'smtp_host', typed.smtp_host, class_='mono-input',
+         warn=refusal if fault == 'smtp_host') }}
+{{ field('SMTP port', 'smtp_port', typed.smtp_port, type='number', class_='short', min=1,
+         max=65535, help=smtp_help, warn=refusal if fault == 'smtp_port') }}
+</div>
+{{ field('Deletion at the provider, days', 'window', typed.window, type='number',
+         class_='short', min=1, help=window_help, warn=refusal if fault == 'window') }}
+{{ field('Comment', 'comment', typed.comment) }}
+</div></section>
 
-  <label for="comment">Comment</label>
-  <input id="comment" name="comment" value="{{ typed.comment }}">
-
-  <h2>The domain in front of it</h2>
-  <label><input type="radio" name="domain_choice" value="free"
-    {{ 'checked' if typed.domain_choice != 'new' }}> A free domain</label>
-  <select name="domain_id">
-    <option value="">&mdash;</option>
-    {%- for free in free_domains %}
-    <option value="{{ free.id }}" {{ 'selected' if typed.domain_id == free.id|string }}>{{ free.label }}</option>
-    {%- endfor %}
-  </select>
-  <label><input type="radio" name="domain_choice" value="new"
-    {{ 'checked' if typed.domain_choice == 'new' }}> A new domain, created in the same step</label>
-  <label for="label">New domain label</label>
-  <input id="label" name="label" value="{{ typed.label }}">
-  <label for="password">Its archive password</label>
-  <input id="password" name="password" type="password" autocomplete="new-password">
-  <label for="password2">Its archive password again</label>
-  <input id="password2" name="password2" type="password" autocomplete="new-password">
-  {%- if field == 'domain' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-
-  <p><button type="submit">Save as disabled</button>
-     <a href="{{ url_for('external') }}">Cancel, nothing changes</a></p>
+<section class="box"><div class="box-head"><h2>The domain in front of it</h2></div><div class="box-body">
+<label class="choice"><input type="radio" name="domain_choice" value="free"
+  {{ 'checked' if typed.domain_choice != 'new' }}><div><b>A free domain</b></div></label>
+<div class="field"><select name="domain_id" class="mid">
+  <option value="">&mdash;</option>
+  {%- for free in free_domains %}
+  <option value="{{ free.id }}" {{ 'selected' if typed.domain_id == free.id|string }}>{{ free.label }}</option>
+  {%- endfor %}
+</select></div>
+<label class="choice"><input type="radio" name="domain_choice" value="new"
+  {{ 'checked' if typed.domain_choice == 'new' }}><div><b>A new domain, created in the same step</b></div></label>
+{{ field('New domain label', 'label', typed.label, class_='mono-input mid') }}
+<div class="inline-fields">
+{{ field('Its archive password', 'password', type='password', autocomplete='new-password',
+         class_='mid') }}
+{{ field('Its archive password again', 'password2', type='password',
+         autocomplete='new-password', class_='mid', warn=refusal if fault == 'domain') }}
+</div>
+</div></section>
+<div class="form-foot"><button class="btn btn-primary" type="submit">Save as disabled</button>\
+<a class="btn" href="{{ url_for('external') }}">Cancel, nothing changes</a></div>
 </form>
 """
 
 ITEM_PAGE = STATE_BOX + """
-<p class="crumbs"><a href="{{ url_for('external') }}">External mailboxes</a> /
-  <code>{{ row.address }}</code></p>
-<h1><code>{{ row.address }}</code></h1>
-{%- if has_route('events') %}
-<p><a href="{{ url_for('events', target=row.address_canonical, back='external') }}">Journal for this mailbox</a></p>
-{%- endif %}
-<p>In front of
+{%- set heading %}<code>{{ row.address }}</code>{% endset %}
+{%- set lede %}In front of
 {%- if row.domain_id %} <a href="{{ url_for('domain', domain_id=row.domain_id) }}"><code>{{ row.label }}</code></a>
-{%- else %} no domain{% endif %}. {{ state_words(row) }}.</p>
-<p>Rotating the provider password here is the operation this interface most exists for.
+{%- else %} no domain{% endif %}. {{ state_words(row) }}.
+Rotating the provider password here is the operation this interface most exists for.
 The deletion window is counted from the fetcher's first sighting of a message. The
 address itself is fixed: the canonical address derives from it, so changing it means
-deleting this row and adding another.</p>
-
-<h2>At the provider</h2>
-<p><span class="badge">{{ provider_says(row) }}</span></p>
+deleting this row and adding another.{% endset %}
+{%- set actions %}{%- if has_route('events') -%}
+<a class="btn" href="{{ url_for('events', target=row.address_canonical, back='external') }}">Journal for this mailbox</a>
+{%- endif %}{% endset %}
+{%- set crumbs %}{{ way() }} / <code>{{ row.address }}</code>{% endset %}
+{%- if row.reading.failed %}
+{{ pipeline_flash(row.reading) }}
+{%- endif %}
+<div class="stack">
+<section class="box">
+<div class="box-head"><h2>At the provider</h2><span class="badge {{ row.provider.tone }}">\
+{{ provider_icon(row.provider) }}{{ row.provider.words }}</span></div>
 {%- if row.last_test_status == 'auth_failed' %}
-<p>The account's owner has very likely changed the password. Fetching for this address
-has stopped, and nothing is sent as it until a check passes.</p>
+<div class="box-body"><p>The account's owner has very likely changed the password. Fetching for this address
+has stopped, and nothing is sent as it until a check passes.</p></div>
 {%- endif %}
-<p>{{ switch(row) }}</p>
-{%- if row.reading.failed %}<p class="field-refusal">the pipeline could not do it: {{ row.reading.failed }}</p>{% endif %}
-{%- if row.state != 'active' %}
-<p>Everyone keeps what has already arrived; disabling stops new mail and stops sending
-as this address.</p>
-{%- endif %}
+<div class="box-body"><div class="btn-row">{{ switch(row) }}
+{%- if row.state != 'active' %}<span class="muted">Everyone keeps what has already arrived; disabling stops new mail and stops sending
+as this address.</span>{% endif %}</div></div>
+<div class="box-body">
 {%- if row.checking %}
-<p>asked to check the password</p>
+<p class="muted">asked to check the password</p>
 {%- else %}
-<form method="post" action="{{ url_for('external_check', external_id=row.id) }}">
-  <button type="submit">Check the password at the provider</button>
-  <span>Checking changes nothing and asks for no password; the pipeline journals the
+<form class="btn-row" method="post" action="{{ url_for('external_check', external_id=row.id) }}">\
+<button class="btn" type="submit">Check the password at the provider</button>
+  <span class="muted">Checking changes nothing and asks for no password; the pipeline journals the
   result in your name.</span>
 </form>
 {%- endif %}
+</div>
+</section>
 
-<h2>Provider servers</h2>
-{%- if form == 'servers' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('external_servers', external_id=row.id) }}">
-  <label for="pop3_host">POP3 host</label>
-  <input id="pop3_host" name="pop3_host" value="{{ servers.pop3_host }}">
-  {%- if field == 'pop3_host' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="pop3_port">POP3 port</label>
-  <input id="pop3_port" name="pop3_port" type="number" min="1" max="65535" value="{{ servers.pop3_port }}">
-  {%- if field == 'pop3_port' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <span>POP3 is implicit TLS on its port, not STARTTLS. The fetcher logs in with the
-  POP3 login, or with the address itself when the login is empty.</span>
-  <label for="smtp_host">SMTP host</label>
-  <input id="smtp_host" name="smtp_host" value="{{ servers.smtp_host }}">
-  {%- if field == 'smtp_host' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="smtp_port">SMTP port</label>
-  <input id="smtp_port" name="smtp_port" type="number" min="1" max="65535" value="{{ servers.smtp_port }}">
-  {%- if field == 'smtp_port' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <span>An SMTP port of 465 is sent with implicit TLS; any other port, such as 587, uses
+{%- set pop3_help %}POP3 is implicit TLS on its port, not STARTTLS. The fetcher logs in with the
+  POP3 login, or with the address itself when the login is empty.{% endset %}
+{%- set smtp_help %}An SMTP port of 465 is sent with implicit TLS; any other port, such as 587, uses
   STARTTLS. Give both hosts by name, not by IP address: the provider's certificate is
   checked against the name. Nothing checks an SMTP host before it is used, so a change
-  takes effect at the next message sent.</span>
-  <p><button type="submit">Save the servers</button>
-  <span class="field-refusal">Changing either host clears the stored provider password,
+  takes effect at the next message sent.{% endset %}
+<section class="box"><div class="box-head"><h2>Provider servers</h2></div><div class="box-body">
+<form method="post" action="{{ url_for('external_servers', external_id=row.id) }}">
+{{ refused(refusal if form == 'servers') }}
+<div class="inline-fields">
+{{ field('POP3 host', 'pop3_host', servers.pop3_host, class_='mono-input',
+         warn=refusal if fault == 'pop3_host') }}
+{{ field('POP3 port', 'pop3_port', servers.pop3_port, type='number', class_='short', min=1,
+         max=65535, help=pop3_help, warn=refusal if fault == 'pop3_port') }}
+</div>
+<div class="inline-fields">
+{{ field('SMTP host', 'smtp_host', servers.smtp_host, class_='mono-input',
+         warn=refusal if fault == 'smtp_host') }}
+{{ field('SMTP port', 'smtp_port', servers.smtp_port, type='number', class_='short', min=1,
+         max=65535, help=smtp_help, warn=refusal if fault == 'smtp_port') }}
+</div>
+{%- set clears %}Changing either host clears the stored provider password,
   so it is never presented to a host you did not put it in for. Enter it again in
-  Settings below; nothing is fetched or sent until you do (<code>0022</code>).</span></p>
+  Settings below; nothing is fetched or sent until you do (<code>0022</code>).{% endset %}
+{{ flash('attn', 'alert', clears) }}
+<div class="form-foot"><button class="btn" type="submit">Save the servers</button></div>
 </form>
+</div></section>
 
-<h2>Settings</h2>
-{%- if form == 'settings' and refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
+{%- set login_help %}Empty means the address itself. Changing a working login makes the fetcher treat
+  the mailbox as new and collect its whole window again.{% endset %}
+<section class="box"><div class="box-head"><h2>Settings</h2></div><div class="box-body">
 <form method="post" action="{{ url_for('external_settings', external_id=row.id) }}">
-  <label for="pop3_login">POP3 login</label>
-  <input id="pop3_login" name="pop3_login" value="{{ settings.pop3_login }}">
-  {%- if field == 'pop3_login' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <span>Empty means the address itself. Changing a working login makes the fetcher treat
-  the mailbox as new and collect its whole window again.</span>
-  <label for="credential">New provider password</label>
-  <input id="credential" name="credential" type="password" autocomplete="new-password">
-  <span>Leave empty to keep the stored password. Stored write-only; never shown again.</span>
-  <label for="window">Deletion at the provider, days</label>
-  <input id="window" name="window" type="number" min="1" value="{{ settings.window }}">
-  {%- if field == 'window' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="comment">Comment</label>
-  <input id="comment" name="comment" value="{{ settings.comment }}">
-  <p><button type="submit">Save settings</button></p>
+{{ refused(refusal if form == 'settings') }}
+{{ field('POP3 login', 'pop3_login', settings.pop3_login, class_='mono-input', help=login_help,
+         warn=refusal if fault == 'pop3_login') }}
+{{ field('New provider password', 'credential', type='password', autocomplete='new-password',
+         help='Leave empty to keep the stored password. Stored write-only; never shown again.') }}
+{{ field('Deletion at the provider, days', 'window', settings.window, type='number',
+         class_='short', min=1, warn=refusal if fault == 'window') }}
+{{ field('Comment', 'comment', settings.comment) }}
+<div class="form-foot"><button class="btn btn-primary" type="submit">Save settings</button>\
+<a class="btn" href="{{ url_for('external') }}">Cancel, nothing changes</a></div>
 </form>
+</div></section>
 
-<div class="danger">
-<h2>Danger zone</h2>
-<p>Removes the row, the provider password and the fetcher's state. The domain
+{%- set sentence %}Removes the row, the provider password and the fetcher's state. The domain
 {%- if row.domain_id %} <code>{{ row.label }}</code>{% endif %}, its archive and every
-message in it stay; you will be asked whether the domain goes too.</p>
-<p><a href="{{ url_for('delete_external_mailbox', external_id=row.id) }}">Delete this external mailbox&hellip;</a></p>
+message in it stay; you will be asked whether the domain goes too.{% endset %}
+{%- set control %}<a class="btn btn-danger" href="{{ url_for('delete_external_mailbox', external_id=row.id) }}">\
+Delete this external mailbox&hellip;</a>{% endset %}
+{{ danger_zone(sentence, none, control) }}
 </div>
 """
 
-DELETE_PAGE = """
-<h1>Delete <code>{{ row.address }}</code>?</h1>
-<p>What goes is this row, the provider password and the fetcher's state. Nobody's mail
-is destroyed by this act.</p>
+DELETE_PAGE = STATE_BOX + """
+{%- set heading %}Delete <code>{{ row.address }}</code>?{% endset %}
+{%- set lede %}What goes is this row, the provider password and the fetcher's state. Nobody's mail
+is destroyed by this act.{% endset %}
+{%- set crumbs %}{{ way() }} / <a href="{{ url_for('external_mailbox', external_id=row.id) }}">\
+<code>{{ row.address }}</code></a> / Delete{% endset %}
+<div class="stack narrow">
 {%- if row.domain_id %}
-<h2>Leave <code>{{ row.label }}</code> free</h2>
+<section class="danger-zone"><div class="box-head"><h2>Leave <code>{{ row.label }}</code> free</h2></div>
+<div class="box-body">
 <p>The domain, its archive and its mailboxes stay exactly as they are. Nothing arrives
 for it and nothing leaves until another external mailbox is put in front of it.</p>
-<form method="post" action="{{ url_for('delete_external_mailbox', external_id=row.id) }}">
+<form class="form-foot" method="post" action="{{ url_for('delete_external_mailbox', external_id=row.id) }}">
   <input type="hidden" name="branch" value="leave">
-  <p><button type="submit" class="danger">Delete the mailbox, leave <code>{{ row.label }}</code> free</button></p>
+  <button class="btn btn-danger" type="submit">Delete the mailbox, leave <code>{{ row.label }}</code> free</button>
 </form>
-<h2>Delete the domain <code>{{ row.label }}</code> too</h2>
-<table>
-<tr><th>Messages removed</th><td>{{ numbers.messages }}</td></tr>
-<tr><th>Mailboxes removed</th><td>{{ numbers.mailboxes }}</td></tr>
-<tr><th>People who lose their only mailbox</th><td>{{ numbers.people }}</td></tr>
-</table>
+</div></section>
+<section class="danger-zone"><div class="box-head"><h2>Delete the domain <code>{{ row.label }}</code> too</h2></div>
+<div class="box-body">
 <p>That is two requests, in order. If the second does not run, a free domain is left,
 which is an ordinary state. Disk space is not stated: the store is hardlinked.</p>
-<form method="post" action="{{ url_for('delete_external_mailbox', external_id=row.id) }}">
+<div class="kv"><div><b>{{ numbers.messages }}</b><span>Messages removed</span></div>\
+<div><b>{{ numbers.mailboxes }}</b><span>Mailboxes removed</span></div>\
+<div><b>{{ numbers.people }}</b><span>People who lose their only mailbox</span></div></div>
+<form class="form-foot" method="post" action="{{ url_for('delete_external_mailbox', external_id=row.id) }}">
   <input type="hidden" name="branch" value="{{ delete_word }}">
-  <p><button type="submit" class="danger">Delete the mailbox and <code>{{ row.label }}</code></button></p>
+  <button class="btn btn-danger-solid" type="submit">Delete the mailbox and <code>{{ row.label }}</code></button>
 </form>
+</div></section>
 {%- else %}
-<form method="post" action="{{ url_for('delete_external_mailbox', external_id=row.id) }}">
+<section class="danger-zone"><div class="box-body">
+<form class="form-foot" method="post" action="{{ url_for('delete_external_mailbox', external_id=row.id) }}">
   <input type="hidden" name="branch" value="leave">
-  <p><button type="submit" class="danger">Delete <code>{{ row.address }}</code></button></p>
+  <button class="btn btn-danger-solid" type="submit">Delete <code>{{ row.address }}</code></button>
 </form>
+</div></section>
 {%- endif %}
-<p><a href="{{ url_for('external_mailbox', external_id=row.id) }}">Cancel, nothing changes</a></p>
+<p><a href="{{ url_for('external_mailbox', external_id=row.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
+</div>
 """
 
 # ⚠️ Any branch value other than this literal counts as "leave": a typo, a truncated
@@ -333,14 +344,34 @@ DELETE_WORD = "delete-the-domain-too"
 
 # --- readers -----------------------------------------------------------------------------------
 
+def provider_of(row):
+    """What the provider last said: its words, the voice they are said in, and the icon
+    beside them - `off` and no icon when nothing was ever checked, whose words are muted."""
+    status = row["last_test_status"]
+    if row["checking"]:
+        return {"words": "asked to check the password", "tone": "attn", "icon": "clock"}
+    if status == "ok":
+        return {"words": f"accepted, checked {row['last_test_at']}", "tone": "ok",
+                "icon": "check"}
+    if status == "auth_failed":
+        return {"words": f"refused, since {row['last_test_at']}", "tone": "bad",
+                "icon": "alert"}
+    if status == "error":
+        return {"words": f"check got no answer ({row['last_test_detail'] or 'no detail'})",
+                "tone": "attn", "icon": "alert"}
+    return {"words": "not checked yet", "tone": "off", "icon": None}
+
+
 def with_reading(rows, period=None):
-    """Each row carrying the reading of the newest request that names it.
+    """Each row carrying the reading of the newest request that names it,
+    and what the provider last said.
 
     ⚠️ Any KIND, not only the enable: in the predecessor a failed enable put its reason on the
     row and a failed check or deletion put nothing anywhere.
     """
     for row in rows:
         row["reading"] = common.reading_of(row, period)
+        row["provider"] = provider_of(row)
     return rows
 
 
@@ -368,10 +399,10 @@ def settings_of(row):
             "comment": row["comment"] or ""}
 
 
-def item(conn, row, status=200, form=None, refusal=None, field=None,
+def item(conn, row, status=200, form=None, refusal=None, fault=None,
          servers=None, settings=None):
     return app.render(row["address"], ITEM_PAGE, section="external", status=status,
-                      row=row, form=form, refusal=refusal, field=field,
+                      row=row, form=form, refusal=refusal, fault=fault,
                       servers=servers or servers_of(row),
                       settings=settings or settings_of(row))
 
@@ -676,8 +707,9 @@ def register(app_):
         if request.method == "GET":
             numbers = (common.one(conn, domains.NUMBERS, {"id": row["domain_id"]})
                        if row["domain_id"] else None)
-            return app.render(f"Delete {row['address']}?", DELETE_PAGE, row=row,
-                              numbers=numbers, delete_word=DELETE_WORD)
+            return app.render(f"Delete {row['address']}?", DELETE_PAGE, section="external",
+                              row=row, numbers=numbers,
+                              delete_word=DELETE_WORD)
         request_id = common.ask(conn, "delete_external_mailbox", row["address_canonical"],
                                 {"external_mailbox_id": external_id}, g.identity)
         domains.record(conn, "delete_external_mailbox", row["address_canonical"],
@@ -702,7 +734,7 @@ def duplicate(spelling):
             "two fetchers on one account and deletion running in two places.")
 
 
-def add_page(typed, free_domains, refusal=None, field=None):
+def add_page(typed, free_domains, refusal=None, fault=None):
     return app.render("Add external mailbox", ADD_PAGE, section="external",
                       status=400 if refusal else 200, typed=typed,
-                      free_domains=free_domains, refusal=refusal, field=field)
+                      free_domains=free_domains, refusal=refusal, fault=fault)

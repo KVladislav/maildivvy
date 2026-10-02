@@ -855,6 +855,51 @@ def test_a_pass_that_has_not_run_yet_is_no_data_yet_and_step_17_accepts_it_as_su
     assert "store/fan-out" in yaml.safe_load(health_vars.read_text())["maildivvy_health_no_data_yet"]
 
 
+def step_17_proof(tmp_path, readings):
+    """Step 17's proof as the install runs it, over a whole report holding `readings`
+    ({"subsystem/check": state}) and PASS everywhere else; its exit code and output."""
+    import subprocess
+    import sys
+
+    import yaml
+    health_vars = yaml.safe_load((Path(__file__).resolve().parents[2] / "ansible" / "roles" / "health"
+                                  / "vars" / "main.yml").read_text())
+    subsystems = {name: [] for name in checks.SUBSYSTEMS}
+    for key, state in readings.items():
+        name, check = key.split("/", 1)
+        subsystems[name].append({"name": check, "state": state, "reading": "read", "problem": f"{key} said so"})
+    for name, held in subsystems.items():
+        held.append({"name": "control", "state": PASS, "reading": "read", "problem": None})
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps({"complete": True, "subsystems": [
+        {"name": name, "checks": held} for name, held in subsystems.items()]}))
+    done = subprocess.run([sys.executable, "-c", health_vars["maildivvy_health_proof"], str(path),
+                           ",".join(health_vars["maildivvy_health_later_steps"]),
+                           ",".join(health_vars["maildivvy_health_no_data_yet"]),
+                           ",".join(health_vars["maildivvy_health_not_stopping"])],
+                          capture_output=True, text=True)
+    return done.returncode, done.stdout
+
+
+def test_step_17_prints_a_newer_rspamd_release_and_does_not_stop_on_it(tmp_path):
+    """The day rspamd 4.2.1 was released, `spam/repin` read FAIL and every install stopped
+    at step 17. It is printed beside the WARNs and accepted; health itself still FAILs."""
+    assert scanners.judge_repin("4.2.0", "4.2.1").state == FAIL
+    code, out = step_17_proof(tmp_path, {})
+    assert code == 0 and out.endswith("readings accepted\n"), out   # the control: a whole PASS report
+    code, out = step_17_proof(tmp_path, {"spam/repin": FAIL, "tls/certificate": WARN})
+    assert code == 0, out
+    assert "FAIL spam/repin" in out and "WARN tls/certificate" in out
+
+
+def test_step_17_stops_on_every_other_fail_and_on_a_repin_it_cannot_read(tmp_path):
+    for key in ("spam/container", "spam/scores", "antivirus/repin", "tls/certificate"):
+        code, out = step_17_proof(tmp_path, {key: FAIL, "spam/repin": FAIL})
+        assert code == 1 and f"FAIL {key}" in out, (key, out)
+    code, out = step_17_proof(tmp_path, {"spam/repin": UNKNOWN})
+    assert code == 1 and "UNKNOWN spam/repin" in out
+
+
 def test_failed_requests_of_the_last_day_warn_naming_kind_and_target():
     found = data.judge_requests([("connect", "ivan@alpha")], 12, 24)
     assert found.state == WARN and "connect ivan@alpha" in found.problem

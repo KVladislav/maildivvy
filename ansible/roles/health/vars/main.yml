@@ -45,14 +45,22 @@ maildivvy_health_no_data_yet:
   # the test VM, 2026-09-24), and then no pass has run yet when step 17 reads health
   - store/fan-out
 
-# The proof, on the machine: argv is the report, the later steps and the no-data checks.
-# A WARN is accepted and printed: it is a signal for the operator the install cannot act
-# on (a self-signed certificate, a Sent link that failed yesterday), never a step that did
-# not work. It prints every reading that is not accepted, and exits 1 then.
+# The FAILs the proof prints and accepts: a newer upstream release is a reason to
+# repin, not a step that did not work, and stopping on it failed every install from the
+# day upstream released one. Health on the running machine still reads it FAIL. One key
+# only: every other FAIL stops the install.
+maildivvy_health_not_stopping: [spam/repin]
+
+# The proof, on the machine: argv is the report, the later steps, the no-data checks and
+# the FAILs that do not stop the install. A WARN is accepted and printed: it is a signal
+# for the operator the install cannot act on (a self-signed certificate, a Sent link that
+# failed yesterday), never a step that did not work; so is a FAIL of
+# maildivvy_health_not_stopping. It prints every reading that is not accepted, and exits 1
+# then.
 maildivvy_health_proof: |
   import json, sys
-  path, later, no_data = sys.argv[1:4]
-  later, no_data = set(later.split(",")), set(no_data.split(","))
+  path, later, no_data, not_stopping = sys.argv[1:5]
+  later, no_data, not_stopping = (set(arg.split(",")) for arg in (later, no_data, not_stopping))
   whole = json.load(open(path))
   assert whole["complete"] is True and len(whole["subsystems"]) == 15, "the report is not whole"
   wrong, warned, read = [], [], 0
@@ -63,7 +71,7 @@ maildivvy_health_proof: |
           read += 1
           key, state = subsystem["name"] + "/" + check["name"], check["state"]
           line = f"{state} {key}: {check['reading']} - {check['problem']}"
-          if state == "WARN":
+          if state == "WARN" or (state == "FAIL" and key in not_stopping):
               warned.append(line)
           elif not (state == "PASS" or (state == "UNKNOWN" and key in no_data)):
               wrong.append(line)

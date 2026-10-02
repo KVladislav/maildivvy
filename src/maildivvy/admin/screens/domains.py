@@ -76,237 +76,268 @@ SELECT id, received_at, message_date, sender, subject, state, is_spam, spam_scor
 """
 
 
-# --- the bits of markup the screens share ---------------------------------------------------
+# --- the bits of markup the screens share (in the design's components) -------------
 
+# Every domain page starts with these macros, so its page head and its body both call
+# them: what sits in front of a domain, the links to its archive listing and its journal
+# (each drawn with the classes it is given), and the way back to it in the crumbs.
 IN_FRONT = """
 {%- macro in_front(row) -%}
 {%- if row.external_id -%}
   {%- if has_route('external_mailbox') -%}
   <a href="{{ url_for('external_mailbox', external_id=row.external_id) }}"><code>{{ row.external_address }}</code></a>
   {%- else -%}<code>{{ row.external_address }}</code>{%- endif -%}
-  {%- if row.external_state != 'active' %} <span class="badge">disabled</span>{% endif -%}
+  {%- if row.external_state != 'active' %} <span class="badge off">disabled</span>{% endif -%}
 {%- elif row.waiting -%}
   asked to create
 {%- else -%}
-  none &mdash; nothing arrives and nothing leaves
+  <span class="muted">none &mdash; nothing arrives and nothing leaves</span>
 {%- endif -%}
 {%- endmacro -%}
-{%- macro listing_link(row) -%}
-{%- if row.waiting -%}waiting for the pipeline
-{%- else -%}<a href="{{ url_for('archive_listing', domain_id=row.id) }}">Archive listing</a>
+{%- macro listing_link(row, class_) -%}
+{%- if row.waiting -%}<span class="muted">waiting for the pipeline</span>
+{%- else -%}<a class="{{ class_ }}" href="{{ url_for('archive_listing', domain_id=row.id) }}">Archive listing</a>
 {%- endif -%}
 {%- endmacro -%}
-{%- macro journal_link(label, text) -%}
-{%- if has_route('events') -%}<a href="{{ url_for('events', target=label, back='domains') }}">{{ text }}</a>
+{%- macro journal_link(label, text, class_) -%}
+{%- if has_route('events') -%}<a class="{{ class_ }}" href="{{ url_for('events', target=label, back='domains') }}">{{ text }}</a>
 {%- else -%}{{ text }}{%- endif -%}
+{%- endmacro -%}
+{%- macro way(row) -%}
+<a href="{{ url_for('domains') }}">Domains</a> / \
+<a href="{{ url_for('domain', domain_id=row.id) }}"><code>{{ row.label }}</code></a>
 {%- endmacro -%}
 """
 
 LIST_PAGE = IN_FRONT + """
-<h1>Domains</h1>
-<p><a class="primary" href="{{ url_for('add_domain') }}">Add domain</a></p>
-<table>
-<tr><th>Label</th><th>External mailbox in front</th><th>Mailboxes</th>
-    <th>In the archive</th><th>Actions</th></tr>
+{%- set heading %}Domains{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_domain') }}">Add domain</a>{% endset %}
+<section class="box"><div class="table-wrap"><table>
+<thead><tr><th>Label</th><th>External mailbox in front</th><th class="num">Mailboxes</th>\
+<th class="num">In the archive</th><th class="acts">Actions</th></tr></thead>
+<tbody>
 {%- for row in domains %}
 <tr>
   <td><a href="{{ url_for('domain', domain_id=row.id) }}"><code>{{ row.label }}</code></a></td>
   <td>{{ in_front(row) }}</td>
-  <td>{{ row.mailboxes }}</td>
-  <td>{{ row.messages }}</td>
-  <td>{% if has_route('mailboxes') %}<a href="{{ url_for('mailboxes', domain=row.id) }}">Mailboxes</a>{% else %}Mailboxes{% endif %}
-      &middot; {{ listing_link(row) }}
-      &middot; {{ journal_link(row.label, 'Journal') }}</td>
+  <td class="num">{{ row.mailboxes }}</td>
+  <td class="num">{{ row.messages }}</td>
+  <td class="acts">{% if has_route('mailboxes') %}<a class="btn btn-sm" href="{{ url_for('mailboxes', domain=row.id) }}">Mailboxes</a>{% else %}Mailboxes{% endif %}
+      {{ listing_link(row, 'btn btn-sm') }}
+      {{ journal_link(row.label, 'Journal', 'btn btn-sm btn-link') }}</td>
 </tr>
 {%- else %}
 <tr><td colspan="5">No domain yet. Every domain has an archive, made in the same act.</td></tr>
 {%- endfor %}
-</table>
+</tbody>
+</table></div></section>
 """
 
-ADD_PAGE = """
-<p class="crumbs"><a href="{{ url_for('domains') }}">Domains</a> / Add domain</p>
-<h1>Add domain</h1>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('add_domain') }}">
-  <label for="label">Label</label>
-  <input id="label" name="label" value="{{ typed.label }}">
-  {%- if field == 'label' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <p>Every domain has an archive, the canonical copy of its mail, with a read-only login
-  of its own (<code>{{ archive }}@&lt;label&gt;</code>). It is made in this same act.</p>
-  <label for="password">Archive password</label>
-  <input id="password" name="password" type="password" autocomplete="new-password">
-  <label for="password2">Archive password again</label>
-  <input id="password2" name="password2" type="password" autocomplete="new-password">
-  {%- if field == 'password' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <p><button type="submit">Add domain</button>
-     <a href="{{ url_for('domains') }}">Cancel, nothing changes</a></p>
+ADD_PAGE = IN_FRONT + """
+{%- set heading %}Add domain{% endset %}
+{%- set crumbs %}<a href="{{ url_for('domains') }}">Domains</a> / Add domain{% endset %}
+{%- set about %}Every domain has an archive, the canonical copy of its mail, with a read-only
+login of its own (<code>{{ archive }}@&lt;label&gt;</code>). It is made in this same act.{% endset %}
+<form class="narrow" method="post" action="{{ url_for('add_domain') }}">
+{{ refused(refusal) }}
+<section class="box"><div class="box-body">
+{{ field('Label', 'label', typed.label, class_='mono-input mid',
+         warn=refusal if fault == 'label') }}
+{{ field('Archive password', 'password', type='password', class_='mid',
+         autocomplete='new-password', help=about) }}
+{{ field('Archive password again', 'password2', type='password', class_='mid',
+         autocomplete='new-password', warn=refusal if fault == 'password') }}
+</div></section>
+<div class="form-foot"><button class="btn btn-primary" type="submit">Add domain</button>\
+<a class="btn" href="{{ url_for('domains') }}">Cancel, nothing changes</a></div>
 </form>
 """
 
 DOMAIN_PAGE = IN_FRONT + mailboxes.SHAPE + """
-<p class="crumbs"><a href="{{ url_for('domains') }}">Domains</a> / <code>{{ row.label }}</code></p>
-<h1><code>{{ row.label }}</code></h1>
-<p>{{ listing_link(row) }} &middot; {{ journal_link(row.label, 'Journal for this domain') }}</p>
-<p>In front of it: {{ in_front(row) }}.
+{%- set heading %}<code>{{ row.label }}</code>{% endset %}
+{%- set lede %}In front of it: {{ in_front(row) }}.
 {%- if not row.external_id and not row.waiting %}
 Free &mdash; no external mailbox in front of it, so nothing arrives and nothing leaves.
 {%- endif %}
 {{ row.mailboxes }} mailbox(es).
-{{ row.messages }} message(s) in the archive{% if row.newest %}, the newest at {{ row.newest }}{% endif %}.</p>
-
-<h2>Mailboxes</h2>
-<p><a href="{{ url_for('add_mailbox', domain=row.id) }}">Give someone a mailbox here</a></p>
-<table>
+{{ row.messages }} message(s) in the archive{% if row.newest %}, the newest at {{ row.newest }}{% endif %}.{% endset %}
+{%- set actions %}{{ listing_link(row, 'btn') }} \
+{{ journal_link(row.label, 'Journal for this domain', 'btn') }}{% endset %}
+{%- set crumbs %}<a href="{{ url_for('domains') }}">Domains</a> / <code>{{ row.label }}</code>{% endset %}
+<div class="stack">
+<section class="box">
+<div class="box-head"><h2>Mailboxes</h2><a class="btn btn-sm btn-primary" \
+href="{{ url_for('add_mailbox', domain=row.id) }}">Give someone a mailbox here</a></div>
+<div class="table-wrap"><table>
 {{ mailbox_head(()) }}
+<tbody>
 {%- for box in boxes %}
 {{ mailbox_row(box, ()) }}
 {%- endfor %}
-</table>
+</tbody>
+</table></div>
+</section>
 
-<h2>Spam</h2>
-<p>{% if row.spam_reaches_people %}Spam reaches every mailbox here.{% else %}Spam is kept
+<section class="box">
+<div class="box-head"><h2>Spam</h2><a class="btn btn-sm" \
+href="{{ url_for('domain_spam', domain_id=row.id) }}">Spam policy&hellip;</a></div>
+<div class="box-body"><p>{% if row.spam_reaches_people %}Spam reaches every mailbox here.{% else %}Spam is kept
 in the archive alone and reaches nobody here.{% endif %}
-A message scoring <strong>{{ row.spam_threshold }}</strong> or more is spam.</p>
-<p><a href="{{ url_for('domain_spam', domain_id=row.id) }}">Spam policy&hellip;</a></p>
+A message scoring <strong>{{ row.spam_threshold }}</strong> or more is spam.</p></div>
+</section>
 
-<h2>Outgoing mail too large to scan</h2>
-<p>The antivirus cannot scan a message over its own size limit. What leaves this domain
-then is this setting; an infected message and one the antivirus could not answer about
-are refused whatever it says.</p>
-{%- if outbound_refusal %}<p class="refusal">{{ outbound_refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('domain_outbound', domain_id=row.id) }}">
-  <label><input type="radio" name="outbound_unscanned" value="send"
-    {{ 'checked' if row.outbound_unscanned == 'send' }}> Send it unscanned</label>
-  <label><input type="radio" name="outbound_unscanned" value="refuse"
-    {{ 'checked' if row.outbound_unscanned == 'refuse' }}> Refuse it</label>
-  <p><button type="submit">Save</button></p>
-</form>
+{{ refused(outbound_refusal) }}
+{%- set about %}The antivirus cannot scan a message over its own size limit. What leaves this
+domain then is this setting; an infected message and one the antivirus could not answer about
+are refused whatever it says.{% endset %}
+{%- set choices -%}
+<label class="choice"><input type="radio" name="outbound_unscanned" value="send"
+{{- ' checked' if row.outbound_unscanned == 'send' }}><div><b>Send it unscanned</b></div></label>
+<label class="choice"><input type="radio" name="outbound_unscanned" value="refuse"
+{{- ' checked' if row.outbound_unscanned == 'refuse' }}><div><b>Refuse it</b></div></label>
+{%- if outbound_refusal %}<div class="field"><p class="help warn">{{ outbound_refusal }}</p></div>{% endif -%}
+{%- endset %}
+<section class="box"><div class="box-body settings">
+{{ setting(url_for('domain_outbound', domain_id=row.id), 'Outgoing mail too large to scan',
+           about, choices, 'Save') }}
+</div></section>
 
-<div class="danger">
-<h2>Danger zone</h2>
-<p>Deleting <code>{{ row.label }}</code> removes its archive, every mailbox in it and
-every name in them. It cannot be undone.</p>
+{%- set sentence %}Deleting <code>{{ row.label }}</code> removes its archive, every mailbox in it
+and every name in them. It cannot be undone.{% endset %}
 {%- if row.external_id %}
-<p>Refused: <code>{{ row.external_address }}</code> sits in front of this domain.
-Delete that external mailbox first; its deletion page offers to take the domain along.</p>
-<p><button type="button" disabled>Delete this domain</button></p>
+{%- set why %}Refused: <code>{{ row.external_address }}</code> sits in front of this domain.
+Delete that external mailbox first; its deletion page offers to take the domain along.{% endset %}
+{%- set control %}<span class="btn btn-danger" aria-disabled="true">Delete this domain</span>{% endset %}
 {%- else %}
-<p><a href="{{ url_for('delete_domain', domain_id=row.id) }}">Delete this domain&hellip;</a></p>
+{%- set control %}<a class="btn btn-danger" href="{{ url_for('delete_domain', domain_id=row.id) }}">\
+Delete this domain&hellip;</a>{% endset %}
 {%- endif %}
+{{ danger_zone(sentence, why, control) }}
 </div>
 """
 
-SPAM_PAGE = """
-<p class="crumbs"><a href="{{ url_for('domains') }}">Domains</a> /
-  <a href="{{ url_for('domain', domain_id=row.id) }}"><code>{{ row.label }}</code></a> / Spam</p>
-<h1>Spam at <code>{{ row.label }}</code></h1>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('domain_spam', domain_id=row.id) }}">
-  <label><input type="checkbox" name="reaches" value="yes" {{ 'checked' if typed.reaches }}>
-    Spam reaches people</label>
-  <p>With this off, a spam message stays in this domain's archive and reaches nobody: no
-  mailbox gets it, and a top-up does not bring it either. One message can still be handed
-  to one person by id.</p>
-  <label for="threshold">A message is spam at this score</label>
-  <input id="threshold" name="threshold" type="number" min="1.00" max="150.00" step="0.01"
-         value="{{ typed.threshold }}">
-  {%- if field == 'threshold' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <p>A changed threshold governs only mail arriving after the change: the verdict is
-  taken once as a message arrives and is kept with it. A message already in the archive
-  carries no marks at all whatever the switch says, because the marks go into the bytes
-  before delivery and a stored message is never rewritten.</p>
-  <p><button type="submit">Save spam policy</button>
-     <a href="{{ url_for('domain', domain_id=row.id) }}">Cancel, nothing changes</a></p>
+SPAM_PAGE = IN_FRONT + """
+{%- set heading %}Spam at <code>{{ row.label }}</code>{% endset %}
+{%- set crumbs %}{{ way(row) }} / Spam{% endset %}
+<form class="narrow" method="post" action="{{ url_for('domain_spam', domain_id=row.id) }}">
+{{ refused(refusal) }}
+<section class="box"><div class="box-body">
+<label class="choice"><input type="checkbox" name="reaches" value="yes"{{ ' checked' if typed.reaches }}>\
+<div><b>Spam reaches people</b><span>With this off, a spam message stays in this domain's archive
+and reaches nobody: no mailbox gets it, and a top-up does not bring it either. One message can
+still be handed to one person by id.</span></div></label>
+{%- set about %}A changed threshold governs only mail arriving after the change: the verdict is
+taken once as a message arrives and is kept with it. A message already in the archive carries
+no marks at all whatever the switch says, because the marks go into the bytes before delivery
+and a stored message is never rewritten.{% endset %}
+{{ field('A message is spam at this score', 'threshold', typed.threshold, type='number',
+         min='1.00', max='150.00', step='0.01', class_='short', help=about,
+         warn=refusal if fault == 'threshold') }}
+</div></section>
+<div class="form-foot"><button class="btn btn-primary" type="submit">Save spam policy</button>\
+<a class="btn" href="{{ url_for('domain', domain_id=row.id) }}">Cancel, nothing changes</a></div>
 </form>
 """
 
 ARCHIVE_PAGE = IN_FRONT + """
-<p class="crumbs"><a href="{{ url_for('domains') }}">Domains</a> /
-  <a href="{{ url_for('domain', domain_id=row.id) }}"><code>{{ row.label }}</code></a> / Archive</p>
-<h1><code>{{ archive }}@{{ row.label }}</code></h1>
-<p>{{ listing_link(row) }}</p>
-<p>The archive is this domain's canonical copy: every person's mailbox here is a hardlink
-into it. Its login is read-only and is shared by every administrator who reads this
-domain, so it is what changes when one of them leaves. Nothing reminds anyone to rotate
-it.</p>
+{%- set heading %}<code>{{ archive }}@{{ row.label }}</code>{% endset %}
+{%- set lede %}The archive is this domain's canonical copy: every person's mailbox here is a
+hardlink into it. Its login is read-only and is shared by every administrator who reads this
+domain, so it is what changes when one of them leaves. Nothing reminds anyone to rotate it.{% endset %}
+{%- set actions %}{{ listing_link(row, 'btn') }}{% endset %}
+{%- set crumbs %}{{ way(row) }} / Archive{% endset %}
+<div class="stack">
+<section class="box"><div class="box-body">
 <p>Status: {% if reading.waiting %}{{ reading.waiting }}. {{ reading.look_again }}
-{%- else %}active{% endif %}. {{ row.messages }} message(s).</p>
+{%- else %}<span class="badge ok">active</span>{% endif %}. {{ row.messages }} message(s).</p>
 <p>Not a person: it cannot be removed, transferred or topped up. Every person's mailbox
 here is a set of names on the archive's own files, and its login is read-only &mdash; an
 ACL of look, read and mark-seen.</p>
-<h2>Archive password</h2>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
-<form method="post" action="{{ url_for('archive_password', domain_id=row.id) }}">
-  <label for="password">New archive password</label>
-  <input id="password" name="password" type="password" autocomplete="new-password">
-  <label for="password2">New archive password again</label>
-  <input id="password2" name="password2" type="password" autocomplete="new-password">
-  <p><button type="submit">Replace the archive password</button></p>
-</form>
+</div></section>
+{{ refused(refusal) }}
+{%- set fields %}
+{{ field('New archive password', 'password', type='password', class_='mid',
+         autocomplete='new-password') }}
+{{ field('New archive password again', 'password2', type='password', class_='mid',
+         autocomplete='new-password', warn=refusal) }}
+{%- endset %}
+<section class="box"><div class="box-body settings">
+{{ setting(url_for('archive_password', domain_id=row.id), 'Archive password', none, fields,
+           'Replace the archive password', primary=true) }}
+</div></section>
+</div>
 """
 
-LISTING_PAGE = """
-<p class="crumbs"><a href="{{ url_for('domains') }}">Domains</a> /
-  <a href="{{ url_for('domain', domain_id=row.id) }}"><code>{{ row.label }}</code></a> / Archive listing</p>
-<h1>Archive listing for <code>{{ row.label }}</code></h1>
-<p>Four fields of each row: the date the message carries, when it arrived, who sent it
-and its subject. Never a body: this screen reads those columns of the ledger and this
+LISTING_PAGE = IN_FRONT + """
+{%- set heading %}Archive listing for <code>{{ row.label }}</code>{% endset %}
+{%- set lede %}Four fields of each row: the date the message carries, when it arrived, who sent
+it and its subject. Never a body: this screen reads those columns of the ledger and this
 process cannot open a mail file at all. The id is what
 <a href="{{ url_for('mailboxes', domain=row.id) }}">deliver one message by id</a> takes.
 A message with no date of its own reads <em>arrived</em> and its arrival time; a date is
-never invented.</p>
-<table>
-<tr><th>Date</th><th>From</th><th>Subject</th><th>Id</th><th>State</th><th>Score</th></tr>
+never invented.{% endset %}
+{%- set crumbs %}{{ way(row) }} / Archive listing{% endset %}
+<section class="box"><div class="table-wrap"><table>
+<thead><tr><th>Date</th><th>From</th><th>Subject</th><th class="num">Id</th><th>State</th>\
+<th class="num">Score</th></tr></thead>
+<tbody>
 {%- for message in messages %}
 <tr><td>{% if message.message_date %}{{ message.message_date }}
-    {%- else %}arrived {{ message.received_at }}
-    <span class="badge">no date in the message</span>{% endif %}</td>
-    <td><code>{{ message.sender or '' }}</code></td><td>{{ message.subject or '' }}</td>
-    <td><code class="message-id">{{ message.id }}</code></td>
+    {%- else %}<span class="muted">arrived</span> {{ message.received_at }}
+    <span class="row-sub"><span class="badge off">no date in the message</span></span>{% endif %}</td>
+    <td><code>{{ message.sender or '' }}</code></td><td class="wrap">{{ message.subject or '' }}</td>
+    <td class="num"><code class="message-id">{{ message.id }}</code></td>
     <td>{{ message.state }}{% if message.is_spam %} <span class="badge">spam</span>{% endif %}</td>
-    <td>{{ message.spam_score if message.spam_score is not none else '' }}</td></tr>
+    <td class="num">{{ message.spam_score if message.spam_score is not none else '' }}</td></tr>
 {%- else %}
 <tr><td colspan="6">Nothing in the archive yet.</td></tr>
 {%- endfor %}
-</table>
+</tbody>
+</table></div></section>
 """
 
-NOT_YET_PAGE = """
-<p class="crumbs"><a href="{{ url_for('domains') }}">Domains</a> /
-  <a href="{{ url_for('domain', domain_id=row.id) }}"><code>{{ row.label }}</code></a> / Archive listing</p>
-<h1>Waiting for the pipeline</h1>
-<p>The archive of <code>{{ row.label }}</code> is not there yet: its creation was asked
-for at {{ row.asked_at.strftime('%H:%M') }} and the pipeline has not performed it. There
-is nothing to list until it has.</p>
-<p><a href="{{ url_for('domain', domain_id=row.id) }}">Back to the domain</a></p>
+NOT_YET_PAGE = IN_FRONT + """
+{%- set heading %}Waiting for the pipeline{% endset %}
+{%- set crumbs %}{{ way(row) }} / Archive listing{% endset %}
+<div class="narrow">
+{%- set not_yet %}The archive of
+<code>{{ row.label }}</code> is not there yet: its creation was asked for at
+{{ row.asked_at.strftime('%H:%M') }} and the pipeline has not performed it. There is nothing
+to list until it has.{% endset %}
+{{ flash('attn', 'clock', not_yet) }}
+<p><a href="{{ url_for('domain', domain_id=row.id) }}">""" + common.BACK + """ Back to the domain</a></p>
+</div>
 """
 
-DELETE_PAGE = """
-<h1>Delete the domain <code>{{ row.label }}</code>?</h1>
+DELETE_PAGE = IN_FRONT + """
+{%- set heading %}Delete the domain <code>{{ row.label }}</code>?{% endset %}
+{%- set crumbs %}{{ way(row) }} / Delete{% endset %}
+<div class="stack narrow">
 {%- if row.external_id %}
-<p class="refusal">Refused: <code>{{ row.external_address }}</code> sits in front of this
-domain. Deleting the domain under it would take away the archive its mail is in.</p>
-<p>Delete that external mailbox first
+{%- set occupied %}<b>Refused: \
+<code>{{ row.external_address }}</code> sits in front of this domain.</b> Deleting the domain
+under it would take away the archive its mail is in. Delete that external mailbox first
 {%- if has_route('delete_external_mailbox') %} &mdash;
 <a href="{{ url_for('delete_external_mailbox', external_id=row.external_id) }}">its deletion
-page</a> offers to take this domain along{% endif %}.</p>
-<p><button type="button" disabled>Delete the domain</button></p>
-<p><a href="{{ url_for('domain', domain_id=row.id) }}">Cancel, nothing changes</a></p>
+page</a> offers to take this domain along{% endif %}.{% endset %}
+{{ refused(occupied) }}
 {%- else %}
+<section class="danger-zone">
+<div class="box-head"><h2>What goes</h2></div>
+<div class="box-body">
 <p>This is the largest destructive act in the interface. It removes:</p>
-<table>
-<tr><th>Messages removed</th><td>{{ numbers.messages }}</td></tr>
-<tr><th>Mailboxes removed</th><td>{{ numbers.mailboxes }}</td></tr>
-<tr><th>People who lose their only mailbox</th><td>{{ numbers.people }}</td></tr>
-</table>
-<p>Disk space is not stated: the store is hardlinked, so no per-domain byte count would
-be an honest one.</p>
-<form method="post" action="{{ url_for('delete_domain', domain_id=row.id) }}">
-  <p><button type="submit" class="danger">Delete <code>{{ row.label }}</code> and everything in it</button></p>
-</form>
-<p><a href="{{ url_for('domain', domain_id=row.id) }}">Cancel, nothing changes</a></p>
+<div class="kv"><div><b>{{ numbers.messages }}</b><span>Messages removed</span></div>\
+<div><b>{{ numbers.mailboxes }}</b><span>Mailboxes removed</span></div>\
+<div><b>{{ numbers.people }}</b><span>People who lose their only mailbox</span></div></div>
+<p class="muted">Disk space is not stated: the store is hardlinked, so no per-domain byte
+count would be an honest one.</p>
+<form class="form-foot" method="post" action="{{ url_for('delete_domain', domain_id=row.id) }}">\
+<button class="btn btn-danger-solid" type="submit">Delete <code>{{ row.label }}</code> and everything in it</button></form>
+</div>
+</section>
 {%- endif %}
+<p><a href="{{ url_for('domain', domain_id=row.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
+</div>
 """
 
 
@@ -340,7 +371,7 @@ def register(app_):
         typed = {"label": request.form.get("label", "") if request.method == "POST" else ""}
         if request.method == "GET":
             return app.render("Add domain", ADD_PAGE, section="domains", archive=ARCHIVE,
-                              typed=typed, refusal=None, field=None)
+                              typed=typed, refusal=None, fault=None)
         try:
             # ⛔ the order is the form's: the archive's password first, because a domain
             # created without one is the failure this act exists to prevent
@@ -391,7 +422,7 @@ def register(app_):
             typed = {"reaches": row["spam_reaches_people"],
                      "threshold": f"{row['spam_threshold']:.2f}"}
             return app.render(f"Spam at {row['label']}", SPAM_PAGE, section="domains",
-                              row=row, typed=typed, refusal=None, field=None)
+                              row=row, typed=typed, refusal=None, fault=None)
 
         # ⚠️ the switch comes back in the position it was LEFT IN, not as the column
         # stands: a refusal must not silently undo the half of the form that parsed
@@ -401,8 +432,8 @@ def register(app_):
             threshold = validate.spam_threshold(typed["threshold"])
         except validate.Refused as refused:
             return app.render(f"Spam at {row['label']}", SPAM_PAGE, section="domains",
-                              status=400, row=row, typed=typed, refusal=str(refused),
-                              field="threshold")
+                              status=400, row=row, typed=typed,
+                              refusal=str(refused), fault="threshold")
 
         before = {"spam_reaches_people": row["spam_reaches_people"],
                   "spam_threshold": row["spam_threshold"]}
@@ -482,7 +513,8 @@ def register(app_):
         occupied = row["external_id"] is not None
         if request.method == "GET" or occupied:
             numbers = common.one(conn, NUMBERS, {"id": domain_id})
-            return app.render(f"Delete {row['label']}?", DELETE_PAGE, status=400 if occupied else 200,
+            return app.render(f"Delete {row['label']}?", DELETE_PAGE, section="domains",
+                              status=400 if occupied else 200,
                               row=row, numbers=numbers)
         request_id = common.ask(conn, "delete_domain", row["label"],
                                 {"domain_id": domain_id}, g.identity)
@@ -493,9 +525,9 @@ def register(app_):
 
 # --- writing --------------------------------------------------------------------------------
 
-def refuse_add(typed, refusal, field):
+def refuse_add(typed, refusal, fault):
     return app.render("Add domain", ADD_PAGE, section="domains", status=400,
-                      archive=ARCHIVE, typed=typed, refusal=refusal, field=field)
+                      archive=ARCHIVE, typed=typed, refusal=refusal, fault=fault)
 
 
 def archive_page(conn, row, status=200, refusal=None):

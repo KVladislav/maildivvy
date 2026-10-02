@@ -24,6 +24,7 @@ from another program. Jinja escapes both; nothing here marks either safe.
 from flask import request
 
 from maildivvy.admin import app, journal, validate
+from maildivvy.admin.screens import common
 
 HELP = "Exact match — the address, the label or the login as the journal writes it."
 NOTHING = "No journal row matches this filter."
@@ -34,61 +35,72 @@ OUTLIVES = ("Every row ever written for this target is shown, including rows wri
             "describes.")
 ANY = "any"
 
+# ⚠️ The design's components: the filter is a form in its own box above the one
+# table, its identifiers typed in `mono-input`s; a refused date is a `flash bad` above it
+# and a `help warn` under the field. Kinds and targets are `code` (the Identifier Is Mono
+# Rule); the detail stays escaped JSON text in `code`. The crumb is the way back to the
+# section the link came from, and nothing at all when `back` named no declared section.
 PAGE = """
-<h1>Journal</h1>
-{%- if crumb %}
-<p class="crumbs"><a href="{{ crumb.url }}">Back to {{ crumb.title }}</a></p>
-{%- endif %}
-<p>Who did what, when, and to whom. Views and refused attempts are not written here, and
+{%- set heading %}Journal{% endset %}
+{%- set lede %}Who did what, when, and to whom. Views and refused attempts are not written here, and
 a provider password never appears in it in any form. An act the pipeline performs carries
-the outcome of the request that was asked for.</p>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
+the outcome of the request that was asked for.{% endset %}
+{%- set crumbs %}{%- if crumb -%}
+<a href="{{ crumb.url }}">""" + common.BACK + """ Back to {{ crumb.title }}</a>
+{%- endif -%}{% endset %}
+{{ refused(refusal) }}
+<div class="stack">
+<section class="box"><div class="box-body">
 <form method="get" action="{{ url_for('events') }}">
-  <label for="who">Who</label>
-  <input id="who" name="who" value="{{ typed.who }}">
-  <label for="action">Act</label>
+<div class="inline-fields">
+  {{ field('Who', 'who', typed.who, class_='mono-input') }}
+  <div class="field"><label for="action">Act</label>
   <select id="action" name="action">
     <option value="" {{ 'selected' if not typed.action }}>{{ any_act }}</option>
     {%- for act in acts %}
     <option value="{{ act }}" {{ 'selected' if typed.action == act }}>{{ act }}</option>
     {%- endfor %}
-  </select>
-  <label for="target">Target</label>
-  <input id="target" name="target" value="{{ typed.target }}">
-  <span>{{ help }}</span>
-  {%- if field == 'target' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="since">From</label>
-  <input id="since" name="since" value="{{ typed.since }}">
-  {%- if field == 'since' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="until">To</label>
-  <input id="until" name="until" value="{{ typed.until }}">
-  {%- if field == 'until' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  {%- if crumb %}<input type="hidden" name="back" value="{{ crumb.section }}">{% endif %}
-  <p><button type="submit">Filter</button>
-     <a href="{{ url_for('events') }}">Show everything</a></p>
+  </select></div>
+  {{ field('Target', 'target', typed.target, help=help,
+           warn=refusal if fault == 'target', class_='mono-input') }}
+  {{ field('From', 'since', typed.since, warn=refusal if fault == 'since',
+           class_='mono-input') }}
+  {{ field('To', 'until', typed.until, warn=refusal if fault == 'until',
+           class_='mono-input') }}
+</div>
+{%- if crumb %}<input type="hidden" name="back" value="{{ crumb.section }}">{% endif %}
+<div class="form-foot"><button class="btn" type="submit">Filter</button> \
+<a href="{{ url_for('events') }}">Show everything</a></div>
 </form>
-<table>
-<tr><th>When</th><th>Who</th><th>Act</th><th>Target</th><th>Detail</th>
-    <th>Break-glass</th></tr>
+</div></section>
+{%- if capped %}
+{{ flash('attn', 'alert', capped) }}
+{%- endif %}
+<section class="box"><div class="table-wrap"><table>
+<thead><tr><th>When</th><th>Who</th><th>Act</th><th>Target</th><th>Detail</th>\
+<th>Break-glass</th></tr></thead>
+<tbody>
 {%- for row in rows %}
 <tr>
   <td>{{ row.at }}</td>
   <td><code>{{ row.actor }}</code></td>
-  <td><code>{{ row.action }}</code></td>
-  <td><code>{{ row.target or '' }}</code></td>
-  <td><code>{{ detail[row.id] }}</code>
+  <td><code>{{ row.action }}</code></td><td><code>{{ row.target or '' }}</code></td>
+  <td class="wrap"><code>{{ detail[row.id] }}</code>
       {%- if row.request_id %}
-      <div class="outcome">the request it asked for: {{ row.request_state }}
-      {%- if row.request_result %} &mdash; {{ row.request_result }}{% endif %}</div>
+      <span class="row-sub">the request it asked for: {{ row.request_state }}
+      {%- if row.request_result %} &mdash; {{ row.request_result }}{% endif %}</span>
       {%- endif %}</td>
   <td>{{ 'yes' if row.break_glass else 'no' }}</td>
 </tr>
 {%- else %}
 <tr><td colspan="6">{{ nothing }}</td></tr>
 {%- endfor %}
-</table>
-{%- if capped %}<p class="notice">{{ capped }}</p>{% endif %}
-{%- if typed.target %}<footer>{{ outlives }}</footer>{% endif %}
+</tbody>
+</table></div></section>
+{%- if typed.target %}
+<p class="muted">{{ outlives }}</p>
+{%- endif %}
+</div>
 """
 
 
@@ -124,17 +136,17 @@ def register(app_):
         conn = app.connection()
         typed = {name: request.args.get(name, "") or ""
                  for name in ("who", "action", "target", "since", "until", "back")}
-        field, refusal = None, None
+        fault, refusal = None, None
         since = until = None
         try:
             since = journal.date_filter(typed["since"])
         except validate.Refused as refused:
-            field, refusal = "since", str(refused)
+            fault, refusal = "since", str(refused)
         if refusal is None:
             try:
                 until = journal.date_filter(typed["until"])
             except validate.Refused as refused:
-                field, refusal = "until", str(refused)
+                fault, refusal = "until", str(refused)
 
         rows = ([] if refusal else
                 journal.rows(conn, who=typed["who"], action=typed["action"],
@@ -147,4 +159,4 @@ def register(app_):
                                   for row in rows},
                           capped=(CAPPED.format(limit=journal.LIMIT)
                                   if len(rows) >= journal.LIMIT else None),
-                          crumb=crumb_for(typed["back"]), field=field, refusal=refusal)
+                          crumb=crumb_for(typed["back"]), fault=fault, refusal=refusal)

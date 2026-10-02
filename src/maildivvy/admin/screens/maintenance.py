@@ -46,48 +46,56 @@ WITHHELD = ("Message {message_id} is withheld. Only a release gives a withheld m
             "anybody, and a release gives it to everybody who receives in the domain.")
 FOLLOWS = "The count follows a valid range."
 
+# ⚠️ The recount is a GET form of its own, so the typed dates travel in the URL; the run is
+# the one POST, with the dates it was counted for carried along hidden. A refused date is a
+# flash above both and the same sentence in that field's `help warn` line.
 PAGE = """
-<p class="crumbs"><a href="{{ url_for('mailboxes') }}">Mailboxes</a> /
-  <a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a>
-  / Top up</p>
-<h1>Top up <code>{{ box.address }}</code></h1>
-<p>A top-up delivers what never arrived in this mailbox. It does not put back what the
+{%- set heading %}Top up <code>{{ box.address }}</code>{% endset %}
+{%- set lede %}A top-up delivers what never arrived in this mailbox. It does not put back what the
 person deleted on purpose; <a href="{{ url_for('mailbox', mailbox_id=box.id) }}">deliver
-one message by id</a> does that.</p>
-{%- if refusal and not field %}<p class="refusal">{{ refusal }}</p>{% endif %}
-
-<h2>Recount a range</h2>
+one message by id</a> does that.{% endset %}
+{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / \
+<a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a> / Top up{% endset %}
+<div class="stack narrow">
+{{ refused(refusal) }}
 <form method="get" action="{{ url_for('top_up', mailbox_id=box.id) }}">
-  <label for="since">From</label>
-  <input id="since" name="since" value="{{ typed.since }}">
-  {%- if field == 'since' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <label for="until">To</label>
-  <input id="until" name="until" value="{{ typed.until }}">
-  {%- if field == 'until' %}<span class="field-refusal">{{ refusal }}</span>{% endif %}
-  <p><button type="submit">Recount</button>
-  {%- if ranged is none %} <span class="field-refusal">{{ follows }}</span>{% endif %}</p>
+<section class="box"><div class="box-head"><h2>Recount a range</h2></div><div class="box-body">
+<div class="inline-fields">
+{{ field('From', 'since', typed.since, class_='mid mono-input',
+         warn=refusal if fault == 'since') }}
+{{ field('To', 'until', typed.until, class_='mid mono-input',
+         warn=refusal if fault == 'until') }}
+</div>
+<div class="form-foot"><button class="btn" type="submit">Recount</button>
+{%- if ranged is none %} <span class="muted">{{ follows }}</span>{% endif %}</div>
+</div></section>
 </form>
 
-<h2>Run it</h2>
 <form method="post" action="{{ url_for('top_up', mailbox_id=box.id) }}">
-  <label><input type="radio" name="choice" value="range"
-    {{ 'checked' if typed.choice != 'all' }}> Between two dates</label>
-  <p>{% if ranged is none %}{{ follows }}{% else %}<span class="would-deliver">{{ ranged }} message(s) would be delivered</span>,
+<section class="box"><div class="box-head"><h2>Run it</h2></div><div class="box-body">
+<div class="kv">
+{%- if ranged is not none %}<div><b>{{ ranged }}</b><span>Between two dates</span></div>{% endif -%}
+<div><b>{{ everything }}</b><span>All of it</span></div></div>
+<label class="choice"><input type="radio" name="choice" value="range"
+  {{- ' checked' if typed.choice != 'all' }}><div><b>Between two dates</b>
+  <span>{% if ranged is none %}{{ follows }}{% else %}<span class="would-deliver">{{ ranged }} message(s) would be delivered</span>,
   from {{ typed.since }} to {{ typed.until }} inclusive &mdash; both ends are whole
-  calendar days, so a range of one day is that day entire.{% endif %}</p>
-  <input type="hidden" name="since" value="{{ typed.since }}">
-  <input type="hidden" name="until" value="{{ typed.until }}">
-  <label><input type="radio" name="choice" value="all"
-    {{ 'checked' if typed.choice == 'all' }}> All of it</label>
-  <p><span class="would-deliver">{{ everything }} message(s) would be delivered</span> to
+  calendar days, so a range of one day is that day entire.{% endif %}</span></div></label>
+<input type="hidden" name="since" value="{{ typed.since }}">
+<input type="hidden" name="until" value="{{ typed.until }}">
+<label class="choice"><input type="radio" name="choice" value="all"
+  {{- ' checked' if typed.choice == 'all' }}><div><b>All of it</b>
+  <span><span class="would-deliver">{{ everything }} message(s) would be delivered</span> to
   <code>{{ box.address }}</code>. Each one becomes a header entry in this person's mail
-  client cache, which has a ceiling of its own.</p>
-  <p><button type="submit">Top up</button>
-     <a href="{{ url_for('mailbox', mailbox_id=box.id) }}">Cancel, nothing changes</a></p>
+  client cache, which has a ceiling of its own.</span></div></label>
+</div></section>
+<div class="form-foot"><button class="btn btn-primary" type="submit">Top up</button>\
+<a class="btn" href="{{ url_for('mailbox', mailbox_id=box.id) }}">Cancel, nothing changes</a></div>
 </form>
-<p>The count is the same selection the pipeline delivers: messages of
+<p class="muted">The count is the same selection the pipeline delivers: messages of
 <code>{{ box.label }}</code> that are in the archive, that this mailbox has not been
 given, and &mdash; unless the domain lets spam reach people &mdash; that are not spam.</p>
+</div>
 """
 
 
@@ -131,15 +139,15 @@ def register(app_):
         typed = {"since": values.get("since", since) or "",
                  "until": values.get("until", until) or "",
                  "choice": values.get("choice", "range")}
-        field, refusal = typed_range(typed)
+        fault, refusal = typed_range(typed)
 
         if request.method == "GET":
-            return page(conn, box, typed, field, refusal)
+            return page(conn, box, typed, fault, refusal)
         if typed["choice"] == "all":
             # ⚠️ a wide EXPLICIT pair: the person was shown its number on this page
             asked_since, asked_until = WIDE_SINCE, WIDE_UNTIL
         elif refusal:
-            return page(conn, box, typed, field, refusal)
+            return page(conn, box, typed, fault, refusal)
         else:
             asked_since, asked_until = typed["since"], typed["until"]
 
@@ -182,9 +190,9 @@ def card(conn, box, refusal, typed):
     return mailboxes.card(conn, box, 400, "deliver", refusal, typed)
 
 
-def page(conn, box, typed, field=None, refusal=None):
+def page(conn, box, typed, fault=None, refusal=None):
     ranged = (None if refusal else count(conn, box, typed["since"], typed["until"]))
     return app.render(f"Top up {box['address']}", PAGE, section="mailboxes",
                       status=400 if refusal else 200, box=box, typed=typed,
-                      field=field, refusal=refusal, follows=FOLLOWS, ranged=ranged,
+                      fault=fault, refusal=refusal, follows=FOLLOWS, ranged=ranged,
                       everything=count(conn, box, WIDE_SINCE, WIDE_UNTIL))

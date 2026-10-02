@@ -35,43 +35,46 @@ SELECT m.id, m.received_at, m.sender, m.subject, m.is_spam, m.spam_score,
  WHERE m.state = 'withheld'
 """
 
-PAGE = """
-<h1>Withheld messages</h1>
-<p>Each of these was held back by the filtering. Everyone who would have received it
+# ⚠️ The design's voices: *Release* is a plain small button on its row, not the
+# prototype's red one, because it destroys nothing and red stays inside the fence.
+# A waiting release reads in the reason's cell, amber, and its row offers no control.
+PAGE = """{%- set heading %}Withheld messages{% endset %}
+{%- set lede %}Each of these was held back by the filtering. Everyone who would have received it
 holds a report standing in for it instead, so nothing is missing without a trace, and
-leaving a message here needs no action at all.</p>
-<p>Releasing gives the message to everyone who receives in its domain &mdash; blocked
+leaving a message here needs no action at all.
+Releasing gives the message to everyone who receives in its domain &mdash; blocked
 people included, since a blocked person still receives &mdash; and
 removes the report from everyone holding it.
 It overrides the domain's spam policy, deliberately: somebody asked for this message to
-go out.</p>
-<table>
-<tr><th>Arrived</th><th>Domain</th><th>From</th><th>Subject</th><th>Why it was held</th>
-    <th>Actions</th></tr>
+go out.{% endset %}
+{{ refused(refusal) }}
+<section class="box"><div class="table-wrap"><table>
+<thead><tr><th>Arrived</th><th>Domain</th><th>From</th><th>Subject</th><th>Why it was held</th>\
+<th class="acts">Actions</th></tr></thead>
+<tbody>
 {%- for row in messages %}
+{%- set said = reading[row.id] %}
 <tr>
   <td>{{ row.received_at }}</td>
   <td><a href="{{ url_for('domain', domain_id=row.domain_id) }}"><code>{{ row.label }}</code></a></td>
   <td><code>{{ row.sender or '(no sender)' }}</code></td>
   <td>{{ row.subject or '(no subject)' }}</td>
-  <td>{{ row.why or no_report }}</td>
-  <td>
-  {%- if reading[row.id].waiting -%}
-  {{ reading[row.id].waiting }}<div class="look-again">{{ reading[row.id].look_again }}</div>
-  <div>waiting for the pipeline</div>
-  {%- else -%}
-  {%- if reading[row.id].failed %}<div class="field-refusal">the pipeline could not do it:
-  {{ reading[row.id].failed }}</div>{% endif -%}
-  <form method="post" action="{{ url_for('release_message', message_id=row.id) }}">
-    <button type="submit">Release&hellip;</button></form>
-  {%- endif -%}
-  </td>
+  <td class="wrap">{{ row.why or no_report }}
+  {%- if said.waiting %}<span class="row-sub state-attn"><svg class="icon attn"><use href="#i-clock"/></svg> {{ said.waiting }}</span>\
+<span class="row-sub">{{ said.look_again }}</span>
+  {%- elif said.failed %}{{ pipeline_failed(said.failed) }}
+  {%- endif %}</td>
+  <td class="acts">
+  {%- if said.waiting %}<span class="muted">waiting for the pipeline</span>
+  {%- else %}<form method="post" action="{{ url_for('release_message', message_id=row.id) }}">\
+<button class="btn btn-sm" type="submit">Release&hellip;</button></form>
+  {%- endif %}</td>
 </tr>
 {%- else %}
 <tr><td colspan="6">Nothing is withheld.</td></tr>
 {%- endfor %}
-</table>
-{%- if refusal %}<p class="refusal">{{ refusal }}</p>{% endif %}
+</tbody>
+</table></div></section>
 """
 
 

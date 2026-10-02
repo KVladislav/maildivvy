@@ -80,71 +80,74 @@ NOTHING = ("Nothing needs anybody right now: health's current report holds no FA
            "everything it was asked for in the last day.")
 
 PAGE = """
-<h1>Overview</h1>
-
-<h2>Needs attention</h2>
-{%- if worries or withheld.waiting or failures.count or health.failing
-      or health.condition != 'current' %}
-<ul>
+{%- set heading %}Overview{% endset %}
+{%- set worried = worries or withheld.waiting or failures.count or health.failing
+                  or health.condition != 'current' %}
+<div class="stack">
+<section class="box{{ ' attn-box' if worried }}"><div class="box-head"><h2>Needs attention</h2></div>
+{%- if worried %}
+<ul class="list">
 {%- if health.condition == 'unreadable' %}
-<li><a href="{{ url_for('health') }}">No health report could be read</a>:
-{{ health.why }}. Nothing here says the machine is well.</li>
+<li><svg class="icon bad ico"><use href="#i-alert"/></svg><div><a href="{{ url_for('health') }}">No health report could be read</a>:
+{{ health.why }}. Nothing here says the machine is well.</div></li>
 {%- elif health.condition == 'stale' %}
-<li><a href="{{ url_for('health') }}">Health's report of {{ health.taken }}</a> is
-{{ health.why }}.</li>
+<li><svg class="icon attn ico"><use href="#i-clock"/></svg><div><a href="{{ url_for('health') }}">Health's report of {{ health.taken }}</a> is
+{{ health.why }}.</div></li>
 {%- endif %}
 {%- for failed in health.failing %}
-<li><a href="{{ url_for('health') }}"><code>{{ failed.name }}</code> is FAIL</a> in
+<li><svg class="icon bad ico"><use href="#i-alert"/></svg><div><a href="{{ url_for('health') }}"><code>{{ failed.name }}</code> is <span class="badge bad">FAIL</span></a> in
 health's report of {{ health.taken }}: <code>{{ failed.check }}</code> &mdash;
-{{ failed.problem }}</li>
+{{ failed.problem }}</div></li>
 {%- endfor %}
 {%- for worry in worries %}
-<li>{{ worry.words }}
+<li><svg class="icon {{ 'attn' if worry.frozen else 'bad' }} ico"><use href="#i-alert"/></svg><div>{{ worry.words }}
   <a href="{{ url_for('external_mailbox', external_id=worry.id) }}"><code>{{ worry.address }}</code></a>
   {%- if worry.frozen %} &mdash; <a href="{{ url_for('fetch') }}">the fetch screen</a>{% endif %}
-  {%- if worry.skip %}<div>{{ worry.skip }}</div>{% endif %}</li>
+  {%- if worry.skip %}<div>{{ worry.skip }}</div>{% endif %}</div></li>
 {%- endfor %}
 {%- if withheld.waiting %}
-<li><a href="{{ url_for('withheld') }}">{{ withheld.waiting }} withheld message(s)</a>,
-the oldest from {{ withheld.oldest }}. Leaving them withheld needs no action.</li>
+<li><svg class="icon attn ico"><use href="#i-clock"/></svg><div><a href="{{ url_for('withheld') }}">{{ withheld.waiting }} withheld message(s)</a>,
+the oldest from {{ withheld.oldest }}. Leaving them withheld needs no action.</div></li>
 {%- endif %}
 {%- if failures.count %}
-<li><a href="{{ url_for('events') }}">{{ failures.count }} request(s) the pipeline could
+<li><svg class="icon bad ico"><use href="#i-alert"/></svg><div><a href="{{ url_for('events') }}">{{ failures.count }} request(s) the pipeline could
 not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
 <code>{{ failures.target or '' }}</code> at {{ failures.at }} &mdash;
-{{ failures.reason }}</li>
+{{ failures.reason }}</div></li>
 {%- endif %}
 </ul>
 {%- else %}
-<p>{{ nothing }}</p>
+<div class="box-body"><p>{{ nothing }}</p></div>
 {%- endif %}
+</section>
 
-<h2>Sections</h2>
-<table>
+<section class="box"><div class="box-head"><h2>Sections</h2></div>
+<div class="table-wrap"><table>
+<tbody>
 <tr>
   <td><a href="{{ url_for('external') }}">External mailboxes</a></td>
   <td>{{ external.enabled }} enabled, {{ external.disabled }} disabled
       {%- if external.enabling %}, {{ external.enabling }} asked to enable{% endif %}.</td>
-  <td><a href="{{ url_for('add_external') }}">Add one</a></td>
+  <td class="acts"><a href="{{ url_for('add_external') }}">Add one</a></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('domains') }}">Domains</a></td>
   <td>{{ domains.domains }} domain(s){% if domains.free %}, {{ domains.free }} free:
       {% for label in free_labels %}<code>{{ label }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
       &mdash; nothing arrives for them and nothing leaves{% else %}, none free{% endif %}.</td>
-  <td><a href="{{ url_for('add_domain') }}">Add one</a></td>
+  <td class="acts"><a href="{{ url_for('add_domain') }}">Add one</a></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('accounts') }}">People</a></td>
   <td>{{ people.people }} person(s), {{ people.blocked }} blocked,
       {{ people.administrators }} administrator(s).</td>
-  <td><a href="{{ url_for('add_account') }}">Add one</a></td>
+  <td class="acts"><a href="{{ url_for('add_account') }}">Add one</a></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('mailboxes') }}">Mailboxes</a></td>
   <td>{{ boxes.mailboxes }} across {{ boxes.domains }} domain(s), and
       {{ boxes.archives }} archive(s).</td>
-  <td><a href="{{ url_for('add_mailbox') }}">Give one</a></td>
+  <td class="acts"><a href="{{ url_for('add_mailbox') }}">Give one</a></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('fetch') }}">Fetch</a></td>
@@ -152,19 +155,19 @@ not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
       {%- if next_by %} Next by {{ next_by }}, the fetch timer's own period ({{ period }}).
       {%- else %} The fetch timer's period could not be read from the machine.{% endif %}
       {{ external.refused }} refused, {{ external.frozen }} frozen.</td>
-  <td></td>
+  <td class="acts"></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('withheld') }}">Withheld messages</a></td>
   <td>{{ withheld.waiting }} waiting.</td>
-  <td></td>
+  <td class="acts"></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('events') }}">Journal</a></td>
   <td>{% if last_act %}Last act <code>{{ last_act.action }}</code> on
       <code>{{ last_act.target or '' }}</code> by <code>{{ last_act.actor }}</code>,
       {{ last_act.at }}.{% else %}Nothing written yet.{% endif %}</td>
-  <td></td>
+  <td class="acts"></td>
 </tr>
 <tr>
   <td><a href="{{ url_for('health') }}">Health</a></td>
@@ -173,9 +176,12 @@ not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
       {% if health.condition == 'stale' %}stale: {{ health.age }}
       {%- if health.age != 'dated in the future' %} old{% endif %}.
       {%- else %}{{ health.age }} old.{% endif %}{% endif %}</td>
-  <td></td>
+  <td class="acts"></td>
 </tr>
-</table>
+</tbody>
+</table></div>
+</section>
+</div>
 """
 
 

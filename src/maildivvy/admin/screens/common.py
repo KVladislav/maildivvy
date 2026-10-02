@@ -22,6 +22,7 @@ import json
 from contextlib import contextmanager
 
 from flask import g, redirect, request, url_for
+from markupsafe import Markup, escape
 
 from maildivvy.admin import journal, validate
 # how long the pipeline takes, read off the installed timer; the reading
@@ -308,3 +309,111 @@ def record(conn, action, target, detail=None, request_id=None):
     journal.record(conn, actor=g.identity.login, action=action, target=target,
                    detail=detail, break_glass=g.identity.break_glass,
                    request_id=request_id)
+
+
+# --- the shapes several screens share, in the design's components --------------------
+#
+# Each returns `Markup` and is a global of every template, so a screen calls it from its own
+# template: `{{ field('Label', 'label', typed.label, warn=refusal if fault == 'label') }}`.
+# Everything they are given is escaped unless it is already `Markup` (a `{% set %}` block
+# is), so a typed value or a pipeline's reason is text, never markup.
+
+# the way back, drawn beside "Cancel, nothing changes" and "Back to ..."
+BACK = """<svg class="icon"><use href="#i-back"/></svg>"""
+
+
+def attributes(values):
+    """HTML attributes from keywords: `class_` is `class`, `aria_label` is `aria-label`; a
+    true value is written bare, a false or missing one not at all."""
+    written = []
+    for name, value in values.items():
+        name = name.rstrip("_").replace("_", "-")
+        if value is None or value is False:
+            continue
+        written.append(f" {name}" if value is True else f' {name}="{escape(value)}"')
+    return Markup("".join(written))
+
+
+def flash(tone, icon, sentence):
+    """A flash: the `flash` box in its tone (`ok`, `attn`, `bad`, `info`), the named icon
+    of the shell's set and the sentence, or nothing at all when there is no sentence."""
+    if not sentence:
+        return Markup("")
+    return Markup('<div class="flash {}"><svg class="icon {} ico"><use href="#i-{}"/>'
+                  '</svg><div>{}</div></div>').format(tone, tone, icon, sentence)
+
+
+def refused(sentence):
+    """A refusal: the red flash with the alert, or nothing when there is none."""
+    return flash("bad", "alert", sentence)
+
+
+# what a row says when the pipeline failed its newest request, before the pipeline's reason
+FAILED = "the pipeline could not do it: "
+
+
+def pipeline_failed(reason):
+    """The worded red line beneath a row whose newest request failed, or nothing."""
+    if not reason:
+        return Markup("")
+    return Markup('<span class="row-sub state-bad"><svg class="icon bad"><use href="#i-x"/>'
+                  '</svg> {}{}</span>').format(FAILED, reason)
+
+
+def pipeline_flash(reading):
+    """A page's own row as `queue_reading` read it: an amber flash while the pipeline owes
+    it something, the refusal when it failed, or nothing."""
+    if reading["waiting"]:
+        return flash("attn", "clock", f"{reading['waiting']}. {reading['look_again']}.")
+    if reading["failed"]:
+        return refused(FAILED + reading["failed"])
+    return Markup("")
+
+
+def field(label, name, value=None, type="text", help=None, warn=None, **attrs):
+    """A labelled input, its help line, and the refusal beside it in `help warn`.
+
+    ⛔ A password field is never filled back in: its value is dropped here,
+    whatever the screen hands over.
+    """
+    if type == "password" or value == "":
+        value = None
+    control = Markup('<input id="{}" name="{}" type="{}"{}{}>').format(
+        name, name, type, attributes({"value": value}), attributes(attrs))
+    lines = Markup("")
+    if help:
+        lines += Markup('<p class="help">{}</p>').format(help)
+    if warn:
+        lines += Markup('<p class="help warn">{}</p>').format(warn)
+    return Markup('<div class="field"><label for="{}">{}</label>{}{}</div>').format(
+        name, label, control, lines)
+
+
+def danger_zone(sentence, about, control):
+    """The red frame, its head and the one `zone-row` of its act: the sentence, its detail
+    (or None) and the control."""
+    detail = Markup('<p class="muted">{}</p>').format(about) if about else ""
+    return Markup('<section class="danger-zone"><div class="box-head"><h2>Danger zone</h2>'
+                  '</div><div class="zone-row"><div><b>{}</b>{}</div>{}</div></section>'
+                  ).format(sentence, detail, control)
+
+
+def setting(action, title, about, fields, button, primary=False):
+    """One `form.setting` row: its title and description left, its fields and its own
+    button right. The design keeps the primary for the row that sets a password. With no
+    button (None) the row is a plain `div.setting`: something to read, nothing to send."""
+    about = Markup('<p class="about">{}</p>').format(about) if about else ""
+    if button is None:
+        return Markup('<div class="setting"><div><h2 class="st">{}</h2>{}</div>'
+                      '<div>{}</div></div>').format(title, about, fields)
+    kind = "btn btn-primary" if primary else "btn"
+    return Markup(
+        '<form class="setting" method="post" action="{}">'
+        '<div><h2 class="st">{}</h2>{}</div>'
+        '<div>{}<div class="form-foot"><button class="{}" type="submit">{}</button></div></div>'
+        '</form>').format(action, title, about, fields, kind, button)
+
+
+SHAPES = {"field": field, "danger_zone": danger_zone, "setting": setting, "flash": flash,
+          "refused": refused, "pipeline_failed": pipeline_failed,
+          "pipeline_flash": pipeline_flash}

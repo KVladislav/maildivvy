@@ -11,13 +11,14 @@ only the database behind the sidebar's counts and the overview's rows is stood i
 
 import datetime
 import json
+import re
 from pathlib import Path
 
 import pytest
 from flask import Flask
 
 from maildivvy.admin import app as application
-from maildivvy.admin import auth
+from maildivvy.admin import auth, style
 from maildivvy.admin.screens import common
 from maildivvy.admin.screens import health as screen
 from maildivvy.admin.screens import (accounts, domains, events, external, fetch, mailboxes,
@@ -236,33 +237,66 @@ def main_of(response):
     return html.split("<main>", 1)[1].split("</main>", 1)[0]
 
 
+VOICES = {"PASS": "ok", "WARN": "attn", "FAIL": "bad", "UNKNOWN": "off"}
+
+
 def test_the_screen_lists_every_subsystem_its_state_and_every_check(client, files):
     write(files["report"], MIXED)
     shown = main_of(client.get("/health"))
-    assert "<h1>Health</h1>" in shown
+    assert "<h1>Health</h1>" in shown and shown.count("<h1") == 1
     assert "2026-09-29 14:00:04 UTC" in shown and "3 minutes" in shown
     assert "the health timer's own period (5 minutes)" in shown
     for name in ("host", "antivirus", "tls", "network"):
         assert f"<code>{name}</code>" in shown, name
-    for state in ("PASS", "WARN", "UNKNOWN", "FAIL"):
-        assert f'<span class="badge state-{state.lower()}">{state}</span>' in shown, state
+    # each state in the design's voice, always with its word
+    for state, voice in VOICES.items():
+        assert f'<span class="badge {voice}">{state}</span>' in shown, state
     assert "ClamAV is not answering: incoming mail waits at the provider" in shown
     assert "no outside probe result is recorded: run the outside probe" in shown
-    assert 'class="banner"' not in shown
+    assert 'class="flash' not in shown and "state-" not in shown
 
 
-def test_a_stale_report_is_a_banner_above_the_table(client, files):
+def test_each_subsystem_is_a_box_whose_checks_form_a_table(client, files):
+    write(files["report"], MIXED)
+    shown = main_of(client.get("/health"))
+    boxes = re.findall(r'<section class="box">(.*?)</section>', shown, re.S)
+    assert len(boxes) == len(MIXED)
+    antivirus = next(b for b in boxes if "<code>antivirus</code>" in b)
+    assert ('<div class="box-head"><h2><code>antivirus</code></h2>'
+            '<span class="badge bad">FAIL</span></div>') in antivirus
+    assert antivirus.count("<table>") == 1 and antivirus.count("<tr>") == 2
+    daemon = antivirus.split("<code>daemon</code>", 1)[0].rsplit("<tr>", 1)[1]
+    assert '<td class="state"><span class="badge bad">FAIL</span></td>' in daemon
+    row = antivirus.split("<code>daemon</code>", 1)[1].split("</tr>", 1)[0]
+    assert (': no answer on /run/clamav/clamd.ctl<span class="row-sub">ClamAV is not '
+            'answering: incoming mail waits at the provider</span>') in row
+    # the closing sentence is a muted paragraph after the boxes, and no footer
+    assert "<footer" not in shown
+    assert '<p class="muted">This screen shows what health' in shown.rsplit("</section>", 1)[1]
+
+
+def test_a_report_with_no_subsystem_says_so_in_a_box(client, files):
+    write(files["report"], [])
+    shown = main_of(client.get("/health"))
+    assert ('<section class="box"><div class="box-body"><p>The report holds no subsystem.'
+            '</p></div></section>') in shown
+
+
+def test_a_stale_report_is_a_flash_attn_above_the_subsystems(client, files):
     write(files["report"], MIXED, taken_at=NOW - datetime.timedelta(minutes=42))
     shown = main_of(client.get("/health"))
-    # a stale report is a warning: the WARN palette, on the banner itself
-    banner = shown.split('<p class="banner state-warn">', 1)[1].split("</p>", 1)[0]
+    # a stale report is a warning: the design's amber flash, with the clock beside it
+    flash = shown.split('<div class="flash attn">', 1)[1].split("</div></div>", 1)[0]
+    assert '<use href="#i-clock"/>' in flash
+    banner = flash.split("<div>", 1)[1]
+    assert shown.index('class="flash attn"') < shown.index('<section class="box">')
     assert " ".join(banner.split()) == (
         "This report is 42 minutes old, older than 15 minutes, so the checks have stopped. "
         "Every subsystem below reads UNKNOWN at best; a FAIL in it is still a FAIL.")
     # said once, above the table, and under no subsystem
     assert "<code>freshness</code>" not in shown and shown.count("42 minutes") == 1
     # and the lede does not say the bound and the period again beneath it
-    lede = shown.split("</p>", 2)[1]
+    lede = shown.split('<p class="lede">', 1)[1].split("</p>", 1)[0]
     assert "The whole reads" in lede
     assert "own period" not in lede and "is stale" not in lede
 
@@ -270,23 +304,25 @@ def test_a_stale_report_is_a_banner_above_the_table(client, files):
 def test_a_future_dated_report_is_the_same_warning(client, files):
     write(files["report"], ALL_PASS, taken_at=NOW + datetime.timedelta(hours=2))
     shown = main_of(client.get("/health"))
-    assert '<p class="banner state-warn">This report is dated in the future' in shown
+    assert ('<div class="flash attn"><svg class="icon attn ico"><use href="#i-clock"/></svg>'
+            '<div>This report is dated in the future') in shown
     assert "own period" not in shown
 
 
-def test_the_banner_colours_are_the_states_own_and_touch_no_other_banner():
-    for state in ("warn", "fail"):
-        assert f".banner.state-{state} {{" in application.STYLE, state
-    # the plain `.banner` rule, which the break-glass and shown-once banners use, is as it was
-    assert ".banner { border: 2px solid #111; padding: .75rem; margin: 0 0 1rem; " \
-           "font-weight: bold; }" in application.STYLE
-    assert '<p class="banner">Signed in with the break-glass account' in application.SHELL
+def test_health_has_no_colours_of_its_own_left_in_the_stylesheet():
+    # the design's flashes and badges speak for Health now: no banner rule, no state rule
+    # and no palette of its own
+    assert not re.search(r"\.banner\b", style.STYLESHEET)
+    assert not re.search(r"state-(pass|warn|fail|unknown)", style.STYLESHEET)
+    assert "flash('attn'" in application.SHELL
+    assert 'class="banner' not in application.SHELL
 
 
-def test_a_missing_report_is_a_banner_and_no_table(client, files):
+def test_a_missing_report_is_a_flash_bad_and_no_table(client, files):
     shown = main_of(client.get("/health"))
-    # stronger than stale: nothing at all is known, so it is the FAIL palette
-    assert '<p class="banner state-fail">No health report could be read' in shown
+    # stronger than stale: nothing at all is known, so it is the design's red flash
+    assert ('<div class="flash bad"><svg class="icon bad ico"><use href="#i-alert"/></svg>'
+            '<div>No health report could be read') in shown
     assert str(files["report"]) in shown
     assert "<table>" not in shown
     assert '<span class="badge' not in shown
@@ -349,7 +385,7 @@ def test_a_fail_in_the_report_needs_attention_with_the_reports_time(client, file
     write(files["report"], MIXED)
     attention = attention_of(client.get("/"))
     assert "Nothing needs anybody" not in attention
-    assert "<code>antivirus</code> is FAIL" in attention
+    assert "<code>antivirus</code> is <span class=\"badge bad\">FAIL</span>" in attention
     assert "ClamAV is not answering" in attention
     assert "2026-09-29 14:00:04 UTC" in attention
     assert "/health" in attention
@@ -384,6 +420,85 @@ def test_the_overview_reads_the_report_as_the_page_renders():
         .split("def configured")[1]
 
 
+# --- the overview, in the design's components ---------------------------------------------
+
+REFUSED_ROW = {"id": 7, "address": "box@example.org", "address_canonical": "box@example.org",
+               "state": "active", "frozen_since": None, "last_fetch_status": "auth_failed",
+               "last_test_status": None, "last_skip_at": None, "last_skip_uidl": None,
+               "delete_window_days": 14, "label": "sales"}
+
+
+def stand_in_busy_rows(monkeypatch):
+    """The overview's rows, each worry there once: a refused password, two withheld
+    messages and a failed request."""
+    def one(conn, sql, parameters=()):
+        if sql == overview.NEWEST_FAILURE:
+            return {"kind": "top_up", "target": "ivan@sales", "finished_at": NOW,
+                    "result": "no mailbox 4"}
+        if sql == overview.LAST_ACT:
+            return None
+        return dict(ZEROES, waiting=2, oldest="2026-09-27", failures=1)
+    monkeypatch.setattr(common, "one", one)
+    monkeypatch.setattr(common, "rows", lambda conn, sql, parameters=():
+                        [dict(REFUSED_ROW)] if sql == overview.WORRIES else [])
+
+
+@pytest.fixture
+def busy_database(monkeypatch):
+    stand_in_busy_rows(monkeypatch)
+
+
+def boxes_of(response):
+    """The overview's main, split at its two boxes."""
+    shown = main_of(response)
+    assert shown.count('<section class="box') == 2
+    attention, sections = shown.split("</section>", 1)
+    return attention, sections
+
+
+def test_the_overview_is_the_attention_box_then_a_plain_box_of_sections(client, files,
+                                                                        busy_database):
+    write(files["report"], MIXED)
+    response = client.get("/")
+    shown = main_of(response)
+    assert '<div class="page-head"><div><h1>Overview</h1>' in shown
+    assert shown.count("<h1") == 1 and "btn-primary" not in shown
+    attention, sections = boxes_of(response)
+    assert ('<section class="box attn-box"><div class="box-head"><h2>Needs attention</h2>'
+            "</div>") in attention
+    assert '<ul class="list">' in attention
+    # four worries: the FAIL, the refused password, the withheld and the failed request,
+    # each a row of the list with its icon first
+    items = attention.split('<ul class="list">', 1)[1].split("</ul>", 1)[0]
+    rows = re.findall(r"<li>(.*?)</li>", items, re.S)
+    assert len(rows) == 4
+    for row in rows:
+        assert re.match(r'<svg class="icon (bad|attn) ico"><use href="#i-[a-z]+"/></svg><div>',
+                        row), row
+    assert '<div class="box-head"><h2>Sections</h2></div>' in sections
+    assert '<div class="table-wrap"><table>' in sections and sections.count("<table") == 1
+    assert sections.count('<td class="acts"><a href="') == 4
+
+
+def test_with_nothing_wrong_the_attention_box_holds_its_one_sentence(client, files,
+                                                                     quiet_database):
+    write(files["report"], ALL_PASS)
+    attention, _ = boxes_of(client.get("/"))
+    assert '<div class="box-body"><p>Nothing needs anybody right now' in attention
+    assert "<ul" not in attention
+    # amber is attention: with nothing to attend to, the box is a plain one
+    assert '<section class="box"><div class="box-head"><h2>Needs attention</h2>' in attention
+    assert "attn" not in attention
+
+
+def test_a_health_fail_is_a_row_with_a_bad_badge_and_its_word(client, files, quiet_database):
+    write(files["report"], MIXED)
+    attention, _ = boxes_of(client.get("/"))
+    row = attention.split('<ul class="list">', 1)[1].split("</li>", 1)[0].strip()
+    assert row.startswith('<li><svg class="icon bad ico"><use href="#i-alert"/></svg>')
+    assert '<code>antivirus</code> is <span class="badge bad">FAIL</span>' in row
+
+
 # --- the states in colour ------------------------------------------------------------------
 
 def luminance(hex_colour):
@@ -397,29 +512,39 @@ def contrast(one, other):
     return (lighter + 0.05) / (darker + 0.05)
 
 
-def test_every_state_has_a_colour_of_its_own_with_contrast_enough_to_read():
-    colours = application.STATE_COLOURS
-    assert set(colours) == set(report.STATES)
-    # four different backgrounds: FAIL, WARN and UNKNOWN each look unlike PASS
-    assert len({background for _, background, _ in colours.values()}) == 4
-    for state, (text, background, _border) in colours.items():
-        assert contrast(text, background) >= 4.5, state        # WCAG AA for body text
-        assert f".badge.state-{state.lower()} {{" in application.STYLE, state
-    # FAIL is the one that is solid: it stands out from everything else on a page
-    assert contrast(colours["FAIL"][1], "#ffffff") >= 4.5
+def token(name):
+    return re.search(rf"--{name}:\s*(#[0-9a-fA-F]{{6}})", style.DESIGN).group(1)
 
 
-def test_the_people_lists_badges_keep_their_plain_look():
+def test_every_state_speaks_one_of_the_designs_four_badge_voices():
+    assert screen.VOICES == VOICES and set(screen.VOICES) == set(report.STATES)
+    # four different voices, each a badge the design itself draws
+    assert len(set(VOICES.values())) == 4
+    for voice in VOICES.values():
+        assert f".badge.{voice}{{" in style.DESIGN, voice
+
+
+def test_the_solid_badge_is_the_maildivvy_sections_one_red_ground_and_reads():
+    rule = re.search(r"\.badge\.bad\.solid\{([^}]*)\}", style.MAILDIVVY).group(1)
+    assert "background:var(--danger)" in rule and "color:var(--bg)" in rule
+    # white on the design's red, readable at WCAG AA
+    assert token("bg").lower() == "#ffffff"
+    assert contrast(token("danger"), token("bg")) >= 4.5
+
+
+def test_the_people_lists_badges_speak_the_designs_voices_and_never_healths_states():
     from maildivvy.admin.screens import accounts
-    assert '<span class="badge">blocked</span>' in accounts.LIST_PAGE
-    assert "state-" not in accounts.LIST_PAGE
+    assert '<span class="badge attn">blocked</span>' in accounts.LIST_PAGE
+    assert '<span class="badge ok">active</span>' in accounts.LIST_PAGE
+    assert not re.search(r"state-(pass|warn|fail|unknown)", accounts.LIST_PAGE)
 
 
 # --- the health status in every signed-in page's header --------------------------
 
 def header_of(response):
     html = response.get_data(as_text=True)
-    return html.split("<header>", 1)[1].split("</header>", 1)[0] if "<header>" in html else ""
+    top = '<header class="topbar">'
+    return html.split(top, 1)[1].split("</header>", 1)[0] if top in html else ""
 
 
 def status_of(response):
@@ -431,7 +556,7 @@ def status_of(response):
 def test_a_current_report_is_its_state_and_age_in_the_header(client, files):
     write(files["report"], [s for s in MIXED if s["name"] in ("host", "tls")])
     assert status_of(client.get("/health")) == (
-        '<a class="health badge state-warn" href="/health">Health: WARN &middot; '
+        '<a class="health badge attn" href="/health">Health: WARN &middot; '
         '3 minutes ago</a>')
 
 
@@ -440,20 +565,20 @@ def test_a_fail_is_in_the_header_of_every_page_not_only_the_health_screen(client
     write(files["report"], MIXED)
     for path in ("/", "/health", "/no-such-page"):
         said = status_of(client.get(path))
-        assert "state-fail" in said and "Health: FAIL" in said, path
+        assert 'class="health badge bad solid"' in said and "Health: FAIL" in said, path
 
 
 def test_a_stale_pass_is_never_pass_in_the_header(client, files):
     write(files["report"], ALL_PASS, taken_at=NOW - datetime.timedelta(minutes=42))
     said = status_of(client.get("/health"))
-    assert "PASS" not in said and "state-pass" not in said
+    assert "PASS" not in said and "badge ok" not in said
     assert "Health: UNKNOWN &middot; stale, 42 minutes old" in said
 
 
 def test_a_missing_report_is_no_report_in_the_header_and_alarms_in_red(client, files):
     response = client.get("/health")
     # nothing is known, so the header alarms as a FAIL does, on every page
-    assert status_of(response) == ('<a class="health badge state-fail" href="/health">'
+    assert status_of(response) == ('<a class="health badge bad solid" href="/health">'
                                    'Health: no report</a>')
     # while the screen's own state stays UNKNOWN: the colour is the header's alone
     assert "The whole reads" not in main_of(response)
@@ -469,16 +594,16 @@ def test_a_reader_that_fails_leaves_the_page_standing_and_says_no_report(client,
     monkeypatch.setattr(screen, "reading", broken)
     answer = client.get("/no-such-page")
     assert answer.status_code == 404 and "<h1>Not found</h1>" in main_of(answer)
-    assert "Health: no report" in status_of(answer) and "state-fail" in status_of(answer)
+    assert "Health: no report" in status_of(answer) and "bad solid" in status_of(answer)
 
 
 def test_a_stale_or_future_report_keeps_its_states_colour_in_the_header(client, files):
     write(files["report"], ALL_PASS, taken_at=NOW - datetime.timedelta(minutes=42))
-    assert "state-unknown" in status_of(client.get("/health"))
+    assert 'class="health badge off"' in status_of(client.get("/health"))
     write(files["report"], MIXED, taken_at=NOW - datetime.timedelta(minutes=42))
-    assert "state-fail" in status_of(client.get("/health"))
+    assert 'class="health badge bad solid"' in status_of(client.get("/health"))
     write(files["report"], ALL_PASS, taken_at=NOW + datetime.timedelta(hours=2))
-    assert "state-unknown" in status_of(client.get("/health"))
+    assert 'class="health badge off"' in status_of(client.get("/health"))
 
 
 def test_the_report_is_read_once_per_page(client, files, quiet_database, monkeypatch):
@@ -500,4 +625,4 @@ def test_the_sign_in_page_has_no_shell_and_no_health(files):
     made.config.update(MAILDIVVY_HEALTH_REPORT=files["report"], MAILDIVVY_SECRET="x" * 32)
     write(files["report"], ALL_PASS)
     page = made.test_client().get("/sign-in").get_data(as_text=True)
-    assert "<header>" not in page and "Health:" not in page
+    assert "<header" not in page and "Health:" not in page

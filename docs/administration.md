@@ -195,12 +195,13 @@ says what the timer last found, never what is true this second; it always shows 
 report's time and age. A report older than 15 minutes (the `stale_minutes` bound) is
 shown as stale, every subsystem then reading UNKNOWN at best and a FAIL staying FAIL, and
 a report that is missing or damaged is shown as no report at all. Each state has its own
-colour, with its word beside it: FAIL red, WARN amber, UNKNOWN indigo, PASS green.
+colour, with its word beside it: FAIL red, WARN amber, UNKNOWN grey, PASS green.
 
 Every page's top bar carries the same reading in a few words, linking to the screen:
 `Health: PASS · 3 minutes ago`, `Health: FAIL · stale, 42 minutes old` for a stale
-report (never PASS), or `Health: no report`, in red like a FAIL, since then nothing is
-known.
+report (never PASS), or `Health: no report`, since then nothing is known. Whenever the
+report reads FAIL or is missing, that badge is solid red, the one solid badge in the
+interface.
 
 The overview lists under **Needs attention** every subsystem that is FAIL, with the
 report's time, and a report that is stale or cannot be read. WARN and UNKNOWN are not
@@ -383,7 +384,7 @@ UNKNOWN service there too.
 | `postfix` | submission, transports, milter binding, queue | FAIL: 465 not greeting or not offering AUTH; the milter not bound on submission; a message queued over 24 h. WARN: over 60 min, usually a provider refusing the relay (`postqueue -p`) |
 | `milter` | running, socket, answers | FAIL: not running, socket missing or of the wrong group, no negotiation. Every submission is deferred meanwhile |
 | `antivirus` | daemon, signatures, held mail, upstream release | FAIL: ClamAV not answering (mail waits at the provider); a mailbox held; signatures over 7 days old; a newer upstream release unshipped for over 7 days. WARN: signatures over 48 h; a newer upstream release |
-| `spam` | scores, sender rule, container, modules, configuration log, repin | FAIL: no probe score; the product's own rule did not run; the container down; a required module off; a configuration error since start; a newer rspamd patch released, so repin ([the roles' README](../ansible/README.md)) |
+| `spam` | scores, sender rule, container, modules, configuration log, repin | FAIL: no probe score; the product's own rule did not run; the container down; a required module off; a configuration error since start; a newer rspamd patch released, so repin ([the roles' README](../ansible/README.md)); the install prints this one and does not stop on it |
 | `search` | index plugin, search | FAIL: the full-text plugin not loaded, or a search that read the messages instead of the index. UNKNOWN until an archive holds mail |
 | `collection` | each external mailbox, fetch runs, deletion windows, fetcher, collection timer | FAIL: the provider refused the stored password; the last fetch failed; a mailbox not fetched for 30 min; a mailbox frozen (only **Resume** on the fetch screen ends it); the fetch timer stopped. WARN: a message skipped after an hour of failures, naming the date the provider deletes it; paused while a backup runs |
 | `store` | ledger, link classes, fan-out timer, fan-out, requests | FAIL: a name in a mailbox with no delivery row; the pass failed or has not run for 10 min. WARN: a request failed in the last 24 h (its reason is on its row) |
@@ -422,16 +423,43 @@ is newer than the running process.
 ### Upgrades
 
 Maildivvy is released as 0.x versions. The machine records the version it runs in
-`/etc/maildivvy/version`, and the release carries its own in `VERSION`. To upgrade,
-unpack the new release beside the old one and run its installer, as for the first
-installation, inside `tmux` or `screen` so that the upgrade goes on if your SSH session
-drops:
+`/etc/maildivvy/version`, and the release carries its own in `VERSION`. An upgrade is
+four things, in this order.
+
+**Read the release's notes.** Read the new version's section of `CHANGELOG.md`, and of
+every version between yours and it, before you start. Its **Changed** part names every
+setting or behaviour the release changes and what you do about it, and some of those are
+yours to do by hand, before or after the upgrade.
+
+**Get and verify the release**, exactly as for the first installation
+([the installation guide](installation.md#getting-and-verifying-the-release)): download
+the tarball, its `.minisig` and `SHA256SUMS`, check the signature with the key the README
+publishes and the sums, and install nothing that fails either.
+
+**Run the new release's installer.** Unpack the new release beside the old one and run
+its installer, as for the first installation, inside `tmux` or `screen` so that the
+upgrade goes on if your SSH session drops:
 
 ```
 tar -xzf <new release tarball>
 cd <new release directory>
 sudo ./maildivvy-install
 ```
+
+**Check the machine afterwards.**
+
+- `cat /etc/maildivvy/version` names the new version. An upgrade that failed leaves the
+  old one there.
+- Health reads every subsystem PASS, or UNKNOWN only where it did before:
+
+  ```
+  sudo runuser -u maildivvy-health -- /opt/maildivvy/bin/maildivvy-health --quiet
+  ```
+
+- Collection runs again: `systemctl is-active maildivvy-fetch.timer maildivvy-pass.timer`
+  reads `active` twice, unless you had stopped one yourself.
+- When the release's notes mention the outside probe or publication, run the probe again
+  from outside and record its result ([the outside probe](#2-the-outside-probe)).
 
 The installer reads the installed version before anything changes, and:
 

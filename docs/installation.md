@@ -447,7 +447,10 @@ in order. Every step reads its own result back before the next starts.
   ([the certificate](#the-certificate), if the first issuance fails).
 - **Step 17** runs health through its unit. It accepts every subsystem PASS or WARN, and
   UNKNOWN only where a fresh machine has no data yet (no external mailbox, no delivery,
-  no mail to search). It prints each WARN it accepted.
+  no mail to search). It prints each WARN it accepted. A newer rspamd release than the
+  one this version pins is printed too and does not stop the run: health reads it FAIL
+  afterwards, which says to repin
+  ([administration guide § 3](administration.md#3-health)).
 - **Steps 18 and 19** prove the ban and then open 993 and 465. If any of their proofs
   fails, both ports are closed again and the run stops naming the proof. Step 19 ends
   with `PUBLISHED: NOW PROVE IT FROM OUTSIDE` and the command that runs the outside probe
@@ -515,7 +518,8 @@ refuse an IP address for either host.
 - The deletion window counts from when the fetcher first saw a message. After it, the
   message is deleted at the provider, and this machine holds the only copy.
 
-Then **Check password** asks the pipeline to log in at the provider, and **Enable**
+Then **Check password** asks the pipeline to log in at the provider, and pressing the
+mailbox's state switch, which reads *disabled* (a screen reader names it **Enable**),
 checks the password again and starts collection. Both are requests the pipeline performs
 within about a minute; the page says when to look again, and a refusal shows its reason
 on the mailbox's page.
