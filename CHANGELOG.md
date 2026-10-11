@@ -5,6 +5,14 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.1.3 - 2026-10-11
+
+### Fixed
+
+- rspamd is repinned to 4.2.2, by digest, with its tag. Upstream's release fixes
+  memory-safety bugs and changes some rules (cryptocurrency addresses, hidden text in
+  HTML tables, obfuscated links), so a message can score differently than under 4.2.1.
+
 ## 0.1.2 - 2026-10-02
 
 ### Changed
