@@ -517,8 +517,8 @@ def test_a_password_checks_verdict_comes_from_the_row_and_only_when_its_stamp_mo
 
 
 ONE_MINUTE = datetime.timedelta(minutes=1)
-# what a check logs in with: credential, POP3 login, host, port
-TESTED = ("the-password", "recent:box", "pop.example.org", 995)
+# what a check logs in with: credential, POP3 login, host, port and pinned certificate
+TESTED = ("the-password", "recent:box", "pop.example.org", 995, None)
 
 
 class FakeProcess:
@@ -526,6 +526,20 @@ class FakeProcess:
         self.returncode = returncode
         self.stderr = stderr
         self.stdout = ""
+
+
+def test_a_check_whose_pinned_certificate_changed_while_it_ran_switches_nothing_on(monkeypatch):
+    """The check trusts the server by the pin it read, so a pin changed meanwhile makes the
+    verdict one about a server the row no longer trusts."""
+    assert "pop3_cert_fingerprint" in requests.TESTED_AGAINST
+    stamp = datetime.datetime(2026, 9, 1, 12)
+    monkeypatch.setattr(requests, "run_runner", lambda *a, **k: FakeProcess(returncode=0))
+    pinned = TESTED[:4] + (":".join(["AB", "01"] * 16),)
+    cursor = Cursor([("ivan.p@example.org", stamp), TESTED, ("ok", None, stamp + ONE_MINUTE),
+                     pinned])
+    with pytest.raises(requests.RequestFailed) as refused:
+        requests.check_credential(cursor, 1, requests.Context())
+    assert "changed while it was being checked" in str(refused.value)
 
 
 def test_a_refused_password_is_a_finished_check_and_only_enabling_turns_it_into_a_failure(monkeypatch):

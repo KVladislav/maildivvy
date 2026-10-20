@@ -98,8 +98,10 @@ and `maildivvy_rspamd_rbls` (off, with the two probe names it tests a resolver w
 `maildivvy_rspamd_rbl_listed_probe` and `maildivvy_rspamd_rbl_clean_probe`).
 
 And for Postfix (`ansible/roles/postfix/defaults/main.yml`):
-`maildivvy_postfix_inet_protocols` (`ipv4`, the families actually served)
-and `maildivvy_postfix_tls_protocols` (`>=TLSv1.2`, both ends).
+`maildivvy_postfix_inet_protocols` (`ipv4`, the families actually served),
+`maildivvy_postfix_tls_protocols` (`>=TLSv1.2`, both ends) and
+`maildivvy_postfix_message_size_limit` (`52428800`, the largest message submission
+accepts, 50 MiB as the antivirus scans).
 
 ## The firewall steps (3 and 4)
 

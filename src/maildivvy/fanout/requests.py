@@ -802,9 +802,10 @@ def refetch(cur, request, context):
 
 
 # What a provider check logs in with: if any of it moves while the check runs,
-# the verdict is about something no longer on the row.
-TESTED_AGAINST = ("SELECT credential, pop3_login, pop3_host, pop3_port FROM external_mailbox "
-                  "WHERE id = %s")
+# the verdict is about something no longer on the row. The pinned certificate is part of
+# it: the check trusts the server by that pin.
+TESTED_AGAINST = ("SELECT credential, pop3_login, pop3_host, pop3_port, pop3_cert_fingerprint "
+                  "FROM external_mailbox WHERE id = %s")
 
 
 def check_credential(cur, rid, context):

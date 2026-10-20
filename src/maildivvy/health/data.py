@@ -67,12 +67,12 @@ def judge_timer(name, timer, active, paused):
 MAILBOXES = """
     SELECT e.id, e.address, e.state, e.delete_window_days, e.last_fetch_at, e.last_fetch_status,
            e.last_fetch_cause, e.last_fetch_detail, e.frozen_since, e.last_skip_at,
-           e.last_skip_uidl, d.label
+           e.last_skip_uidl, d.label, e.keep_at_provider
       FROM external_mailbox e LEFT JOIN domain d ON d.external_mailbox_id = e.id
      ORDER BY e.id
 """
 COLUMNS = ("id", "address", "state", "window", "fetched_at", "status", "cause", "detail",
-           "frozen_since", "skipped_at", "skipped_uidl", "domain")
+           "frozen_since", "skipped_at", "skipped_uidl", "domain", "kept")
 
 
 def rows_of(raw):
@@ -125,6 +125,10 @@ def judge_mailbox(row, now, bound, quiet):
                                               "backup pauses collection or a fetch run is still going")
         return Check(name, FAIL, reading, f"not fetched in {minutes_of(bound)} min: collection has "
                                           "stopped for it, whatever its last status says")
+    if row["skipped_at"] is not None and row["kept"]:
+        # nothing deletes it at the provider, so there is no date to fetch it by
+        return passed(name, reading + f"; message {row['skipped_uidl']} skipped "
+                                      f"{row['skipped_at'].date().isoformat()}, kept at the provider")
     if row["skipped_at"] is not None:
         deletes_on = row["skipped_at"] + datetime.timedelta(days=int(row["window"]))
         if now < deletes_on:
@@ -212,7 +216,8 @@ def fetch_runs(ctx):
 
 def judge_windows(rows, state):
     """Every row a window, and every collected row's rendered configuration carrying exactly
-    its own `keep <n>d`: mpop's default with no `keep` line is DELETE."""
+    its own `keep <n>d`, or `keep on` for a row kept at the provider:
+    mpop's default with no `keep` line is DELETE."""
     if not rows:
         return Check("deletion windows", UNKNOWN, "0 rows",
                      "no external mailbox: every row carrying a window would be vacuous")
@@ -230,7 +235,10 @@ def judge_windows(rows, state):
             problems.append(f"{row['address']}: no-file")
         elif not rendered["keep"]:
             problems.append(f"{row['address']}: no-keep-line")
-        elif rendered["keep"] != [f"{int(row['window'])}d"]:
+        elif row["kept"] and rendered["keep"] != ["on"]:
+            problems.append(f"{row['address']}: keep {', '.join(rendered['keep'])} against "
+                            "kept at the provider")
+        elif not row["kept"] and rendered["keep"] != [f"{int(row['window'])}d"]:
             problems.append(f"{row['address']}: keep {', '.join(rendered['keep'])} against a window "
                             f"of {row['window']} days")
     reading = f"{len(rows)} rows, {len(state['configs'])} rendered configurations"

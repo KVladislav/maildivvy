@@ -63,7 +63,7 @@ EX_CONFIG = 78
 COLUMNS = """
     SELECT e.id, e.pop3_login, e.address, e.pop3_host, e.pop3_port,
            d.label, e.delete_window_days, e.address_canonical,
-           d.spam_threshold, e.held_since
+           d.spam_threshold, e.held_since, e.keep_at_provider, e.pop3_cert_fingerprint
       FROM external_mailbox e
       JOIN domain d ON d.external_mailbox_id = e.id
 """
@@ -124,13 +124,15 @@ def audit(cursor, action, target, detail):
         (ACTOR, action, target, json.dumps({k: as_text(v) for k, v in detail.items()})))
 
 
-def deletion_date(skipped_at, window):
-    """When the provider deletes a skipped message.
+def deletion_date(skipped_at, window, kept=False):
+    """When the provider deletes a skipped message, None if it never does.
 
-    Computed from two columns that already exist rather than stored: a stored copy is
-    wrong the day the window changes.
+    Computed from columns that already exist rather than stored: a stored copy is
+    wrong the day the window changes. A mailbox kept at the provider deletes nothing.
     """
-    return None if window is None else skipped_at + datetime.timedelta(days=int(window))
+    if kept or window is None:
+        return None
+    return skipped_at + datetime.timedelta(days=int(window))
 
 
 # --- the listing session that finds the stuck message -----------------------------------------
@@ -261,7 +263,7 @@ def bounded_retry(conn, mailbox, args, folder, path, result):
             audit(cur, "auto_skip_message", mailbox.target,
                   {"uidl": identifier, "stuck_since": stuck_since, "stuck_runs": stuck_runs,
                    "skipped_at": skipped_at,
-                   "deletes_at": deletion_date(skipped_at, mailbox.window)})
+                   "deletes_at": deletion_date(skipped_at, mailbox.window, mailbox.keep)})
             cur.execute("COMMIT")
         except Exception as err:  # noqa: BLE001 - the run continues with the next mailbox
             cur.execute("ROLLBACK")

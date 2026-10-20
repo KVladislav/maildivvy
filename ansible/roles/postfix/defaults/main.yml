@@ -7,3 +7,9 @@ maildivvy_postfix_inet_protocols: ipv4
 
 # The floor for both ends of TLS, as Dovecot's `ssl_min_protocol` is for 993.
 maildivvy_postfix_tls_protocols: ">=TLSv1.2"
+
+# The largest message submission accepts, in bytes: 50 MiB. Postfix's own default
+# is 10240000. The antivirus scans up to the same 50M (maildivvy_clamav_stream_max), so
+# a larger limit here admits mail the milter sends unscanned or refuses, as its domain
+# is set.
+maildivvy_postfix_message_size_limit: 52428800

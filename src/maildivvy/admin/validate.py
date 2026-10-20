@@ -55,6 +55,12 @@ RESERVED_LOGINS = frozenset({"archive", "break-glass"})
 INNER = re.compile(r"[\s\x00-\x1f\x7f]")
 
 WHOLE_NUMBER = re.compile(r"^-?[0-9]+$")
+# A SHA-256 certificate fingerprint in the one spelling stored, as the table's CHECK spells
+# it (`schema/0002_provider_login_keep_and_pins.sql`), and what the form also takes: any
+# case, colons or spaces or neither, after the label openssl or mpop prints.
+FINGERPRINT = re.compile(r"^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$")
+FINGERPRINT_LABEL = re.compile(r"^sha-?256(?:\s+fingerprint)?\s*[=:]\s*", re.IGNORECASE)
+FINGERPRINT_HEX = re.compile(r"^[0-9A-Fa-f]{64}$")
 PORT_NUMBER = re.compile(r"^[0-9]+$")
 
 # ⚠️ THE DOT-INSENSITIVE HOSTS ARE CODE, NOT A SETTING. Folding decides one
@@ -188,6 +194,41 @@ def pop3_login(text):
         return None
     no_inner_whitespace(typed, "POP3 login")
     return typed
+
+
+def smtp_login(text):
+    """The SMTP login to store: the stripped text, or None meaning the POP3 login.
+
+    ⛔ No colon: Postfix splits its SASL value `login:password` at the first one, so the
+    rest of such a login would be sent as part of the password.
+    """
+    typed = str(text or "").strip()
+    if not typed:
+        return None
+    no_inner_whitespace(typed, "SMTP login")
+    if ":" in typed:
+        raise Refused("The SMTP login must have no colon in it: the relay would send what "
+                      "follows the colon as part of the password.")
+    return typed
+
+
+def is_fingerprint(text):
+    """A fingerprint as stored; what exempts one from the journal's secret filter."""
+    return isinstance(text, str) and FINGERPRINT.fullmatch(text) is not None
+
+
+def fingerprint(text, what):
+    """A SHA-256 certificate fingerprint in the spelling stored, or None for none."""
+    typed = FINGERPRINT_LABEL.sub("", str(text or "").strip())
+    if not typed:
+        return None
+    digits = re.sub(r"[\s:]", "", typed)
+    if not FINGERPRINT_HEX.fullmatch(digits):
+        raise Refused(f"The {what} must be a SHA-256 fingerprint: 64 hexadecimal digits, "
+                      "with or without colons, as openssl x509 -fingerprint -sha256 prints "
+                      "it.")
+    digits = digits.upper()
+    return ":".join(digits[i:i + 2] for i in range(0, len(digits), 2))
 
 
 def external_address(text):

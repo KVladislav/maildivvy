@@ -17,7 +17,7 @@ maildivvy_postfix_queue: /var/spool/postfix
 maildivvy_postfix_passfile: /etc/postfix/maildivvy.pgpass
 maildivvy_postfix_real_passfile: "{{ maildivvy_postfix_queue }}/etc/postfix/maildivvy.pgpass"
 
-# The five views of docs/architecture.md § Views, one lookup map each. Postfix reads
+# The six views of docs/architecture.md § Views, one lookup map each. Postfix reads
 # views and no table at all.
 maildivvy_postfix_maps:
   - {name: sender-login, view: postfix_sender_login}
@@ -25,6 +25,7 @@ maildivvy_postfix_maps:
   - {name: generic, view: postfix_generic}
   - {name: transport, view: postfix_transport}
   - {name: relayhost, view: postfix_relayhost}
+  - {name: tls-policy, view: postfix_tls_policy}
 maildivvy_postfix_map_dir: /etc/postfix
 maildivvy_postfix_map_prefix: maildivvy-
 
@@ -51,6 +52,12 @@ maildivvy_postfix_main:
   inet_interfaces: all
   inet_protocols: "{{ maildivvy_postfix_inet_protocols }}"
   smtputf8_enable: "no"
+  message_size_limit: "{{ maildivvy_postfix_message_size_limit }}"
+  # ⚠️ local(8) and virtual(8) refuse to start, `fatal: configuration error`, when their
+  # mailbox limit is below the message limit, and both defaults (51200000) are below
+  # 50 MiB. Neither delivers anything here, so they follow the message limit.
+  mailbox_size_limit: "{{ maildivvy_postfix_message_size_limit }}"
+  virtual_mailbox_limit: "{{ maildivvy_postfix_message_size_limit }}"
 
   default_transport: "{{ maildivvy_postfix_error }}"
   relay_transport: "{{ maildivvy_postfix_error }}"
@@ -82,6 +89,13 @@ maildivvy_postfix_main:
   smtp_tls_secure_cert_match: nexthop
   smtp_tls_CAfile: /etc/ssl/certs/ca-certificates.crt
   smtp_tls_mandatory_protocols: "{{ maildivvy_postfix_tls_protocols }}"
+  # A pinned SMTP server: the policy view answers `fingerprint match=<pins>` for
+  # its `[host]:port`, and trusts that certificate in place of the bundle and the name.
+  # ⚠️ Postfix keys a TLS policy BY NEXT HOP, never by sender, so a pin holds for every
+  # mailbox sending to that server and port. The digest is named, not left to the
+  # compatibility level, because the stored pins are SHA-256.
+  smtp_tls_policy_maps: "pgsql:{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}tls-policy.cf"
+  smtp_tls_fingerprint_digest: sha256
 
   # ⛔ Only root may put mail in the queue by `sendmail`. The pickup path has no
   # From check and no scan, and the per-sender maps would relay any sender it names with

@@ -16,6 +16,7 @@ from maildivvy_postconf import actions, normalise, parse_main, parse_master, par
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROOT / "ansible" / "roles" / "postfix"
 SCHEMA = ROOT / "schema" / "0001_initial.sql"
+MIGRATIONS = sorted((ROOT / "schema").glob("[0-9][0-9][0-9][0-9]_*.sql"))
 CERT_NAME = "mail.example.test"
 
 
@@ -206,6 +207,29 @@ def test_the_providers_certificate_is_verified_by_its_configured_name_against_th
     assert "smtp_tls_CApath" not in values
 
 
+def test_a_pinned_server_is_looked_up_by_next_hop_in_the_policy_view_by_its_sha256():
+    """Postfix keys a TLS policy by the transport's `[host]:port`, never by sender: the
+    view answers per server, and the digest is named rather than left to the
+    compatibility level, since the stored pins are SHA-256."""
+    values = main_cf()
+    assert values["smtp_tls_policy_maps"] == "pgsql:/etc/postfix/maildivvy-tls-policy.cf"
+    assert values["smtp_tls_fingerprint_digest"] == "sha256"
+    assert values["smtp_tls_security_level"] == "secure"  # an unpinned server stays
+    view = MIGRATIONS[1].read_text().split("CREATE VIEW postfix_tls_policy AS", 1)[1].split(";", 1)[0]
+    assert "'[' || lower(e.smtp_host) || ']:' || e.smtp_port" in view
+    assert "'fingerprint match='" in view and "GROUP BY lower(e.smtp_host), e.smtp_port" in view
+
+
+def test_submission_takes_a_message_up_to_50_mib_and_the_scanner_scans_as_much():
+    values = variables()
+    assert values["maildivvy_postfix_message_size_limit"] == 52428800
+    # local(8) and virtual(8) are fatal on a mailbox limit below the message limit
+    for name in ("message_size_limit", "mailbox_size_limit", "virtual_mailbox_limit"):
+        assert main_cf()[name] == "52428800", name
+    clamav = yaml.safe_load((ROOT / "ansible" / "roles" / "clamav" / "defaults" / "main.yml").read_text())
+    assert clamav["maildivvy_clamav_stream_max"] == clamav["maildivvy_clamav_file_max"] == "50M"
+
+
 def test_a_provider_on_465_has_a_client_of_its_own_in_wrapper_mode():
     """The plain client waited for a clear-text greeting from a provider's 465."""
     entry = service("smtps/unix")
@@ -319,13 +343,15 @@ def test_no_listener_but_465_and_sendmail_for_root_alone():
     assert main_cf()["authorized_submit_users"] == "root"
 
 
-# --- the five lookup maps --------------------------------
+# --- the six lookup maps ------------------------
 
-def test_the_five_maps_are_the_five_views_the_schema_grants_postfix():
-    granted = re.search(r"GRANT SELECT ON ([^;]+) TO maildivvy_postfix;", SCHEMA.read_text(), re.S)
-    views = {name.strip() for name in granted.group(1).replace("\n", " ").split(",")}
+def test_the_six_maps_are_the_six_views_the_migrations_grant_postfix():
+    views = set()
+    for path in MIGRATIONS:
+        for granted in re.finditer(r"GRANT SELECT ON ([^;]+) TO maildivvy_postfix;", path.read_text(), re.S):
+            views |= {name.strip() for name in granted.group(1).replace("\n", " ").split(",")}
     assert {entry["view"] for entry in maps()} == views
-    assert len(maps()) == 5
+    assert len(maps()) == 6
 
 
 def test_a_map_names_a_passfile_and_carries_no_password():
@@ -346,7 +372,8 @@ def test_every_lookup_key_in_a_query_is_quoted():
 
 def test_each_map_reads_one_view_and_answers_one_column():
     names = {entry["name"] for entry in maps()}
-    assert names == {"sender-login", "sasl-password", "generic", "transport", "relayhost"}
+    assert names == {"sender-login", "sasl-password", "generic", "transport", "relayhost",
+                     "tls-policy"}
     for entry in maps():
         assert "SELECT mvalue" in map_file(entry)
 

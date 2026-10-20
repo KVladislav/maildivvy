@@ -252,6 +252,16 @@ def test_real_provider_hosts_pass_the_filter_and_dotted_passwords_are_still_with
     assert [journal.filtered(p) for p in passwords] == [journal.WITHHELD] * len(passwords)
 
 
+def test_a_stored_fingerprint_passes_the_filter_and_a_near_miss_is_still_withheld():
+    """A pin is public, and the servers row journals it before and after; only the one
+    stored spelling is exempt, so a password shaped like hex with colons is not."""
+    pin = ":".join(["AB", "01"] * 16)
+    assert journal.filtered({"after": {"pop3_cert_fingerprint": pin}}) == \
+        {"after": {"pop3_cert_fingerprint": pin}}
+    assert journal.filtered(pin.lower()) == journal.WITHHELD
+    assert journal.filtered(pin[:-3]) == journal.WITHHELD
+
+
 def test_the_filters_exemption_is_that_same_rule_so_the_two_cannot_drift():
     # an IPv6 literal is password-shaped by every other test in the rule
     assert validate.is_host("2001:db8:85a3::8a2e:370:7334")

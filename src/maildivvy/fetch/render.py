@@ -6,9 +6,11 @@ in a file, never in `argv` and never in the process table. No code path here wri
 
 ⛔ THE TRANSPORT HAS NO SWITCH. The two transport lines of TEMPLATE are
 literal constants, and a unit test reads every line of this package to prove no other
-one carries the lowercase token. A slot in either of them would be the switch that rule
-exists to keep out; a server that speaks plain text is reached by swapping the BINARY
-(`--mpop`), which changes what runs and nothing about what the file says.
+one carries the lowercase token but PIN_LINE. A slot in either of them would be the
+switch that rule exists to keep out; a server that speaks plain text is reached by
+swapping the BINARY (`--mpop`), which changes what runs and nothing about what the file
+says. PIN_LINE changes only what is trusted, never whether TLS is spoken: a pinned
+server is accepted by its certificate's fingerprint in place of the trust store.
 
 ⛔ THE HOST AND THE LOGIN LINES ARE MPOP'S STATE KEY. mpop files what it
 has already retrieved under (host, login), so one character's difference there reads to
@@ -49,8 +51,9 @@ class RenderError(Exception):
 class Mailbox(NamedTuple):
     """One external mailbox as the runner selects it, in the order QUERY names.
 
-    A new column is appended, never inserted: `window`, `target`, `threshold` and
-    `held_since` each arrived that way. Unpacking is by name, so nothing shifts.
+    A new column is appended, never inserted: `window`, `target`, `threshold`,
+    `held_since`, `keep` and `pin` each arrived that way. Unpacking is by name, so
+    nothing shifts.
     """
 
     id: int
@@ -63,6 +66,8 @@ class Mailbox(NamedTuple):
     target: str
     threshold: object
     held_since: datetime | None
+    keep: bool
+    pin: str | None
 
 
 # ⛔ Two of these lines are constants and must stay constants. Every other slot is a
@@ -81,6 +86,10 @@ TEMPLATE = (
     "uidls_file {state}/uidls",
     'delivery mda "{delivery}"',
 )
+# ⛔ The one further line that names TLS, rendered only for a pinned server. The
+# fingerprint is held to PIN before it is written, so it can carry no second directive.
+PIN_LINE = "tls_fingerprint {pin}"
+PIN = re.compile(r"^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}\Z")
 
 
 def check_field(value, column):
@@ -107,12 +116,16 @@ def login_of(mailbox):
 
 
 def keep_of(mailbox):
-    """The provider-side window as mpop's duration.
+    """The provider-side window as mpop's duration, or `on` when nothing is deleted.
 
     mpop's clock starts at its FIRST SIGHTING of the message, not at the message's Date
     header, so a message already three weeks old when first seen is deleted
-    three weeks later than a reader of "from its date" would expect.
+    three weeks later than a reader of "from its date" would expect. A mailbox kept at
+    the provider renders `on`, mpop's "never delete"; its window stays on the
+    row for when that is switched off.
     """
+    if mailbox.keep:
+        return "on"
     if mailbox.window is None:
         # `keep on` would be mpop's reading of a missing window and deletes nothing.
         # The column is NOT NULL, so a None here is a query that lost it.
@@ -147,17 +160,31 @@ def delivery_command(mailbox, bindir, hold_bound=DEFAULT_HOLD_BOUND):
     return " ".join(argv)
 
 
+def pin_of(mailbox):
+    """The pinned POP3 certificate's fingerprint, or None for the trust store."""
+    if mailbox.pin is None:
+        return None
+    if not isinstance(mailbox.pin, str) or not PIN.match(mailbox.pin):
+        raise RenderError(
+            f"pop3_cert_fingerprint {mailbox.pin!r} is not a SHA-256 fingerprint in upper "
+            "case hex with colons; it would become a directive of its own in the file mpop "
+            "obeys")
+    return mailbox.pin
+
+
 def render(mailbox, state_root=DEFAULT_STATE_DIR, bindir=DEFAULT_BINDIR,
            hold_bound=DEFAULT_HOLD_BOUND):
     """The mpoprc text for one external mailbox."""
     check_field(mailbox.address, "address")
     user = check_field(login_of(mailbox), "pop3_login")
     host = check_field(mailbox.pop3_host, "pop3_host")
-    return "\n".join(TEMPLATE).format(
+    pin = pin_of(mailbox)
+    lines = TEMPLATE + ((PIN_LINE,) if pin else ())
+    return "\n".join(lines).format(
         account=account_name(mailbox.id), host=host, port=int(mailbox.pop3_port),
         user=user, bindir=bindir, id=mailbox.id, keep=keep_of(mailbox),
         state=state_dir(state_root, mailbox.id),
-        delivery=delivery_command(mailbox, bindir, hold_bound)) + "\n"
+        delivery=delivery_command(mailbox, bindir, hold_bound), pin=pin) + "\n"
 
 
 def write_config(text, state):

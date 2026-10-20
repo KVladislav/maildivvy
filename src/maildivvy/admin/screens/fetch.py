@@ -181,6 +181,10 @@ def skip_of(row, today=None):
     """The last skip, while the provider has not deleted it yet - whatever else is newer."""
     if not row["last_skip_at"]:
         return None
+    if row["keep_at_provider"]:
+        # nothing deletes it, so the skip stays worth saying until the next one
+        return (f"skipped message {row['last_skip_uidl']} at {row['last_skip_at']}; it is "
+                "kept at the provider, which nothing here deletes.")
     deletes_at = row["last_skip_at"].date() + timedelta(days=row["delete_window_days"])
     if deletes_at < (today or date.today()):
         return None

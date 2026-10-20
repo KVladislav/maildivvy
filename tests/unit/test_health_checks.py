@@ -681,7 +681,7 @@ def mailbox(**overrides):
     row = {"id": 6, "address": "Ivan.P@example.org", "state": "active", "window": 14,
            "fetched_at": NOW - datetime.timedelta(minutes=2), "status": "no_new_mail", "cause": None,
            "detail": None, "frozen_since": None, "skipped_at": None, "skipped_uidl": None,
-           "domain": "alpha"}
+           "domain": "alpha", "kept": False}
     row.update(overrides)
     return row
 
@@ -784,6 +784,13 @@ def test_a_skipped_message_warns_until_its_provider_deletion_date_and_names_it()
     assert data.judge_mailbox(expired, NOW, BOUND, False).state == PASS
 
 
+def test_a_skipped_message_kept_at_the_provider_has_no_deletion_date_to_warn_of():
+    kept = mailbox(skipped_at=NOW - datetime.timedelta(days=2), skipped_uidl="uidl-42", kept=True)
+    found = data.judge_mailbox(kept, NOW, BOUND, False)
+    assert found.state == PASS
+    assert "uidl-42" in found.reading and "kept at the provider" in found.reading
+
+
 def test_zero_provider_rows_is_unknown_not_a_vacuous_pass():
     assert states(data.judge_mailboxes([], NOW, BOUND, False)) == [UNKNOWN]
     assert data.judge_windows([], {}).state == UNKNOWN
@@ -799,6 +806,15 @@ def test_each_collected_rows_configuration_carries_exactly_its_own_window():
         assert found.state == FAIL and text in found.problem
     with pytest.raises(Unreadable):
         data.judge_windows(rows, {"listed": False})
+
+
+def test_a_row_kept_at_the_provider_must_render_keep_on_and_never_its_window():
+    rows = [mailbox(kept=True)]
+    assert data.judge_windows(rows, {"listed": True, "configs": {"6": {"keep": ["on"]}}}).state == PASS
+    found = data.judge_windows(rows, {"listed": True, "configs": {"6": {"keep": ["14d"]}}})
+    assert found.state == FAIL and "kept at the provider" in found.problem
+    found = data.judge_windows([mailbox()], {"listed": True, "configs": {"6": {"keep": ["on"]}}})
+    assert found.state == FAIL and "keep on against a window of 14 days" in found.problem
 
 
 def test_the_fetcher_is_the_units_own_binary_and_at_least_the_minimum():

@@ -16,7 +16,8 @@ from maildivvy.fetch import render
 
 ROW = dict(id=7, pop3_login="recent:ivan.p@example.org", address="Ivan.P@example.org",
            pop3_host="pop.example.org", pop3_port=995, label="alpha", window=14,
-           target="ivan.p@example.org", threshold=8.00, held_since=None)
+           target="ivan.p@example.org", threshold=8.00, held_since=None, keep=False, pin=None)
+PIN = ":".join(["AB", "01"] * 16)
 
 BINDIR = "/opt/maildivvy/bin"
 STATE = "/var/lib/maildivvy/fetch"
@@ -86,14 +87,36 @@ def test_transport_security_is_two_literal_lines():
 
 
 def test_no_other_line_of_the_fetch_package_carries_the_token():
-    """A slot in either transport line would be the switch this rule keeps out."""
+    """A slot in either transport line would be the switch this rule keeps out. The pin's
+    line is the one other: it says what is trusted, never whether TLS is spoken."""
     package = Path(render.__file__).parent
     carrying = []
     for path in sorted(package.glob("*.py")):
         for number, line in enumerate(path.read_text().splitlines(), 1):
             if "tls" in line:
                 carrying.append((path.name, number, line.strip().rstrip(",")))
-    assert [line for _, _, line in carrying] == ['"tls on"', '"tls_starttls off"'], carrying
+    assert [line for _, _, line in carrying] == [
+        '"tls on"', '"tls_starttls off"', 'PIN_LINE = "tls_fingerprint {pin}"'], carrying
+
+
+# --- a pinned POP3 certificate --------------------------------------------------------
+
+
+def test_an_unpinned_server_renders_no_fingerprint_and_is_checked_against_the_trust_store():
+    assert not any(line.startswith("tls_fingerprint") for line in lines(rendered()))
+
+
+def test_a_pinned_server_renders_its_fingerprint_and_keeps_both_transport_lines():
+    text = rendered(pin=PIN)
+    assert line_starting(text, "tls_fingerprint") == f"tls_fingerprint {PIN}"
+    assert "tls on" in lines(text) and "tls_starttls off" in lines(text)
+
+
+@pytest.mark.parametrize("bad", [PIN.lower(), PIN + "\nkeep off", PIN.replace(":", ""), "AB:01", ""])
+def test_a_pin_in_any_other_spelling_is_refused_before_it_becomes_a_directive(bad):
+    with pytest.raises(render.RenderError) as raised:
+        rendered(pin=bad)
+    assert "pop3_cert_fingerprint" in str(raised.value)
 
 
 # --- the login reaches the provider as stored ---------------------------
@@ -151,6 +174,11 @@ def test_keep_and_only_new_are_rendered_for_every_account():
     text = rendered()
     assert line_starting(text, "keep") == "keep 14d"
     assert line_starting(text, "only_new") == "only_new on"
+
+
+def test_a_mailbox_kept_at_the_provider_renders_keep_on_whatever_its_window():
+    for window in (14, 1000000):
+        assert line_starting(rendered(keep=True, window=window), "keep") == "keep on"
 
 
 def test_a_window_the_query_lost_raises_here_and_renders_nothing():
@@ -238,6 +266,6 @@ def test_every_template_slot_is_filled():
 def test_the_row_is_unpacked_by_name_so_a_lost_column_never_shifts_another():
     assert render.Mailbox._fields == (
         "id", "pop3_login", "address", "pop3_host", "pop3_port", "label", "window",
-        "target", "threshold", "held_since")
+        "target", "threshold", "held_since", "keep", "pin")
     with pytest.raises(TypeError):
         render.Mailbox(*range(len(render.Mailbox._fields) - 1))

@@ -39,6 +39,7 @@ SMTP_PORT = 587
 ROW = """
 SELECT e.id, e.address, e.address_canonical, e.pop3_login, e.pop3_host, e.pop3_port,
        e.smtp_host, e.smtp_port, e.delete_window_days, e.comment,
+       e.smtp_login, e.keep_at_provider, e.pop3_cert_fingerprint, e.smtp_cert_fingerprint,
        e.state, e.state_changed_at, e.state_changed_by,
        e.last_fetch_at, e.last_fetch_status, e.last_fetch_cause, e.last_fetch_detail,
        e.last_test_at, e.last_test_status, e.last_test_detail,
@@ -100,6 +101,19 @@ STATE_BOX = """
 {%- endif -%}
 {%- endmacro -%}
 {%- macro way() -%}<a href="{{ url_for('external') }}">External mailboxes</a>{%- endmacro -%}
+{%- set smtp_login_help %}Empty means the POP3 login, or the address when the POP3 login is empty or
+  holds a colon, as a <code>recent:</code> login does. The password is the same one.{% endset -%}
+{%- set pin_help %}Only for a server whose certificate cannot be verified. Empty checks the
+  certificate against the trusted authorities and the host name; a SHA-256 fingerprint
+  trusts that one certificate instead, and fetching stops when the provider replaces
+  it.{% endset -%}
+{%- set smtp_pin_help %}As for POP3, and it holds for every external mailbox that sends through the
+  same SMTP host and port: the relay pins a server, not a mailbox.{% endset -%}
+{%- macro keep_box(on) -%}
+<div class="field"><label class="checkline"><input type="checkbox" name="keep_at_provider" value="yes"
+{{- ' checked' if on }}><div><b>Keep mail at the provider</b><span>Nothing is ever deleted there,
+whatever the window; the provider's mailbox fills up until its owner empties it.</span></div></label></div>
+{%- endmacro -%}
 """
 
 LIST_PAGE = STATE_BOX + """
@@ -112,7 +126,7 @@ LIST_PAGE = STATE_BOX + """
 {%- for row in mailboxes %}
 <tr>
   <td><a href="{{ url_for('external_mailbox', external_id=row.id) }}"><code>{{ row.address }}</code></a>\
-<span class="row-sub">deleted at the provider {{ row.delete_window_days }} days after first seen</span></td>
+<span class="row-sub">{% if row.keep_at_provider %}kept at the provider{% else %}deleted at the provider {{ row.delete_window_days }} days after first seen{% endif %}</span></td>
   <td>{% if row.domain_id %}<a href="{{ url_for('domain', domain_id=row.domain_id) }}"><code>{{ row.label }}</code></a>{% else %}&mdash;{% endif %}</td>
   <td class="state">{{ switch(row) }}<span class="row-sub">{{ state_words(row) }}</span>
       {{- pipeline_failed(row.reading.failed) }}
@@ -158,6 +172,8 @@ ADD_PAGE = STATE_BOX + """
          warn=refusal if fault == 'address') }}
 {{ field('POP3 login', 'pop3_login', typed.pop3_login, class_='mono-input', help=login_help,
          warn=refusal if fault == 'pop3_login') }}
+{{ field('SMTP login', 'smtp_login', typed.smtp_login, class_='mono-input', help=smtp_login_help,
+         warn=refusal if fault == 'smtp_login') }}
 {{ field('Provider password', 'credential', type='password', autocomplete='new-password',
          help='Stored write-only; never shown again.') }}
 <div class="inline-fields">
@@ -172,8 +188,13 @@ ADD_PAGE = STATE_BOX + """
 {{ field('SMTP port', 'smtp_port', typed.smtp_port, type='number', class_='short', min=1,
          max=65535, help=smtp_help, warn=refusal if fault == 'smtp_port') }}
 </div>
+{{ field('POP3 certificate fingerprint', 'pop3_cert_fingerprint', typed.pop3_cert_fingerprint,
+         class_='mono-input', help=pin_help, warn=refusal if fault == 'pop3_cert_fingerprint') }}
+{{ field('SMTP certificate fingerprint', 'smtp_cert_fingerprint', typed.smtp_cert_fingerprint,
+         class_='mono-input', help=smtp_pin_help, warn=refusal if fault == 'smtp_cert_fingerprint') }}
 {{ field('Deletion at the provider, days', 'window', typed.window, type='number',
          class_='short', min=1, help=window_help, warn=refusal if fault == 'window') }}
+{{ keep_box(typed.keep_at_provider) }}
 {{ field('Comment', 'comment', typed.comment) }}
 </div></section>
 
@@ -262,6 +283,10 @@ as this address.</span>{% endif %}</div></div>
 {{ field('SMTP port', 'smtp_port', servers.smtp_port, type='number', class_='short', min=1,
          max=65535, help=smtp_help, warn=refusal if fault == 'smtp_port') }}
 </div>
+{{ field('POP3 certificate fingerprint', 'pop3_cert_fingerprint', servers.pop3_cert_fingerprint,
+         class_='mono-input', help=pin_help, warn=refusal if fault == 'pop3_cert_fingerprint') }}
+{{ field('SMTP certificate fingerprint', 'smtp_cert_fingerprint', servers.smtp_cert_fingerprint,
+         class_='mono-input', help=smtp_pin_help, warn=refusal if fault == 'smtp_cert_fingerprint') }}
 {%- set clears %}Changing either host clears the stored provider password,
   so it is never presented to a host you did not put it in for. Enter it again in
   Settings below; nothing is fetched or sent until you do (<code>0022</code>).{% endset %}
@@ -277,10 +302,13 @@ as this address.</span>{% endif %}</div></div>
 {{ refused(refusal if form == 'settings') }}
 {{ field('POP3 login', 'pop3_login', settings.pop3_login, class_='mono-input', help=login_help,
          warn=refusal if fault == 'pop3_login') }}
+{{ field('SMTP login', 'smtp_login', settings.smtp_login, class_='mono-input', help=smtp_login_help,
+         warn=refusal if fault == 'smtp_login') }}
 {{ field('New provider password', 'credential', type='password', autocomplete='new-password',
          help='Leave empty to keep the stored password. Stored write-only; never shown again.') }}
 {{ field('Deletion at the provider, days', 'window', settings.window, type='number',
          class_='short', min=1, warn=refusal if fault == 'window') }}
+{{ keep_box(settings.keep_at_provider) }}
 {{ field('Comment', 'comment', settings.comment) }}
 <div class="form-foot"><button class="btn btn-primary" type="submit">Save settings</button>\
 <a class="btn" href="{{ url_for('external') }}">Cancel, nothing changes</a></div>
@@ -390,12 +418,15 @@ def needed(conn, external_id):
 
 def servers_of(row):
     return {"pop3_host": row["pop3_host"], "pop3_port": row["pop3_port"],
-            "smtp_host": row["smtp_host"], "smtp_port": row["smtp_port"]}
+            "smtp_host": row["smtp_host"], "smtp_port": row["smtp_port"],
+            "pop3_cert_fingerprint": row["pop3_cert_fingerprint"],
+            "smtp_cert_fingerprint": row["smtp_cert_fingerprint"]}
 
 
 def settings_of(row):
-    """What the settings form shows: the stored login, never the password."""
-    return {"pop3_login": row["pop3_login"] or "", "window": row["delete_window_days"],
+    """What the settings form shows: the stored logins, never the password."""
+    return {"pop3_login": row["pop3_login"] or "", "smtp_login": row["smtp_login"] or "",
+            "window": row["delete_window_days"], "keep_at_provider": row["keep_at_provider"],
             "comment": row["comment"] or ""}
 
 
@@ -408,7 +439,8 @@ def item(conn, row, status=200, form=None, refusal=None, fault=None,
 
 
 def check_servers(form, defaults=None):
-    """The four server fields, first fault in field order."""
+    """The server fields, first fault in field order: the four of
+    the hosts, then the two certificate pins."""
     defaults = defaults or {}
     return {
         "pop3_host": ("pop3_host", lambda: validate.host(form.get("pop3_host"), "POP3 host",
@@ -419,6 +451,10 @@ def check_servers(form, defaults=None):
                                                          SMTP_EXAMPLE)),
         "smtp_port": ("smtp_port", lambda: validate.port(form.get("smtp_port"), "SMTP port",
                                                          defaults.get("smtp_port"))),
+        "pop3_cert_fingerprint": ("pop3_cert_fingerprint", lambda: validate.fingerprint(
+            form.get("pop3_cert_fingerprint"), "POP3 certificate fingerprint")),
+        "smtp_cert_fingerprint": ("smtp_cert_fingerprint", lambda: validate.fingerprint(
+            form.get("smtp_cert_fingerprint"), "SMTP certificate fingerprint")),
     }
 
 
@@ -448,19 +484,23 @@ def register(app_):
     def add_external():
         conn = app.connection()
         free = common.rows(conn, FREE_DOMAINS)
-        typed = {"address": "", "pop3_login": "", "pop3_host": "", "pop3_port": POP3_PORT,
-                 "smtp_host": "", "smtp_port": SMTP_PORT, "window": validate.WINDOW_DEFAULT,
+        typed = {"address": "", "pop3_login": "", "smtp_login": "", "pop3_host": "",
+                 "pop3_port": POP3_PORT, "smtp_host": "", "smtp_port": SMTP_PORT,
+                 "pop3_cert_fingerprint": "", "smtp_cert_fingerprint": "",
+                 "window": validate.WINDOW_DEFAULT, "keep_at_provider": False,
                  "comment": "", "domain_choice": "free", "domain_id": "", "label": ""}
         if request.method == "GET":
             return add_page(typed, free)
         typed.update({name: request.form.get(name, "") for name in
-                      ("address", "pop3_login", "pop3_host", "pop3_port", "smtp_host",
-                       "smtp_port", "comment", "domain_id", "label")})
+                      ("address", "pop3_login", "smtp_login", "pop3_host", "pop3_port",
+                       "smtp_host", "smtp_port", "pop3_cert_fingerprint",
+                       "smtp_cert_fingerprint", "comment", "domain_id", "label")})
         typed["window"] = request.form.get("window", "")
+        typed["keep_at_provider"] = keep = common.checked(request.form, "keep_at_provider")
         typed["domain_choice"] = request.form.get("domain_choice", "")
 
         # ⛔ EVERY CHECK RUNS BEFORE ANYTHING IS WRITTEN, in the form's own order:
-        # window, address, login, servers, domain choice.
+        # window, address, logins, servers, domain choice.
         try:
             window = validate.window(request.form.get("window"))
         except validate.Refused as refused:
@@ -477,6 +517,10 @@ def register(app_):
             login = validate.pop3_login(request.form.get("pop3_login"))
         except validate.Refused as refused:
             return add_page(typed, free, str(refused), "pop3_login")
+        try:
+            smtp_login = validate.smtp_login(request.form.get("smtp_login"))
+        except validate.Refused as refused:
+            return add_page(typed, free, str(refused), "smtp_login")
         servers, field, refusal = read_servers(request.form,
                                                {"pop3_port": POP3_PORT, "smtp_port": SMTP_PORT})
         if servers is None:
@@ -513,12 +557,15 @@ def register(app_):
             with common.unique_violation(conn, duplicate(display)), conn.cursor() as cursor:
                 cursor.execute(
                     "INSERT INTO external_mailbox (address, address_canonical, pop3_login, "
-                    "credential, pop3_host, pop3_port, smtp_host, smtp_port, "
-                    "delete_window_days, comment) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                    (display, canonical, login, credential, servers["pop3_host"],
+                    "smtp_login, credential, pop3_host, pop3_port, smtp_host, smtp_port, "
+                    "pop3_cert_fingerprint, smtp_cert_fingerprint, delete_window_days, "
+                    "keep_at_provider, comment) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "RETURNING id",
+                    (display, canonical, login, smtp_login, credential, servers["pop3_host"],
                      servers["pop3_port"], servers["smtp_host"], servers["smtp_port"],
-                     window, typed["comment"] or None))
+                     servers["pop3_cert_fingerprint"], servers["smtp_cert_fingerprint"],
+                     window, keep, typed["comment"] or None))
                 external_id = cursor.fetchone()[0]
         except validate.Refused:
             # ⚠️ the concurrent winner committed between the check and this INSERT; its
@@ -563,7 +610,8 @@ def register(app_):
             return add_page(typed, free, str(refused), "domain")
 
         domains.record(conn, "add_external_mailbox", canonical,
-                       {"credential_set": credential is not None, "window": window})
+                       {"credential_set": credential is not None, "window": window,
+                        "keep_at_provider": keep})
         # the link is written once, here, and there is no unlink and no move
         domains.record(conn, "map_domain", label, {"external_mailbox_id": external_id})
         return common.acted("external", "external_saved")
@@ -575,12 +623,15 @@ def register(app_):
 
     @app_.post("/external/<int:external_id>/settings")
     def external_settings(external_id):
-        """the login, a new password, the window and the comment together."""
+        """the logins, a new password, the window, whether mail is kept at
+        the provider and the comment together."""
         conn = app.connection()
         row = needed(conn, external_id)
+        keep = common.checked(request.form, "keep_at_provider")
         settings = {"pop3_login": request.form.get("pop3_login",
                                                    row["pop3_login"] or ""),
-                    "window": request.form.get("window", ""),
+                    "smtp_login": request.form.get("smtp_login", row["smtp_login"] or ""),
+                    "window": request.form.get("window", ""), "keep_at_provider": keep,
                     "comment": request.form.get("comment", row["comment"] or "")}
         try:
             window = validate.window(request.form.get("window"))
@@ -598,28 +649,44 @@ def register(app_):
         except validate.Refused as refused:
             return item(conn, row, 400, "settings", str(refused), "pop3_login",
                         settings=settings)
+        try:
+            # a form that does not carry it keeps the stored one, as for the POP3 login
+            typed_smtp = request.form.get("smtp_login")
+            smtp_login = (row["smtp_login"] if typed_smtp is None
+                          else validate.smtp_login(typed_smtp))
+        except validate.Refused as refused:
+            return item(conn, row, 400, "settings", str(refused), "smtp_login",
+                        settings=settings)
 
         credential = request.form.get("credential") or None
         before_login = row["pop3_login"] or None
         login_changed = login != before_login
+        before_smtp = row["smtp_login"] or None
         comment = request.form.get("comment", row["comment"] or "") or None
 
         with conn.cursor() as cursor:
             if credential is not None:
                 cursor.execute("UPDATE external_mailbox SET credential = %s WHERE id = %s",
                                (credential, external_id))
-            cursor.execute("UPDATE external_mailbox SET pop3_login = %s, "
-                           "delete_window_days = %s, comment = %s WHERE id = %s",
-                           (login, window, comment, external_id))
+            cursor.execute("UPDATE external_mailbox SET pop3_login = %s, smtp_login = %s, "
+                           "delete_window_days = %s, keep_at_provider = %s, comment = %s "
+                           "WHERE id = %s",
+                           (login, smtp_login, window, keep, comment, external_id))
         if credential is not None:
             domains.record(conn, "set_credential", row["address_canonical"],
                            {"credential_set": True})
         if login_changed:
             domains.record(conn, "set_pop3_login", row["address_canonical"],
                            {"before": before_login, "after": login})
-        if window != row["delete_window_days"]:
+        if smtp_login != before_smtp:
+            # a login is not a secret; nothing at the provider is asked, because
+            # the password check is POP3 alone
+            domains.record(conn, "set_smtp_login", row["address_canonical"],
+                           {"before": before_smtp, "after": smtp_login})
+        if window != row["delete_window_days"] or keep != row["keep_at_provider"]:
+            # the row records the policy, both halves even when one moved
             domains.record(conn, "set_delete_window", row["address_canonical"],
-                           {"days": window})
+                           {"days": window, "keep_at_provider": keep})
         # ⛔ a changed login AND a changed password each ask the pipeline to try the
         # stored credential; the comment and the window change nothing at the provider
         if login_changed or credential is not None:
@@ -631,11 +698,13 @@ def register(app_):
 
     @app_.post("/external/<int:external_id>/servers")
     def external_servers(external_id):
-        """four fields; an identical save writes nothing at all."""
+        """the hosts, ports and certificate pins; an identical save writes
+        nothing at all."""
         conn = app.connection()
         row = needed(conn, external_id)
         typed = {name: request.form.get(name, "") for name in
-                 ("pop3_host", "pop3_port", "smtp_host", "smtp_port")}
+                 ("pop3_host", "pop3_port", "smtp_host", "smtp_port",
+                  "pop3_cert_fingerprint", "smtp_cert_fingerprint")}
         # ⚠️ no default here: on this form an empty port is refused, because nothing on
         # the screen shows what it would become
         values, field, refusal = read_servers(request.form)
@@ -651,11 +720,14 @@ def register(app_):
                         or before["smtp_host"] != values["smtp_host"])
         with conn.cursor() as cursor:
             cursor.execute("UPDATE external_mailbox SET pop3_host = %s, pop3_port = %s, "
-                           "smtp_host = %s, smtp_port = %s WHERE id = %s",
+                           "smtp_host = %s, smtp_port = %s, pop3_cert_fingerprint = %s, "
+                           "smtp_cert_fingerprint = %s WHERE id = %s",
                            (values["pop3_host"], values["pop3_port"], values["smtp_host"],
-                            values["smtp_port"], external_id))
-        # hosts and ports are not secrets, so the row carries all four, before and after;
-        # the journal records that the host change cleared the credential
+                            values["smtp_port"], values["pop3_cert_fingerprint"],
+                            values["smtp_cert_fingerprint"], external_id))
+        # hosts, ports and certificate fingerprints are not secrets, so the row carries
+        # them all, before and after; the journal records that the host change cleared the
+        # credential
         domains.record(conn, "set_provider_servers", row["address_canonical"],
                        {"before": before, "after": values, "credential_cleared": host_changed})
         if host_changed:
@@ -663,7 +735,7 @@ def register(app_):
             # below now asks for the password again
             return common.acted("external_mailbox", "servers_saved_password_cleared",
                                 external_id=external_id)
-        # a port-only change keeps the credential; try it, though the check is POP3 alone
+        # a port or pin change keeps the credential; try it, though the check is POP3 alone
         common.ask(conn, "test_credential", row["address_canonical"],
                    {"external_mailbox_id": external_id}, g.identity)
         return common.acted("external_mailbox", "servers_saved", external_id=external_id)

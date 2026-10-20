@@ -84,7 +84,9 @@ mail a person sends.
 
 1. **Collect.** A timer starts the fetch runner every three minutes. For each enabled
    external mailbox it takes a try-lock, renders mpop's configuration (TLS on, the
-   credential read from a pipe) and bounds the run with its own timeout. mpop retrieves
+   credential read from a pipe, the deletion window or "keep everything", and a pinned
+   certificate's fingerprint where the mailbox gives one) and bounds the run with its own
+   timeout. mpop retrieves
    one message at a time and pipes it into the delivery filter, and records it as
    retrieved only when the filter succeeded, so a failure leaves that message and every
    later one at the provider for the next run.
@@ -110,13 +112,16 @@ mail a person sends.
 ### Outgoing
 
 1. **Submit.** The client authenticates on port 465, implicit TLS, as
-   `<login>@<domain>`. Nothing listens on port 25, and only root may use `sendmail`.
+   `<login>@<domain>`, and may send a message of up to 50 MiB, as much as the antivirus
+   scans. Nothing listens on port 25, and only root may use `sendmail`.
 2. **Bind the sender.** Postfix refuses an envelope sender the login does not own. The
    milter refuses a From address that is not the external mailbox's own, then scans the
    message with ClamAV before Postfix queues it. It never rewrites.
-3. **Relay.** Postfix picks the relay host and credential by sender, verifies the
+3. **Relay.** Postfix picks the relay host and credential by sender, and logs in with the
+   mailbox's SMTP login, else its POP3 login, else the address. It verifies the
    provider's certificate against the configured host name before it sends the password,
-   and hands the message to the provider's SMTP server.
+   or against the fingerprint pinned for that server and port, and hands the message to
+   the provider's SMTP server.
 4. **Sent.** The client's append to its Sent folder is the confirmation. The Sent hook
    finds the file through Dovecot, adds its name under `Sent/<account>` in the archive
    and writes the ledger rows. It never moves the file and never fails the append.
@@ -190,8 +195,9 @@ Logs go to the journal.
 
 One initial schema, `schema/0001_initial.sql`, and migrations after it. The main tables:
 
-- **`external_mailbox`**: the provider mailbox in front of a domain: address, POP3 login,
-  hosts and ports, the deletion window, the stored credential (cleared whenever a host
+- **`external_mailbox`**: the provider mailbox in front of a domain: address, POP3 and
+  SMTP logins, hosts and ports, pinned certificate fingerprints, the deletion window or
+  whether mail is kept at the provider, the stored credential (cleared whenever a host
   changes), and the fetch's state.
 - **`domain`**: one DNS label, the external mailbox in front of it, the archive's password
   hash, the spam threshold and whether spam reaches people.

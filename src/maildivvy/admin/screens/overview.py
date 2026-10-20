@@ -31,7 +31,7 @@ from maildivvy.admin.screens import common, fetch, health
 WORRIES = """
 SELECT e.id, e.address, e.address_canonical, e.state, e.frozen_since,
        e.last_fetch_status, e.last_test_status, e.last_skip_at, e.last_skip_uidl,
-       e.delete_window_days, d.label
+       e.delete_window_days, e.keep_at_provider, d.label
   FROM external_mailbox e
   LEFT JOIN domain d ON d.external_mailbox_id = e.id
  WHERE e.last_fetch_status = 'auth_failed' OR e.last_test_status = 'auth_failed'

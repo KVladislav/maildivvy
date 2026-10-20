@@ -6,6 +6,7 @@ which columns the two queries select, what the command line refuses, and what th
 credential helper writes on which stream.
 """
 
+import contextlib
 import datetime
 import io
 import os
@@ -43,7 +44,7 @@ class Cursor:
 
 
 ROW = (7, None, "Ivan.P@example.org", "pop.example.org", 995, "alpha", 14,
-       "ivan.p@example.org", 8.00, None)
+       "ivan.p@example.org", 8.00, None, False, None)
 
 
 # --- the two queries ---------------------------------------------------------
@@ -55,7 +56,8 @@ def test_both_queries_select_the_same_columns_in_the_mailboxs_own_order():
     selected = runner.COLUMNS.split("SELECT")[1].split("FROM")[0]
     names = [part.strip().split(".")[1] for part in selected.split(",")]
     assert names == ["id", "pop3_login", "address", "pop3_host", "pop3_port", "label",
-                     "delete_window_days", "address_canonical", "spam_threshold", "held_since"]
+                     "delete_window_days", "address_canonical", "spam_threshold", "held_since",
+                     "keep_at_provider", "pop3_cert_fingerprint"]
     assert len(names) == len(render.Mailbox._fields)
 
 
@@ -154,7 +156,8 @@ def test_a_run_with_no_external_mailboxes_exits_zero_and_prints_nothing(monkeypa
     (["auth_failed", "no_new_mail"], 1),
 ])
 def test_a_run_exits_non_zero_when_any_mailbox_failed(monkeypatch, statuses, code):
-    rows = [(i, None, f"a{i}@x.test", "p.x.test", 995, "alpha", 14, f"a{i}@x.test", 8.00, None)
+    rows = [(i, None, f"a{i}@x.test", "p.x.test", 995, "alpha", 14, f"a{i}@x.test", 8.00, None,
+             False, None)
             for i in range(len(statuses))]
     monkeypatch.setattr(runner.db, "connect", lambda *a, **k: Connection(rows))
     answers = iter(statuses)
@@ -163,7 +166,8 @@ def test_a_run_exits_non_zero_when_any_mailbox_failed(monkeypatch, statuses, cod
 
 
 def test_only_the_named_mailbox_is_fetched_with_only(monkeypatch):
-    rows = [(i, None, f"a{i}@x.test", "p.x.test", 995, "alpha", 14, f"a{i}@x.test", 8.00, None)
+    rows = [(i, None, f"a{i}@x.test", "p.x.test", 995, "alpha", 14, f"a{i}@x.test", 8.00, None,
+             False, None)
             for i in (1, 2, 3)]
     monkeypatch.setattr(runner.db, "connect", lambda *a, **k: Connection(rows))
     fetched = []
@@ -218,6 +222,11 @@ def test_the_deletion_date_is_the_skip_plus_the_window():
     skipped = datetime.datetime(2026, 9, 20, 6, 24)
     assert runner.deletion_date(skipped, 14) == datetime.datetime(2026, 10, 4, 6, 24)
     assert runner.deletion_date(skipped, None) is None  # no window, no day to name
+
+
+def test_a_mailbox_kept_at_the_provider_names_no_deletion_date():
+    skipped = datetime.datetime(2026, 9, 20, 6, 24)
+    assert runner.deletion_date(skipped, 14, kept=True) is None
 
 
 # --- the credential helper ---------------------------------------------------
@@ -353,14 +362,15 @@ def test_the_timeout_kills_the_delivery_filter_mpop_started_as_well(tmp_path):
             pytest.fail(f"the child {child} of the killed mpop is still running")
     finally:
         if running(child):
-            os.kill(child, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, signal.SIGKILL)
 
 
 def running(pid):
     """Is the process there and not a zombie?"""
     try:
         state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # gone before, or while, it is read
         return False
     return state != "Z"
 

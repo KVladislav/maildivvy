@@ -38,7 +38,7 @@ INTERFACE_ACTS = (
     "map_domain", "set_archive_password", "set_spam_policy", "set_outbound_unscanned",
     "create_account", "set_password", "set_account_state", "grant_admin", "revoke_admin",
     "add_external_mailbox", "deactivate_external_mailbox", "set_credential",
-    "set_provider_servers", "set_pop3_login", "set_delete_window", "resume_fetch",
+    "set_provider_servers", "set_pop3_login", "set_smtp_login", "set_delete_window", "resume_fetch",
     "break_glass_use",
 )
 # Written by the pipeline, in the name of the administrator who asked for it.
@@ -104,6 +104,8 @@ def is_secret_shaped(text):
         return False
     if validate.is_host(text):
         return False     # the host field's own rule, so the two cannot drift
+    if validate.is_fingerprint(text):
+        return False     # a certificate's fingerprint is public
     return len(classes_of(text)) >= CLASSES
 
 

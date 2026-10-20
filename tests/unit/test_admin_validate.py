@@ -165,6 +165,46 @@ def test_one_rule_serves_the_address_and_the_login():
     assert "no_inner_whitespace" in validate.pop3_login.__code__.co_names
 
 
+# --- the SMTP login ----------------------------------------------------------------
+
+@pytest.mark.parametrize("typed,stored", [("", None), ("   ", None), (None, None),
+                                          ("  box-smtp  ", "box-smtp")])
+def test_an_empty_smtp_login_is_the_pop3_login_and_a_typed_one_is_stripped(typed, stored):
+    assert validate.smtp_login(typed) == stored
+
+
+def test_an_smtp_login_with_a_colon_is_refused_since_postfix_splits_its_value_there():
+    assert "no colon" in refusal(validate.smtp_login, "recent:box@example.org")
+    assert "no spaces" in refusal(validate.smtp_login, "box smtp")
+    assert "no_inner_whitespace" in validate.smtp_login.__code__.co_names
+
+
+# --- a pinned certificate ------------------------------------------------------------
+
+PIN = ":".join(["AB", "01"] * 16)
+
+
+@pytest.mark.parametrize("typed", [
+    PIN, PIN.lower(), PIN.replace(":", ""), PIN.replace(":", " "),
+    f"sha256 Fingerprint={PIN}", f"SHA256 Fingerprint={PIN}", f"SHA256: {PIN}",
+    f"  {PIN.lower()}  "])
+def test_a_fingerprint_in_any_usual_spelling_is_stored_in_the_one(typed):
+    assert validate.fingerprint(typed, "POP3 certificate fingerprint") == PIN
+    assert validate.is_fingerprint(PIN)
+
+
+@pytest.mark.parametrize("typed,stored", [("", None), ("   ", None), (None, None)])
+def test_an_empty_fingerprint_is_no_pin(typed, stored):
+    assert validate.fingerprint(typed, "SMTP certificate fingerprint") == stored
+
+
+@pytest.mark.parametrize("typed", [PIN[:-3], PIN + ":CD", "zz" * 32, "sha1 Fingerprint=" + PIN,
+                                   PIN + "\nkeep off", "AB-01" * 16])
+def test_anything_but_a_sha256_fingerprint_is_refused(typed):
+    assert refusal(validate.fingerprint, typed, "POP3 certificate fingerprint").startswith(
+        "The POP3 certificate fingerprint must be a SHA-256 fingerprint")
+
+
 # --- the provider host and port --------------------------------------
 
 @pytest.mark.parametrize("typed", ["pop .example.org", "a@example.org", "pop!example.org",

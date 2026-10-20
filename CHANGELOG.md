@@ -5,6 +5,33 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-20
+
+### Added
+
+- An external mailbox may have an SMTP login of its own. Left empty, the relay logs in
+  with the POP3 login, or with the address when the POP3 login is empty or holds a colon
+  (a `recent:` login).
+- An external mailbox may keep its mail at the provider: nothing is deleted there,
+  whatever the deletion window.
+- A provider certificate that cannot be verified can be pinned by its SHA-256
+  fingerprint, for the POP3 server and the SMTP server each on its own. A pinned server
+  is trusted by that certificate alone. An SMTP pin holds for every external mailbox
+  sending through the same host and port.
+- `maildivvy_postfix_message_size_limit`, a Postfix role default that
+  `/etc/maildivvy/install.yml` may set: the largest message submission accepts.
+
+### Changed
+
+- ⚠️ The relay logs in with an external mailbox's POP3 login where one is set, no longer
+  always with the address. A provider that accepts only the address for SMTP stops
+  relaying such a mailbox's mail until its SMTP login is set to the address.
+- Submission accepts a message up to 50 MiB (52428800 bytes), as much as the antivirus
+  scans. It was Postfix's default of 10240000 bytes.
+- The upgrade applies one database migration, `schema/0002_provider_login_keep_and_pins.sql`.
+  It upgrades a 0.1 release; a machine from before 0.1.0 is upgraded with a 0.1 release
+  first, and the installer refuses this one there until it is.
+
 ## 0.1.3 - 2026-10-11
 
 ### Fixed

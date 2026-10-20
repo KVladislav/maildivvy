@@ -502,8 +502,9 @@ The person's mail client uses `<mail hostname>` for both IMAP (993) and submissi
 
 **External mailboxes → Add external mailbox.** This is the provider mailbox the domain's
 mail is collected from, and sent through. You give the address, the POP3 login if it is
-not the address, the provider password, the POP3 and SMTP hosts and ports, the deletion
-window in days, and the domain in front of it. It is saved **disabled**.
+not the address, the SMTP login if it is not the POP3 login, the provider password, the
+POP3 and SMTP hosts and ports, the deletion window in days, and the domain in front of
+it. It is saved **disabled**.
 
 ⛔ **Give both hosts by name, never by IP address.** The relay verifies the provider's
 certificate against the host name the mailbox is configured with before it sends the
@@ -515,8 +516,40 @@ refuse an IP address for either host.
 - Changing either host clears the stored password: type it again.
 - Changing the POP3 login makes the fetcher treat the mailbox as new and collect its
   whole window again.
+- The relay logs in with the SMTP login, or with the POP3 login when the SMTP login is
+  empty, or with the address when both are, or when the POP3 login holds a colon, as a
+  `recent:` login does. The password is the same one. Nothing checks the SMTP login
+  before a message is sent: **Check password** asks the POP3 server alone.
 - The deletion window counts from when the fetcher first saw a message. After it, the
   message is deleted at the provider, and this machine holds the only copy.
+- **Keep mail at the provider** deletes nothing there, whatever the window. The
+  provider's mailbox then fills up until its owner empties it. Unticked again, the
+  window applies from each message's first sighting, so mail kept past it is deleted at
+  the next fetch.
+
+#### A provider certificate that cannot be verified
+
+A provider whose certificate is self-signed, names another host, or has expired cannot
+be verified, so nothing is fetched from it or sent through it. If you have checked that
+the certificate really is the provider's, pin it: give its SHA-256 fingerprint in
+**POP3 certificate fingerprint** or **SMTP certificate fingerprint** on the mailbox's
+servers form. A pinned server is trusted when it presents that certificate, whatever it
+names and whatever its dates, and refused otherwise; its password is never sent to
+another. Read the fingerprint from a machine you trust:
+
+```sh
+openssl s_client -connect <pop3 host>:995 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+openssl s_client -connect <smtp host>:587 -starttls smtp </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+```
+
+Use `:465` without `-starttls smtp` for a provider on 465. The form takes the line as
+openssl prints it.
+
+- When the provider replaces its certificate, fetching or sending stops until the pin
+  is updated. Health reports the failed fetch, and relayed mail waits in the queue.
+- An SMTP pin belongs to the server and port, not to the mailbox: it holds for every
+  external mailbox sending through that host and port, and a second pin there is
+  accepted beside the first.
 
 Then **Check password** asks the pipeline to log in at the provider, and pressing the
 mailbox's state switch, which reads *disabled* (a screen reader names it **Enable**),

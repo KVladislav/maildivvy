@@ -38,6 +38,7 @@ TUNABLES = (
     "maildivvy_rspamd_greylist_score", "maildivvy_rspamd_provider_hosts", "maildivvy_rspamd_rbls",
     "maildivvy_rspamd_rbl_listed_probe", "maildivvy_rspamd_rbl_clean_probe",
     "maildivvy_postfix_inet_protocols", "maildivvy_postfix_tls_protocols",
+    "maildivvy_postfix_message_size_limit",
 )
 SECRETS = ("maildivvy_breakglass_password", "maildivvy_acme_dns_credentials")
 # the run's own values (run.run_values), never kept: the test certificate is chosen on the

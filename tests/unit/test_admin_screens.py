@@ -1328,7 +1328,8 @@ def an_external(**changed):
         "id": 9, "address": "Box@example.org", "address_canonical": "box@example.org",
         "pop3_login": "recent:box", "pop3_host": "pop.example.org", "pop3_port": 995,
         "smtp_host": "smtp.example.org", "smtp_port": 587, "delete_window_days": 14,
-        "comment": "the sales mailbox", "state": "active",
+        "smtp_login": None, "keep_at_provider": False, "pop3_cert_fingerprint": None,
+        "smtp_cert_fingerprint": None, "comment": "the sales mailbox", "state": "active",
         "state_changed_at": "2026-09-02 10:00", "state_changed_by": "t28admin",
         "last_fetch_at": FETCHED_AT, "last_fetch_status": "auth_failed",
         "last_fetch_cause": None, "last_fetch_detail": None,
@@ -1558,8 +1559,9 @@ def test_adding_one_is_a_narrow_form_and_a_refusal_is_a_flash_and_a_warn(externa
     form = html.split('<form class="narrow" method="post" action="/external/add">', 1)[1] \
         .split("</form>", 1)[0]
     names = re.findall(r'<(?:input|select)[^>]* name="([a-z0-9_]+)"', form)
-    assert names[:9] == ["address", "pop3_login", "credential", "pop3_host", "pop3_port",
-                         "smtp_host", "smtp_port", "window", "comment"]
+    assert names[:13] == ["address", "pop3_login", "smtp_login", "credential", "pop3_host",
+                          "pop3_port", "smtp_host", "smtp_port", "pop3_cert_fingerprint",
+                          "smtp_cert_fingerprint", "window", "keep_at_provider", "comment"]
     assert form.count('<div class="inline-fields">') == 3
     assert '<div class="box-head"><h2>The domain in front of it</h2></div>' in form
     assert ('<label class="choice"><input type="radio" name="domain_choice" value="free" '
@@ -1583,6 +1585,60 @@ def test_adding_one_is_a_narrow_form_and_a_refusal_is_a_flash_and_a_warn(externa
     again = html.split('<label for="password2">', 1)[1].split("</div>", 1)[0]
     assert '<p class="help warn">Choose a free domain, or a new one.</p>' in again
     assert html.count('class="flash bad') == 1 and html.count("help warn") == 1
+
+
+PIN = ":".join(["AB", "01"] * 16)
+
+
+def test_the_item_page_carries_the_smtp_login_the_pins_and_the_keep_box(external_world, monkeypatch):
+    monkeypatch.setitem(EXTERNALS, 12, an_external(
+        id=12, address="ok@example.org", address_canonical="ok@example.org", comment=None,
+        last_fetch_status="ok", last_test_status="ok", frozen_since=None, domain_id=2,
+        label="office", smtp_login="box-smtp", keep_at_provider=True,
+        pop3_cert_fingerprint=PIN, smtp_cert_fingerprint=PIN))
+    for external_id, login, pin, checked in [(9, None, None, False), (12, "box-smtp", PIN, True)]:
+        _, html = main_part(external_world, f"/external/{external_id}")
+        servers = html.split(f'<form method="post" action="/external/{external_id}/servers">', 1)[1] \
+            .split("</form>", 1)[0]
+        for name in ("pop3_cert_fingerprint", "smtp_cert_fingerprint"):
+            value = f' value="{pin}"' if pin else ""
+            assert (f'<input id="{name}" name="{name}" type="text"{value} class="mono-input">'
+                    ) in servers
+        assert "the relay pins a server, not a mailbox" in servers
+        settings = html.split(f'<form method="post" action="/external/{external_id}/settings">', 1)[1] \
+            .split("</form>", 1)[0]
+        value = f' value="{login}"' if login else ""
+        assert (f'<input id="smtp_login" name="smtp_login" type="text"{value} class="mono-input">'
+                ) in settings
+        box = settings.split('<label class="checkline">', 1)[1].split("</label>", 1)[0]
+        assert box.startswith('<input type="checkbox" name="keep_at_provider" value="yes"'
+                              + (" checked>" if checked else ">"))
+        assert "<b>Keep mail at the provider</b>" in box
+    _, html = main_part(external_world, "/external")
+    assert "kept at the provider" in row_of(html, "ok@example.org")
+    assert "deleted at the provider 14 days after first seen" in row_of(html, "Box@example.org")
+
+
+@pytest.mark.parametrize("path,form,fault,words", [
+    ("/external/9/settings", {"smtp_login": "recent:box", "window": "14"}, "smtp_login",
+     "no colon"),
+    ("/external/9/settings", {"smtp_login": "box smtp", "window": "14"}, "smtp_login",
+     "no spaces"),
+    ("/external/9/servers", {"pop3_host": "pop.example.org", "pop3_port": "995",
+                             "smtp_host": "smtp.example.org", "smtp_port": "587",
+                             "pop3_cert_fingerprint": "AB:01"}, "pop3_cert_fingerprint",
+     "SHA-256 fingerprint"),
+    ("/external/9/servers", {"pop3_host": "pop.example.org", "pop3_port": "995",
+                             "smtp_host": "smtp.example.org", "smtp_port": "587",
+                             "smtp_cert_fingerprint": "zz" * 32}, "smtp_cert_fingerprint",
+     "SHA-256 fingerprint"),
+])
+def test_a_refused_login_or_pin_is_said_beside_its_own_field(external_world, path, form, fault,
+                                                              words):
+    status, html = main_part(external_world, path, "post", **form)
+    assert status == 400
+    beside = html.split(f'<label for="{fault}">', 1)[1].split('<label for=', 1)[0]
+    assert '<p class="help warn">' in beside and words in beside
 
 
 def test_the_deletion_page_is_two_danger_zones_with_leaving_the_domain_first(external_world):
@@ -2128,8 +2184,8 @@ def row(**columns):
         "last_test_at", "last_test_status", "last_test_detail", "stuck_since",
         "stuck_runs", "skip_streak", "frozen_since", "last_skip_at", "last_skip_uidl",
         "held_since", "delete_window_days", "checking", "enabling", "deleting")}
-    empty.update({"state": "active", "delete_window_days": 14, "stuck_runs": 0,
-                  "checking": False, "enabling": False, "deleting": False})
+    empty.update({"state": "active", "delete_window_days": 14, "keep_at_provider": False,
+                  "stuck_runs": 0, "checking": False, "enabling": False, "deleting": False})
     empty.update(columns)
     return empty
 
@@ -2220,6 +2276,13 @@ def test_the_skip_goes_only_once_the_provider_has_deleted_it():
     kept = row(last_skip_at=skipped, last_skip_uidl="UID-9", delete_window_days=14)
     assert fetch.skip_of(kept, today=datetime.date(2026, 9, 15)) is not None
     assert fetch.skip_of(kept, today=datetime.date(2026, 9, 16)) is None
+
+
+def test_a_skip_kept_at_the_provider_stays_and_names_no_deletion_date():
+    skipped = datetime.datetime(2026, 9, 1, 9, 30, tzinfo=datetime.timezone.utc)
+    kept = row(last_skip_at=skipped, last_skip_uidl="UID-9", keep_at_provider=True)
+    said = fetch.skip_of(kept, today=datetime.date(2027, 9, 1))
+    assert "UID-9" in said and "kept at the provider" in said and "deletes it on" not in said
 
 
 @pytest.mark.parametrize("columns,says", [
@@ -2746,7 +2809,7 @@ def worry_row(**columns):
     empty = {"id": 1, "address": "box@example.org", "address_canonical": "box@example.org",
              "state": "active", "frozen_since": None, "last_fetch_status": None,
              "last_test_status": None, "last_skip_at": None, "last_skip_uidl": None,
-             "delete_window_days": 14, "label": "sales"}
+             "delete_window_days": 14, "keep_at_provider": False, "label": "sales"}
     empty.update(columns)
     return empty
 
