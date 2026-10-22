@@ -5,6 +5,15 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.2.1 - 2026-10-22
+
+### Fixed
+
+- rspamd is repinned to 4.2.3, by digest, with its tag. Upstream's release fixes crashes
+  and leaks and changes how HTML, URLs and ARC seals are read, so a message can score
+  differently than under 4.2.2. With the DNS blocklists turned on, a blocklist rule now
+  scores once per matched value.
+
 ## 0.2.0 - 2026-10-20
 
 ### Added
