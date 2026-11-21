@@ -5,6 +5,16 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.3.1 - 2026-11-21
+
+### Fixed
+
+- The IMAP client's unit tests pass on Python 3.14.10, whose `imaplib` reads the
+  server's capabilities from its greeting and no longer asks for them with
+  `CAPABILITY`. Nothing Maildivvy sends a provider changed: every IMAP test passes with
+  both the older and the newer `imaplib`. 0.3.0 was tagged but not released, as its
+  tests failed on that Python; everything listed under 0.3.0 below ships in 0.3.1.
+
 ## 0.3.0 - 2026-11-21
 
 ### Added

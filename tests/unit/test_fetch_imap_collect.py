@@ -642,7 +642,8 @@ def test_a_plain_check_logs_in_examines_the_inbox_and_writes_only_its_three_colu
     assert row["mark"] == mark and row["journal"] == []
     assert wrote_a_fetch_column(cur) == [] and "BEGIN" not in cur.statements
     # a login and EXAMINE INBOX, nothing searched or read, and no configuration written
-    assert {c for c in commands(provider)} == {"CAPABILITY", "AUTHENTICATE", "EXAMINE", "LOGOUT"}
+    # CAPABILITY is imaplib's to send or not, by Python's version (test_fetch_imap.py)
+    assert {c for c in commands(provider)} - {"CAPABILITY"} == {"AUTHENTICATE", "EXAMINE", "LOGOUT"}
     assert refused(provider) == []
     assert not (tmp_path / "state").exists()
     assert cur.statements[0].startswith("SELECT pg_try_advisory_lock")

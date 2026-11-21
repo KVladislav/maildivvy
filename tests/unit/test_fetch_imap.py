@@ -76,8 +76,12 @@ def opened(stub, **kwargs):
     return session
 
 
+# imaplib sends CAPABILITY only when the greeting did not carry the capabilities: CPython
+# 3.14.10 reads them from the greeting's response code, 3.14.4 asked. Either is a read, so
+# the tests hold what the client sends besides it.
 def commands(stub):
-    return [(r["command"], r["argument"]) for r in read_log(stub.log_path) if "command" in r]
+    return [(r["command"], r["argument"]) for r in read_log(stub.log_path)
+            if "command" in r and r["command"] != "CAPABILITY"]
 
 
 def events(stub, kind):
@@ -99,7 +103,7 @@ def test_a_whole_read_sends_only_commands_that_read_and_peeks_at_every_body(prov
         bodies = [session.fetch(uid).data for uid in (1, 2, 3)]
     assert bodies == [f"Subject: {uid}\r\n\r\nmessage {uid}\r\n".encode() for uid in (1, 2, 3)]
     assert commands(provider) == [
-        ("CAPABILITY", ""), ("AUTHENTICATE", "PLAIN"), ("EXAMINE", '"INBOX"'),
+        ("AUTHENTICATE", "PLAIN"), ("EXAMINE", '"INBOX"'),
         ("UID SEARCH", "UID 1:3"),
         *[("UID FETCH", f"{uid} (BODY.PEEK[] FLAGS INTERNALDATE)") for uid in (1, 2, 3)],
         ("LOGOUT", "")]
@@ -496,7 +500,7 @@ def test_a_password_with_a_line_break_or_a_nul_is_refused_before_anything_is_sen
         with pytest.raises(imap.AuthFailed, match="the login holds"):
             session.login(f"{USER}{unsendable}", PASSWORD)
     assert secret not in str(refused.value) and "DELETE" not in str(refused.value)
-    assert [command for command, _ in commands(provider)] == ["CAPABILITY", "LOGOUT"]
+    assert [command for command, _ in commands(provider)] == ["LOGOUT"]
 
 
 def test_plain_carries_utf8_and_login_is_used_only_when_plain_is_not_offered(provider,
@@ -635,7 +639,7 @@ def test_a_folder_name_holding_a_line_break_is_never_sent(provider, trusted):
             session.examine("Lists\r\nA9 DELETE INBOX")
         assert session.examine(imap.INBOX).uidvalidity == 1   # nothing was sent
     assert [command for command, _ in commands(provider)] == [
-        "CAPABILITY", "AUTHENTICATE", "EXAMINE", "LOGOUT"]
+        "AUTHENTICATE", "EXAMINE", "LOGOUT"]
 
 
 # --- answers the client cannot use ----------------------------------------------------

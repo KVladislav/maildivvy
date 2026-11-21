@@ -379,8 +379,9 @@ def test_imap_reads_by_uid_and_records_uid_commands_with_their_sub_command(mails
     client.noop()
     client.logout()
 
-    assert commands(mailstore) == [
-        ("CAPABILITY", ""), ("LOGIN", f'{USER} "{PASSWORD}"'), ("EXAMINE", '"INBOX"'),
+    # CAPABILITY is imaplib's to send or not, by Python's version (test_fetch_imap.py)
+    assert [c for c in commands(mailstore) if c[0] != "CAPABILITY"] == [
+        ("LOGIN", f'{USER} "{PASSWORD}"'), ("EXAMINE", '"INBOX"'),
         ("UID SEARCH", "UID 2:*"), ("UID FETCH", "2 (BODY.PEEK[] FLAGS INTERNALDATE)"),
         ("NOOP", ""), ("LOGOUT", "")]
     assert imap_events(mailstore, "refused") == []
