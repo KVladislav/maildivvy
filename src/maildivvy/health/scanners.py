@@ -36,13 +36,26 @@ PIN_RULE = "rspamd.local.lua"
 # --- antivirus -------------------------------------------------------------------------------------
 
 
-def judge_clamd(active, version, now, conf):
-    """Running, answering on its socket, and its signatures fresh."""
+# streamed through the product's own client on every run: `VERSION` alone is answered by
+# a daemon that cannot scan
+SAMPLE = b"maildivvy-health: a clean sample for the antivirus\r\n"
+
+
+def judge_clamd(active, version, verdict, now, conf):
+    """Running, answering on its socket, scanning a clean sample clean, and its signatures
+    fresh."""
     if version is None:
         state = "active" if active else "inactive"
         return [Check("daemon", FAIL, f"{CLAMD_UNIT} {state}, the socket did not answer",
                       "the antivirus does not answer: mail is held at the provider")]
-    found = [passed("daemon", f"ClamAV {version.engine} answering on {scan.CLAMD_SOCKET}")]
+    reading = f"ClamAV {version.engine} answering on {scan.CLAMD_SOCKET}"
+    if verdict.verdict != scan.CLEAN:
+        found = [Check("daemon", FAIL, f"{reading}, a clean sample {verdict.verdict}",
+                       f"the antivirus answers but does not scan: {verdict.detail}; mail it "
+                       "fails on is withheld unscanned, or held at the provider while it "
+                       "does not answer")]
+    else:
+        found = [passed("daemon", f"{reading}, a clean sample scanned clean")]
     if version.signatures_built is None:
         found.append(Check("signatures", UNKNOWN, f"set {version.signatures}",
                            "the daemon did not say when its signatures were built"))
@@ -62,8 +75,9 @@ def judge_clamd(active, version, now, conf):
 
 @check("daemon")
 def clamd(ctx):
-    return judge_clamd(probe.is_active(CLAMD_UNIT), scan.clamd_version(timeout=30), ctx.now,
-                       ctx.settings)
+    version = scan.clamd_version(timeout=30)
+    verdict = scan.scan_virus(SAMPLE, timeout=30) if version is not None else None
+    return judge_clamd(probe.is_active(CLAMD_UNIT), version, verdict, ctx.now, ctx.settings)
 
 
 HELD = """SELECT e.address, e.held_since FROM external_mailbox e

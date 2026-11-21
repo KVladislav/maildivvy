@@ -31,8 +31,9 @@ def parse(text):
     return email.message_from_string(text, policy=email.policy.default)
 
 
-def compose(reason=scan.INFECTED, original=ORDINARY, withheld_id=WITHHELD_ID, domain=DOMAIN):
-    return report.compose(reason, parse(original), withheld_id, domain)
+def compose(reason=scan.INFECTED, original=ORDINARY, withheld_id=WITHHELD_ID, domain=DOMAIN,
+            failed=False):
+    return report.compose(reason, parse(original), withheld_id, domain, failed=failed)
 
 
 def parsed(**kwargs):
@@ -53,6 +54,18 @@ def test_the_infected_report_says_malware_and_the_unscanned_one_says_nobody_look
     assert infected != unscanned
     for words in (infected, unscanned):
         assert store.QUARANTINE in words  # where the reader will find the message
+
+
+def test_a_message_the_scanner_failed_on_is_reported_as_that_and_not_as_too_large():
+    failed = parsed(reason=scan.UNSCANNED, failed=True).get_content()
+    assert "scanner failed on it" in failed and "could not scan this message" in failed
+    assert "too large" not in failed and "larger than" not in failed
+    assert "malware" not in failed and "NOTHING IS KNOWN ABOUT IT" in failed
+    assert store.QUARANTINE in failed
+    # the reason the pass reads is the verdict, unchanged
+    assert parsed(reason=scan.UNSCANNED, failed=True)[report.REASON_HEADER] == scan.UNSCANNED
+    # `failed` changes nothing for a verdict that is not unscanned
+    assert "found malware in it" in parsed(reason=scan.INFECTED, failed=True).get_content()
 
 
 @pytest.mark.parametrize("reason", [scan.CLEAN, scan.UNAVAILABLE, "", None, "Infected"])
@@ -129,7 +142,7 @@ def test_a_from_the_library_refuses_to_parse_is_quoted_as_unreadable():
     told anything was withheld, and the delivery failure walks into the bounded retry."""
     hostile = ("From: =?utf-8?B?YQ0KYg==?= <a@example.org>\r\nSubject: hello\r\n\r\nwords\r\n")
     original = parse(hostile)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017 - the email package's own error, whichever it is
         str(original["From"])  # the control: reading it the plain way does raise
     body = parsed(original=hostile).get_content()
     assert "(an unreadable From header)" in body

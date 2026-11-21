@@ -25,8 +25,12 @@ fail the client's APPEND, which is what must never happen.
 hands the program the bytes on stdin, the mailbox as its one argument and the login in
 `USER` - no UID and no file name. The Message-ID is looked up in that person's Sent with
 `doveadm fetch storageid`; a directory listing would race the client that is still
-writing. A message with NO Message-ID is found by the append itself: the candidates saved in the last hour are asked for, and the one whose bytes
-are the bytes this program was handed is the appended message. Nothing is guessed: a
+writing. Only the flags at the end of the file's name are not Dovecot's answer: a client
+appends with any flags it likes, so the base name Dovecot gives is looked for with any
+flags after it, in that one folder (`store.resolve_own`). A message with NO Message-ID is
+found by the append itself: the candidates saved in the last
+hour are asked for, and the one whose bytes are the bytes this program was handed is the
+appended message. Nothing is guessed: a
 lookup that finds no file records nothing.
 
 ⛔ THE "ALREADY RECORDED" CHECK MATCHES ONLY ROWS WITH NO ARCHIVE NUMBER. The provider's feed serves relayed mail back, and the pass records that copy under
@@ -38,8 +42,12 @@ from writing a second row is the name this program itself made, which is checked
 anything else is done.
 
 ⛔ THE LEDGER'S RULES ARE THE PASS'S OWN FUNCTIONS. The sender, the date and the
-unfolding of a header are imported from `fanout/pass_.py`, so the two programs that
-write `message` rows cannot come to disagree about one message.
+unfolding of a header are `lib/headers.py`'s, the archive's name is made by
+`lib/store.py`'s `link_into`, the delivery row is `fanout/ledger.py`'s `LINK`, and the
+Message-ID is stored and looked up in `lib/messageid.py`'s bounded form - each the one
+the pass uses - so the two programs that write `message` rows cannot come to disagree
+about one message. The hook imports none of the pass itself, and so nothing of the
+delivery filter or the scanners' client with it.
 """
 
 import email
@@ -49,8 +57,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-from maildivvy.fanout import pass_
-from maildivvy.lib import config, db, doveadm, store
+from maildivvy.fanout import ledger
+from maildivvy.lib import config, db, doveadm, headers, messageid, store
 
 CONSUMER = "senthook"  # its own least-privileged database role
 PREFIX = "maildivvy-sent-hook"
@@ -85,12 +93,6 @@ RECORD = """
     INSERT INTO message (domain_id, message_id_header, archive_uid, state, message_date,
                          sender, subject, is_spam)
     VALUES (%s, %s, NULL, 'delivered', %s, %s, %s, false) RETURNING id
-"""
-# The sender's OWN copy, the one the client appended: every name in the store must have
-# a row. The archive's name gets none, as the pass gives the archive none.
-LINK = """
-    INSERT INTO delivery (message_id, mailbox_id, state, linked_at)
-    VALUES (%s, %s, 'linked', now()) ON CONFLICT (message_id, mailbox_id) DO NOTHING
 """
 
 
@@ -145,10 +147,10 @@ def read_message(raw):
     head = raw[:end.start()] if end else raw
     parsed = email.message_from_string(head.decode("utf-8", "replace"))
     return Outgoing(
-        message_id=pass_.first_occurrence(parsed.get("Message-ID")) or None,
-        subject=pass_.first_occurrence(parsed.get("Subject")) or None,
-        sender=pass_.sender_of(parsed.get("From")),
-        date=pass_.date_of(parsed.get("Date")),
+        message_id=headers.first_occurrence(parsed.get("Message-ID")) or None,
+        subject=headers.first_occurrence(parsed.get("Subject")) or None,
+        sender=headers.sender_of(parsed.get("From")),
+        date=headers.date_of(parsed.get("Date")),
     )
 
 
@@ -185,9 +187,13 @@ def newest(records, raw):
 
 
 def _resolve(domain, account, record_, root):
-    """The file of one doveadm record in the person's own Sent, or None."""
+    """The file of one doveadm record in the person's own Sent, or None.
+
+    The person's resolver, not the archive's: the client appends with whatever flags it
+    likes, `(\\Seen \\Flagged)` or a keyword, and the file's name carries them.
+    """
     box = store.maildir(store.home(domain, account, root), ONLY_MAILBOX)
-    return store.resolve(box, record_["storageid"])
+    return store.resolve_own(box, record_["storageid"])
 
 
 def source_of(login, domain, account, raw, message_id, root=None):
@@ -219,6 +225,24 @@ def source_of(login, domain, account, raw, message_id, root=None):
                   f"the {len(raw)} bytes this hook was handed (no Message-ID to look up)")
 
 
+def archive_folders(domain, account, root):
+    """`Sent`, then `Sent/<account>`, in the domain's archive; returns the second's maildir.
+
+    Through Dovecot, so each folder carries its marker and the archive's ACL; a folder that
+    exists already is success. The import of a person's sent mail
+    makes them the same way.
+
+    ⛔ THE PARENT IS MADE BY NAME, not left to `Sent/<account>` to make on its way past: a
+    folder Dovecot creates as a parent has no ACL file of its own, and a folder in an
+    archive without one keeps every right - which is the archive login, shared by the
+    administrators, free to write into `Sent`.
+    """
+    archive_login = f"{store.ARCHIVE}@{domain}"
+    doveadm.create_folder(archive_login, ONLY_MAILBOX)
+    doveadm.create_folder(archive_login, archive_folder(account))
+    return store.maildir(store.archive_home(domain, root), archive_folder(account))
+
+
 def already_named(source, archive_maildir):
     """Has this hook already given the archive a name for this very file?
 
@@ -226,7 +250,7 @@ def already_named(source, archive_maildir):
     computes the name it made the first time. It is the same file when it is the same
     inode: another message of the same name would be a different one.
     """
-    existing = store.resolve(archive_maildir, pass_.base_name(source))
+    existing = store.resolve(archive_maildir, store.base_name(source))
     if existing is None:
         return None
     return existing if Path(existing).stat().st_ino == Path(source).stat().st_ino else None
@@ -250,29 +274,23 @@ def record(conn, domain, account, folder, outgoing, source, root):
             raise Refused(f"{account}@{domain} has no mailbox row in the ledger")
         mailbox_id = found[0]
 
-        if outgoing.message_id:
-            cur.execute(RECORDED, (domain_id, outgoing.message_id))
+        stored = messageid.stored(outgoing.message_id)
+        if stored:
+            cur.execute(RECORDED, (domain_id, stored))
             found = cur.fetchone()
             if found is not None:
                 return None  # already recorded, by this hook; nothing to add
 
-        cur.execute(RECORD, (domain_id, outgoing.message_id, outgoing.date,
-                             outgoing.sender, outgoing.subject))
+        cur.execute(RECORD, (domain_id, stored, outgoing.date, outgoing.sender, outgoing.subject))
         message_id = cur.fetchone()[0]
 
-        # Through Dovecot, so each folder carries its marker and the archive's ACL; a
-        # folder that exists already is success.
-        # ⛔ THE PARENT IS MADE BY NAME, not left to `Sent/<account>` to make on its way
-        # past: a folder Dovecot creates as a parent has no ACL file of its own, and a
-        # folder in an archive without one keeps every right - which is the archive
-        # login, shared by the administrators, free to write into `Sent`.
-        archive_login = f"{store.ARCHIVE}@{domain}"
-        doveadm.create_folder(archive_login, ONLY_MAILBOX)
-        doveadm.create_folder(archive_login, folder)
-        archive_maildir = store.maildir(store.archive_home(domain, root), folder)
-        pass_.fsync_dirs(pass_.link_into(source, [archive_maildir], root))
+        archive_maildir = archive_folders(domain, account, root)
+        store.fsync_dirs(store.link_into(source, [archive_maildir], root))
 
-        cur.execute(LINK, (message_id, mailbox_id))
+        # The sender's OWN copy, the one the client appended: every name in the store
+        # must have a row. The archive's name gets none, as the pass gives
+        # the archive none.
+        cur.execute(ledger.LINK, (message_id, mailbox_id))
     conn.commit()
     return message_id
 

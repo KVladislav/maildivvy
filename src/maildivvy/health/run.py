@@ -9,6 +9,8 @@
     maildivvy-health --format prometheus    any of the above in Prometheus's text format
     maildivvy-health --textfile-dir <dir>   a run of every subsystem also writes
                                             <dir>/maildivvy.prom for node_exporter
+    maildivvy-health --ledger-pass          the ledger's daily pass over every name, kept for
+                                            the runs that follow to report (its timer)
 
 The exit code is the worst state's: 0 PASS, 1 WARN, 2 FAIL, 3 UNKNOWN. A run that cannot
 run at all - its settings refused, a program error - is 3 and writes no file, so the file
@@ -17,15 +19,18 @@ goes stale and a collector reads UNKNOWN: the checks have stopped.
 Only a run of every subsystem writes `/var/lib/maildivvy/health/health.json`, and the
 textfile when a directory is given: a run of one never replaces a whole report with part
 of one.
+
+The every-five-minutes run holds to the ledger only the names changed since the last one;
+the daily pass reads every name, and each run reports its last result and age.
 """
-# The records behind it, and for the Prometheus output.
+# The records behind it: for the Prometheus output, for the ledger.
 
 import argparse
 import datetime
 import sys
 import traceback
 
-from maildivvy.health import checks, report, settings
+from maildivvy.health import checks, data, report, settings
 from maildivvy.health.report import UNKNOWN
 
 
@@ -40,6 +45,8 @@ def parser():
     p.add_argument("--textfile-dir", metavar="DIR",
                    help=f"a run of every subsystem also writes DIR/{report.TEXTFILE}, for "
                         "node_exporter's textfile collector")
+    p.add_argument("--ledger-pass", action="store_true",
+                   help="take the ledger's daily pass over every name and keep its result")
     p.add_argument("--conf", default=str(settings.CONF), help=argparse.SUPPRESS)
     p.add_argument("--report", default=str(settings.REPORT), help=argparse.SUPPRESS)
     return p
@@ -50,18 +57,22 @@ def main(argv=None):
     try:
         conf = settings.read(args.conf)
         now = datetime.datetime.now(datetime.timezone.utc)
-        if args.cached:
+        if args.ledger_pass:
+            record = data.take_ledger_pass(now)
+            whole = report.Report(now, [report.Subsystem("store", data.judge_pass(record, now, conf))])
+        elif args.cached:
             whole = report.read_json(args.report, now,
                                      datetime.timedelta(minutes=conf.stale_minutes))
             if args.subsystem:
                 whole = whole.only(args.subsystem)
         else:
-            whole = checks.run([args.subsystem] if args.subsystem else None, conf=conf, now=now)
+            whole = checks.run([args.subsystem] if args.subsystem else None, conf=conf, now=now,
+                               keep=not args.subsystem)
             if not args.subsystem:
                 report.write_json(args.report, whole)
                 if args.textfile_dir:
                     report.write_textfile(args.textfile_dir, whole)
-    except Exception as err:  # the checks did not run, or their result could not be kept: say so
+    except Exception as err:  # noqa: BLE001 - the checks did not run, or their result could not be kept: say so
         said = f"{UNKNOWN} maildivvy-health could not run: {type(err).__name__}: {err}"
         # in Prometheus's format each line a comment, so a scrape of it still parses
         prefix = "# " if args.format == "prometheus" else ""

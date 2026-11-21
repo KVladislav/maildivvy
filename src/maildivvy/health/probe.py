@@ -39,8 +39,12 @@ def command(argv, timeout=TIMEOUT, input=None, check=False):
 
 
 def show(unit, *properties):
-    """`systemctl show`'s answer for these properties, as {name: value}."""
-    argv = ["systemctl", "show", unit] + [f"--property={name}" for name in properties]
+    """`systemctl show`'s answer for these properties, as {name: value}.
+
+    ⛔ ITS TIMES IN UTC: printed in the machine's zone, a time in the hour a
+    change from daylight saving repeats reads an hour off, and a pass 20 s old read
+    "no pass in 10 minutes"."""
+    argv = ["systemctl", "show", "--timestamp=utc", unit] + [f"--property={name}" for name in properties]
     out = command(argv, check=True).stdout
     found = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
     missing = [name for name in properties if name not in found]

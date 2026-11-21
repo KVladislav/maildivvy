@@ -45,7 +45,9 @@ own Sent folder, without sharing one password to the provider mailbox.
   [the installation guide](docs/installation.md#the-machine-and-its-disks).
 - A name for the machine that mail clients connect to, and a certificate for it: see
   [the installation guide](docs/installation.md#the-certificate).
-- Mailboxes at a provider that offers POP3 and authenticated SMTP over TLS.
+- Mailboxes at a provider that offers POP3 or IMAP, and authenticated SMTP, over TLS. A
+  mailbox collected over IMAP is only read: nothing in it is deleted, moved or marked as
+  read at the provider.
 - If people read mail from outside your network: your router forwarding ports 993 and
   465 to the machine.
 
@@ -54,7 +56,8 @@ own Sent folder, without sharing one password to the provider mailbox.
 - [Installation guide](docs/installation.md): what the machine needs, the settings, the
   install, the first sign-in and the first mail.
 - [Administration guide](docs/administration.md): backup and restore, health and
-  monitoring, the ban, upgrades, and what never to do.
+  monitoring, the ban, upgrades, collection over IMAP and its snapshots, and what never
+  to do.
 - [Architecture](docs/architecture.md): how it is built.
 - [The installation's roles](ansible/README.md): each step in detail.
 - [Changelog](CHANGELOG.md), [security policy](SECURITY.md),
@@ -81,15 +84,15 @@ A new key would be announced here, with the reason; the key is never changed sil
 
 ## Tests
 
-The unit tests, and the lint of the installation roles (`ansible-lint` and Ansible's
-syntax check), run locally in seconds and need no mail machine. They need Python 3.14 and
+The unit tests with the lint of the Python (`ruff`), and the lint of the installation
+roles (`ansible-lint` and Ansible's syntax check), run locally in seconds and need no mail machine. They need Python 3.14 and
 the packages `.github/workflows/ci.yml` installs, at its versions; a `.venv` at the
 repository's root is used when it is there:
 
 ```
 python3.14 -m venv .venv
 .venv/bin/pip install pytest==9.0.2 pyyaml==6.0.3 flask==3.1.3 jinja2==3.1.6 \
-    ansible-core==2.20.1 ansible-lint==26.9.0
+    ansible-core==2.20.1 ansible-lint==26.9.0 ruff==0.17.4
 make test-unit
 make lint
 ```

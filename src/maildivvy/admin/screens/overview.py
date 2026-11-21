@@ -79,8 +79,8 @@ NOTHING = ("Nothing needs anybody right now: health's current report holds no FA
            "mailbox is frozen, nothing is withheld, and the pipeline has performed "
            "everything it was asked for in the last day.")
 
-PAGE = """
-{%- set heading %}Overview{% endset %}
+PAGE = """{% extends "app.SHELL" %}
+{%- set heading %}Overview{% endset %}{% block body %}
 {%- set worried = worries or withheld.waiting or failures.count or health.failing
                   or health.condition != 'current' %}
 <div class="stack">
@@ -107,7 +107,7 @@ health's report of {{ health.taken }}: <code>{{ failed.check }}</code> &mdash;
 {%- endfor %}
 {%- if withheld.waiting %}
 <li><svg class="icon attn ico"><use href="#i-clock"/></svg><div><a href="{{ url_for('withheld') }}">{{ withheld.waiting }} withheld message(s)</a>,
-the oldest from {{ withheld.oldest }}. Leaving them withheld needs no action.</div></li>
+the oldest from {{ withheld.oldest | moment }}. Leaving them withheld needs no action.</div></li>
 {%- endif %}
 {%- if failures.count %}
 <li><svg class="icon bad ico"><use href="#i-alert"/></svg><div><a href="{{ url_for('events') }}">{{ failures.count }} request(s) the pipeline could
@@ -151,8 +151,8 @@ not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
 </tr>
 <tr>
   <td><a href="{{ url_for('fetch') }}">Fetch</a></td>
-  <td>Last run {{ external.last_run or 'never' }}.
-      {%- if next_by %} Next by {{ next_by }}, the fetch timer's own period ({{ period }}).
+  <td>Last run {{ external.last_run|moment or 'never' }}.
+      {%- if next_by %} Next by {{ next_by|moment }}, the fetch timer's own period ({{ period }}).
       {%- else %} The fetch timer's period could not be read from the machine.{% endif %}
       {{ external.refused }} refused, {{ external.frozen }} frozen.</td>
   <td class="acts"></td>
@@ -166,7 +166,7 @@ not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
   <td><a href="{{ url_for('events') }}">Journal</a></td>
   <td>{% if last_act %}Last act <code>{{ last_act.action }}</code> on
       <code>{{ last_act.target or '' }}</code> by <code>{{ last_act.actor }}</code>,
-      {{ last_act.at }}.{% else %}Nothing written yet.{% endif %}</td>
+      {{ last_act.at|moment }}.{% else %}Nothing written yet.{% endif %}</td>
   <td class="acts"></td>
 </tr>
 <tr>
@@ -181,8 +181,7 @@ not perform</a> in the last day. The newest: <code>{{ failures.kind }}</code> on
 </tbody>
 </table></div>
 </section>
-</div>
-"""
+</div>{% endblock %}"""
 
 
 # --- what needs a person now --------------------------------------------------------
@@ -208,7 +207,7 @@ def failures_of(count_row, newest):
     return {"count": count_row["failures"] if count_row else 0,
             "kind": newest["kind"] if newest else None,
             "target": newest["target"] if newest else None,
-            "at": f"{newest['finished_at']:%H:%M}" if newest else None,
+            "at": common.moment(newest['finished_at']) if newest else None,
             "reason": (newest["result"] or common.NO_REASON) if newest else None}
 
 
@@ -221,7 +220,7 @@ def register(app_):
         worries = [worry for worry in
                    (worry_of(row) for row in common.rows(conn, WORRIES)) if worry]
         last_run = external["last_run"]
-        return app.render("Overview", PAGE, section="overview", worries=worries,
+        return app.render("Overview", "overview.PAGE", section="overview", worries=worries,
                           health=health.configured(),
                           withheld=common.one(conn, WITHHELD),
                           failures=failures_of(common.one(conn, FAILURES),

@@ -4,12 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maildivvy"
-version = "0.2.1"
+version = "0.3.0"
 description = "One mail machine: fetch, filter, deliver and share mail, installed by Ansible."
 requires-python = ">=3.14"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The Python lint `make test-unit` runs first: pyflakes, pycodestyle's errors, bugbear,
+# blind excepts, and the few bandit rules that name a real misuse (exec and eval, an
+# unsafe YAML load, a shell, an insecure temporary name). A deliberate case is marked in
+# place with `# noqa: <rule>` and its reason. No formatter.
+[tool.ruff]
+extend-include = ["bin/*", "maildivvy-install"]
+
+[tool.ruff.lint]
+select = ["F", "E", "B", "BLE", "S102", "S306", "S307", "S506", "S602", "S604", "S605"]
+# E501: the code has no one width to hold it to. B905: the zips pair sequences that are
+# equal by construction, and `strict=` on each would say nothing.
+ignore = ["E501", "B905"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests/stubs", "ansible/library"]

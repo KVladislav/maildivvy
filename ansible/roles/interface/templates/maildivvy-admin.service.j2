@@ -4,7 +4,7 @@
 # opens no TCP port at all.
 [Unit]
 Description=Maildivvy: the administration interface, behind the local reverse proxy
-Documentation=file://{{ maildivvy_interface_opt }}/lib/maildivvy/admin/run.py
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/admin/run.py
 # it reads accounts, sessions and the journal out of the database
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -42,7 +42,10 @@ NoNewPrivileges=true
 # It binds a unix socket, not a port: no capability in either set.
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# ⚠️ UNIX ALONE: the proxy reaches it on its socket, and the database (its db.conf names
+# no host) and systemd's notification are unix sockets too; `openssl passwd`, its one
+# child, opens nothing.
+RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

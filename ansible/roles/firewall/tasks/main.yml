@@ -17,7 +17,7 @@
   maildivvy_ufw:
     admin_networks: "{{ maildivvy_admin_networks }}"
     ports: "{{ maildivvy_admin_ports }}"
-    published: "{{ maildivvy_mail_ports }}"
+    published: "{{ maildivvy_publish_ports }}"
   register: maildivvy_ufw
 
 - name: Change the firewall under the self-reverting timer

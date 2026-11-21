@@ -1,0 +1,13 @@
+# ⛔ OFF: NO HASH OF A MESSAGE LEAVES THIS MACHINE. The image's own rule `rspamd.com` hashes
+# the text and the attachments of every scored message and asks rspamd.com's public fuzzy
+# storage about them, over the container's own network. The public feed has been thin
+# since its full lists became a paid service, and what it answers moves a verdict with
+# nobody looking - the reason the image is pinned at all.
+#
+# ⚠️ Off BY NAME twice. The module, which the step reads back as a module disabled
+# explicitly, never as an absence; and the rule itself, so a fuzzy storage of our own, if
+# one is ever added by turning the module back on, does not bring the public rule with it.
+enabled = false;
+rule "rspamd.com" {
+  enabled = false;
+}

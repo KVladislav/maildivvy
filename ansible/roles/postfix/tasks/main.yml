@@ -7,8 +7,8 @@
 #
 # What the step leaves: submission on 465 alone in wrapper mode, SASL through Dovecot's
 # socket, and no other listener - nothing on 25 at all, and `sendmail` for root alone;
-# both transports `error`, so a sender sends only through its own per-sender
-# map; the five maps keyed by sender and never by host; the rewrite in the SMTP client;
+# every transport `error`, so a sender sends only through its own per-sender
+# map and nothing is delivered on the machine itself; the five maps keyed by sender and never by host; the rewrite in the SMTP client;
 # the provider's certificate verified by name before its password is sent.
 # 465 stays closed to the network by the firewall until publication (step 19).
 
@@ -34,21 +34,6 @@
 
 # --- the database role -------------------------------------------
 
-- name: Give the daemon's role LOGIN, which step 6 withheld until its user existed
-  ansible.builtin.command:
-    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
-    stdin: |
-      DO $$
-      BEGIN
-          IF NOT (SELECT rolcanlogin FROM pg_roles WHERE rolname = '{{ maildivvy_postfix_db_role }}') THEN
-              ALTER ROLE {{ maildivvy_postfix_db_role }} LOGIN;
-              RAISE NOTICE 'granted login';
-          END IF;
-      END
-      $$;
-  register: maildivvy_postfix_login
-  changed_when: "'granted login' in maildivvy_postfix_login.stderr"
-
 # ⚠️ INSIDE THE CHROOT. `submissions` runs chrooted, so `smtpd` resolves the map's
 # `passfile=/etc/postfix/…` against the queue directory, while `postmap` and the SMTP
 # client resolve it for real. One file at both paths, not two copies that drift; without
@@ -61,24 +46,13 @@
     group: root
     mode: "0755"
 
-- name: Give the role its password in a passfile owned by the account Postfix runs as
-  ansible.builtin.command:
-    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ maildivvy_postfix_db_role }}",
-           "{{ maildivvy_postfix_real_passfile }}", postfix,
-           --db, "{{ maildivvy_postfix_db_name }}", --host, "{{ maildivvy_postfix_db_host }}"]
-  register: maildivvy_postfix_password
-  changed_when: (maildivvy_postfix_password.stdout | from_json).changed
-
-- name: Read the passfile back by owner, mode and shape, never printing it
-  ansible.builtin.command:
-    argv: [sh, -c, 'stat -c "%U %a" "$1" && awk -F: "END { print NR, NF }" "$1" && cut -d: -f1-4 "$1"', -,
-           "{{ maildivvy_postfix_real_passfile }}"]
-  register: maildivvy_postfix_passfile_read
-  changed_when: false
-  failed_when: >-
-    maildivvy_postfix_passfile_read.rc != 0 or maildivvy_postfix_passfile_read.stdout_lines !=
-    ['postfix 600', '1 5',
-     maildivvy_postfix_db_host ~ ':5432:' ~ maildivvy_postfix_db_name ~ ':' ~ maildivvy_postfix_db_role]
+- name: Give the daemon's role LOGIN and its passfile, owned by the account Postfix runs as
+  ansible.builtin.import_tasks: ../../postgresql/tasks/daemon_role.yml
+  vars:
+    maildivvy_daemon_db_role: "{{ maildivvy_postfix_db_role }}"
+    maildivvy_daemon_passfile: "{{ maildivvy_postfix_real_passfile }}"
+    maildivvy_daemon_reader: postfix
+    maildivvy_daemon_db_host: "{{ maildivvy_postfix_db_host }}"
 
 - name: The unchrooted path is a symlink to that one file
   ansible.builtin.file:
@@ -89,9 +63,9 @@
     group: root
     follow: false
 
-# --- the five lookup maps ---------------------------------------------
+# --- the six lookup maps ----------------------------------------------
 
-- name: Write the five lookup maps, one view each
+- name: Write the six lookup maps, one view each
   ansible.builtin.template:
     src: map.cf.j2
     dest: "{{ maildivvy_postfix_map_dir }}/{{ maildivvy_postfix_map_prefix }}{{ item.name }}.cf"
@@ -103,31 +77,33 @@
     label: "{{ item.name }}"
   register: maildivvy_postfix_maps_written
 
-# --- the certificate ---------------------------------------------
+# --- the certificate ----------------------------------------------------
 
-- name: The account Postfix runs as joins ssl-cert, now that the package has made it
-  ansible.builtin.user:
-    name: postfix
-    groups: [ssl-cert]
-    append: true
-  register: maildivvy_postfix_group
-
-# The hook republishes the pair and reloads every consumer that is installed; Postfix is
-# now one of them. It is lego's, so there is nothing to re-run on a self-signed machine.
-- name: Run the certificate's deploy hook again, now that Postfix reads the key
+# ⛔ NO GROUP FOR THE KEY: smtpd opens the key as root, before it drops to
+# `postfix` and enters the chroot, so `postfix` reads nothing through `ssl-cert` and is
+# not put in it. A machine an earlier version installed has it there; it leaves, and the
+# daemon is restarted below while any of its processes still holds the group, which a
+# running one keeps from its start - read from the processes, not from this run,
+# so a run stopped between the two is finished by the next.
+- name: Read who is in ssl-cert
   ansible.builtin.command:
-    argv: ["{{ maildivvy_postfix_cert_program }}", deploy]
-  when: maildivvy_cert_mode != 'self-signed'
+    argv: [getent, group, ssl-cert]
+  register: maildivvy_postfix_ssl_cert
+  changed_when: false
+
+- name: The account Postfix runs as leaves ssl-cert, which an earlier version gave it
+  ansible.builtin.command:
+    argv: [gpasswd, -d, postfix, ssl-cert]
+  when: "'postfix' in maildivvy_postfix_ssl_cert.stdout.split(':')[3].split(',')"
   changed_when: true
 
-# ⚠️ the shell's own `test`, never /usr/bin/test: Ubuntu 26.04's coreutils are uutils',
-# whose `test -r` answers from the owner and group alone and ignores the supplementary
-# group that is the whole point here (measured 2026-09-20; `cat` reads the file).
-- name: The published certificate and key are readable by the account Postfix runs as
+# `ps` exits 1 when the account runs nothing, as on a machine where Postfix is stopped
+- name: Read the groups Postfix's running processes hold
   ansible.builtin.command:
-    argv: [runuser, -u, postfix, --, sh, -c, 'test -r "$1"', -, "{{ item }}"]
-  loop: ["{{ maildivvy_postfix_cert }}", "{{ maildivvy_postfix_key }}"]
+    argv: [ps, -u, postfix, -o, supgrp=]
+  register: maildivvy_postfix_running_groups
   changed_when: false
+  failed_when: maildivvy_postfix_running_groups.rc not in [0, 1]
 
 # --- main.cf and master.cf ------------------
 
@@ -145,12 +121,26 @@
     argv: [postfix, check]
   changed_when: false
 
+# Not "this run wrote it": a run stopped between the write and the restart leaves the
+# files as this step writes them and the daemon on the old ones, for ever. The master's own
+# last read of them is what they are compared with: its start, or its last `reload` line,
+# since step 14 edits master.cf on every run and reloads after (maildivvy_stale).
+- name: Is any of the configuration newer than the master's last read of it?
+  maildivvy_stale:
+    unit: postfix
+    reloaded: {identifier: postfix/master, match: '^(daemon started|reload) -- '}
+    paths: "{{ ['/etc/postfix/main.cf', '/etc/postfix/master.cf', maildivvy_postfix_real_passfile]
+               + maildivvy_postfix_maps | map(attribute='name')
+                 | map('regex_replace', '^(.*)$', maildivvy_postfix_map_dir ~ '/' ~ maildivvy_postfix_map_prefix ~ '\\1.cf')
+                 | list }}"
+  register: maildivvy_postfix_stale
+
 - name: Restart Postfix for the new configuration
   ansible.builtin.systemd:
     name: postfix
     state: restarted
-  when: maildivvy_postfix_written.changed or maildivvy_postfix_maps_written.changed
-        or maildivvy_postfix_group.changed or maildivvy_postfix_password.changed
+  when: maildivvy_postfix_stale.stale
+    or 'ssl-cert' in maildivvy_postfix_running_groups.stdout | regex_findall('[^,\\s]+')
 
 - name: Postfix runs and starts at boot
   ansible.builtin.systemd:
@@ -159,6 +149,8 @@
     enabled: true
 
 # --- the step's own proofs ----------------------------------------------------------------
+# `postconf` reads the files, never the running master; what makes them the master's values
+# is the restart above, whenever the files are newer than its last read of them.
 
 # Appending would make every one of these print `overriding earlier entry` for ever
 - name: Read main.cf back, with the warnings a duplicated setting prints
@@ -173,7 +165,7 @@
     fail_msg: "{{ maildivvy_postfix_effective.stderr }}"
     quiet: true
 
-- name: Read each setting back from the daemon's own view of it
+- name: Read each setting back as Postfix parses it
   ansible.builtin.command:
     argv: [postconf, -h, "{{ item.key }}"]
   loop: "{{ maildivvy_postfix_main | dict2items }}"
@@ -208,6 +200,32 @@
     fail_msg: "{{ maildivvy_postfix_ports.stdout_lines }}"
     quiet: true
 
+# the daemon holds the pair it serves, read as root; what its account can open is
+# no proof of that, and `postfix` opens neither file. The handshake is over loopback, and
+# the certificate it presents is compared with the published one, the leaf of an ACME
+# chain on either side.
+- name: Read the certificate 465 serves
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      openssl s_client -connect 127.0.0.1:465 -servername {{ maildivvy_cert_name | quote }} </dev/null 2>/dev/null
+      | openssl x509 -noout -fingerprint -sha256
+    executable: /bin/bash
+  register: maildivvy_postfix_served
+  changed_when: false
+
+- name: Read the published certificate
+  ansible.builtin.command:
+    argv: [openssl, x509, -noout, -fingerprint, -sha256, -in, "{{ maildivvy_published_cert }}"]
+  register: maildivvy_postfix_published
+  changed_when: false
+
+- name: 465 serves the published certificate
+  ansible.builtin.assert:
+    that: maildivvy_postfix_served.stdout == maildivvy_postfix_published.stdout
+    fail_msg: "465 serves {{ maildivvy_postfix_served.stdout }}, the published certificate is {{ maildivvy_postfix_published.stdout }}"
+    quiet: true
+
 # ⛔ `postmap -q` exits 1 BOTH for "no such key" and for "the database refused us". The
 # correct answer for a name that does not exist is rc 1 with NO OUTPUT; a `fatal: query
 # error` with rc 1 is the whole of Postfix being unable to look anything up, so what is
@@ -239,5 +257,5 @@
   ansible.builtin.command:
     argv: [runuser, -u, postfix, --, env, "PGPASSFILE={{ maildivvy_postfix_passfile }}",
            psql, -X, -w, -At, -h, "{{ maildivvy_postfix_db_host }}", -U, "{{ maildivvy_postfix_db_role }}",
-           -d, "{{ maildivvy_postfix_db_name }}", -c, "SELECT count(*) FROM postfix_sasl_password"]
+           -d, "{{ maildivvy_db_name }}", -c, "SELECT count(*) FROM postfix_sasl_password"]
   changed_when: false

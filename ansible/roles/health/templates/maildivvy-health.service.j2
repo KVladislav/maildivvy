@@ -5,7 +5,7 @@
 # read, the two helpers read and hand back over their sockets (health/helper.py).
 [Unit]
 Description=Maildivvy: check every subsystem and write the health report
-Documentation=file://{{ maildivvy_health_opt }}/lib/maildivvy/health/run.py
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/health/run.py
 After=network-online.target postgresql.service dovecot.service postfix.service
 Wants=network-online.target
 

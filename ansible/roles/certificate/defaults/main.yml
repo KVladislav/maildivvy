@@ -7,10 +7,10 @@ maildivvy_cert_mode: acme
 
 # lego from the upstream release, pinned by version and sha256 per architecture, and
 # checked against the release's checksums file with an anchored match.
-maildivvy_lego_version: 5.4.1
+maildivvy_lego_version: 5.6.0
 maildivvy_lego_sha256:
-  amd64: ebb33f1bead5a7c99dd46f1c5734b44cf1eab5b5c12faf397cd14d50a5916419
-  arm64: 8494c06bde449ac4d65c726b7ea50d67ac61f422e698c9b78b47778445b098f2
+  amd64: f02fc11b6f56b97e387fa7caa0268f86f5a336953b22458e6430e4651fea439a
+  arm64: 34d87a6552d69390c4a4560237045c47713a8e148d899e16db0e97040894ed1f
 maildivvy_lego_release_url: https://github.com/go-acme/lego/releases/download
 
 # DNS-01: lego's code for the DNS provider; its credential names are read from

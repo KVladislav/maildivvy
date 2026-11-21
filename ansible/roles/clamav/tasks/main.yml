@@ -154,7 +154,7 @@
 
 - name: Wait until the daemon answers again, the reload being a pause in scanning
   ansible.builtin.command:
-    argv: [runuser, -u, vmail, --, env, PYTHONPATH=/opt/maildivvy/lib, PYTHONDONTWRITEBYTECODE=1,
+    argv: [runuser, -u, vmail, --, env, "PYTHONPATH={{ maildivvy_opt }}/lib", PYTHONDONTWRITEBYTECODE=1,
            python3, -c, "{{ maildivvy_clamav_ping }}"]
   register: maildivvy_clamav_ping_read
   changed_when: false
@@ -201,7 +201,7 @@
 # product's own client, as the mail owner, over the socket it will use.
 - name: Scan EICAR, a clean message and one byte over the limit, as the mail owner
   ansible.builtin.command:
-    argv: [runuser, -u, vmail, --, env, PYTHONPATH=/opt/maildivvy/lib, PYTHONDONTWRITEBYTECODE=1,
+    argv: [runuser, -u, vmail, --, env, "PYTHONPATH={{ maildivvy_opt }}/lib", PYTHONDONTWRITEBYTECODE=1,
            python3, -c, "{{ maildivvy_clamav_probe }}", "{{ maildivvy_clamav_eicar }}",
            "{{ maildivvy_clamav_stream_max }}", "{{ maildivvy_clamav_file_max }}"]
   register: maildivvy_clamav_probe_read

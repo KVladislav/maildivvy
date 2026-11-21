@@ -15,7 +15,7 @@ auth_mechanisms = plain login
 # owned by the auth worker's user.
 pgsql {{ maildivvy_dovecot_db_socket }} {
   parameters {
-    dbname = {{ maildivvy_dovecot_db_name }}
+    dbname = {{ maildivvy_db_name }}
     user = {{ maildivvy_dovecot_db_role }}
     passfile = {{ maildivvy_dovecot_passfile }}
   }

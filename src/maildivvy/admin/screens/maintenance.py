@@ -49,13 +49,14 @@ FOLLOWS = "The count follows a valid range."
 # ⚠️ The recount is a GET form of its own, so the typed dates travel in the URL; the run is
 # the one POST, with the dates it was counted for carried along hidden. A refused date is a
 # flash above both and the same sentence in that field's `help warn` line.
-PAGE = """
+PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, refused, field %}
 {%- set heading %}Top up <code>{{ box.address }}</code>{% endset %}
 {%- set lede %}A top-up delivers what never arrived in this mailbox. It does not put back what the
 person deleted on purpose; <a href="{{ url_for('mailbox', mailbox_id=box.id) }}">deliver
 one message by id</a> does that.{% endset %}
 {%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / \
-<a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a> / Top up{% endset %}
+<a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a> / Top up{% endset %}{% block body %}
 <div class="stack narrow">
 {{ refused(refusal) }}
 <form method="get" action="{{ url_for('top_up', mailbox_id=box.id) }}">
@@ -71,7 +72,7 @@ one message by id</a> does that.{% endset %}
 </div></section>
 </form>
 
-<form method="post" action="{{ url_for('top_up', mailbox_id=box.id) }}">
+<form method="post" action="{{ url_for('top_up', mailbox_id=box.id) }}">{{ csrf() }}
 <section class="box"><div class="box-head"><h2>Run it</h2></div><div class="box-body">
 <div class="kv">
 {%- if ranged is not none %}<div><b>{{ ranged }}</b><span>Between two dates</span></div>{% endif -%}
@@ -95,8 +96,7 @@ one message by id</a> does that.{% endset %}
 <p class="muted">The count is the same selection the pipeline delivers: messages of
 <code>{{ box.label }}</code> that are in the archive, that this mailbox has not been
 given, and &mdash; unless the domain lets spam reach people &mdash; that are not spam.</p>
-</div>
-"""
+</div>{% endblock %}"""
 
 
 # --- the two counts ----------------------------------------------------------
@@ -117,10 +117,16 @@ def count(conn, box, since, until):
 
 
 def typed_range(values):
-    """The two dates as typed, or (field at fault, sentence). Empty is refused."""
+    """(field at fault, sentence), or (None, None) with both dates in `values` rewritten
+    as the dates they are. Empty is refused.
+
+    ⚠️ The date read is what goes on, never the text typed: `calendar_date` reads a date
+    with a space or a no-break space around it, and that text, sent on as it was, made
+    the count's query fail and queued a request the pipeline could not read.
+    """
     for name, what in (("since", "From date"), ("until", "To date")):
         try:
-            validate.calendar_date(values.get(name), what)
+            values[name] = validate.calendar_date(values.get(name), what).isoformat()
         except validate.Refused as refused:
             return name, str(refused)
     return None, None
@@ -151,9 +157,13 @@ def register(app_):
         else:
             asked_since, asked_until = typed["since"], typed["until"]
 
-        asked = common.ask(conn, "top_up", box["address"],
-                           {"mailbox_id": mailbox_id, "since": asked_since,
-                            "until": asked_until}, g.identity)
+        # a double click asks once; another range of the same mailbox is its own top-up
+        asked = common.ask_once(conn, "top_up", box["address"],
+                                {"mailbox_id": mailbox_id, "since": asked_since,
+                                 "until": asked_until}, g.identity,
+                                same=("mailbox_id", "since", "until"))
+        if asked is None:
+            return common.acted("mailbox", "already_asked", mailbox_id=mailbox_id)
         record(conn, "top_up", box["address"],
                {"since": asked_since, "until": asked_until}, request_id=asked)
         return common.acted("mailbox", "top_up_asked", mailbox_id=mailbox_id)
@@ -178,9 +188,11 @@ def register(app_):
                                                        label=box["label"]), typed)
         if found["state"] == "withheld":
             return card(conn, box, WITHHELD.format(message_id=message_id), typed)
-        asked = common.ask(conn, "deliver_one", box["address"],
-                           {"mailbox_id": mailbox_id, "message_id": message_id},
-                           g.identity)
+        asked = common.ask_once(conn, "deliver_one", box["address"],
+                                {"mailbox_id": mailbox_id, "message_id": message_id},
+                                g.identity, same=("mailbox_id", "message_id"))
+        if asked is None:
+            return common.acted("mailbox", "already_asked", mailbox_id=mailbox_id)
         record(conn, "deliver_one", box["address"], {"message": message_id},
                request_id=asked)
         return common.acted("mailbox", "one_message_asked", mailbox_id=mailbox_id)
@@ -192,7 +204,7 @@ def card(conn, box, refusal, typed):
 
 def page(conn, box, typed, fault=None, refusal=None):
     ranged = (None if refusal else count(conn, box, typed["since"], typed["until"]))
-    return app.render(f"Top up {box['address']}", PAGE, section="mailboxes",
+    return app.render(f"Top up {box['address']}", "maintenance.PAGE", section="mailboxes",
                       status=400 if refusal else 200, box=box, typed=typed,
                       fault=fault, refusal=refusal, follows=FOLLOWS, ranged=ranged,
                       everything=count(conn, box, WIDE_SINCE, WIDE_UNTIL))

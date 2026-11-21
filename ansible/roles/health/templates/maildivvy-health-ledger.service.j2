@@ -1,0 +1,35 @@
+# Managed by Ansible (roles/health). Install step 17.
+# The ledger's daily pass: every name in every mailbox held to the
+# ledger, which the five-minute run does only for the names changed since its last one.
+# The store helper reads; this unit keeps the result, whose age every health run reports.
+[Unit]
+Description=Maildivvy: hold every name in the store to the ledger, once a day
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/health/data.py
+After=network-online.target postgresql.service dovecot.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={{ maildivvy_health_user }}
+Group={{ maildivvy_health_user }}
+ExecStart={{ maildivvy_health_program }} --ledger-pass --quiet
+# ⛔ The exit code is the pass's worst state, as the health unit's is; the unit fails only
+# when the program cannot run, and then the kept result ages into UNKNOWN.
+SuccessExitStatus=1 2 3
+TimeoutStartSec={{ maildivvy_health_ledger_timeout }}
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# The pass's result, beside the report.
+ReadWritePaths={{ maildivvy_health_dir }}
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+CapabilityBoundingSet=
+# It asks the store helper over its socket and nothing else.
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

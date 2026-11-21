@@ -32,8 +32,9 @@ login the person typed against the external address they are entitled to; after 
 rewrite that information is gone.
 
 Then the same message is scanned, before Postfix queues it: *infected* is a
-permanent refusal naming the detection, *unavailable* a temporary one, and a message
-too large to scan follows its domain's own setting.
+permanent refusal naming the detection, *unavailable* a temporary one, a message
+too large to scan follows its domain's own setting, and a message the daemon
+failed on while it still answers is a permanent refusal whatever that setting says.
 """
 
 import email.utils
@@ -167,6 +168,12 @@ def decide_scan(verdict, outbound_unscanned):
         # The client keeps the message and retries; nothing is queued unscanned.
         return refusal("451", "4.7.1",
                        f"the antivirus is temporarily unavailable: {verdict.detail}")
+    if verdict.verdict == scan.UNSCANNED and verdict.failed:
+        # ⛔ The daemon is up and failed on this message. The domain's setting is
+        # about size, and says nothing of a message the daemon could not scan: refused
+        # for good, since the same message fails the same way when the client retries.
+        return refusal("554", "5.7.0",
+                       f"this message could not be scanned and was not sent: {verdict.detail}")
     if verdict.verdict == scan.UNSCANNED:
         # ⛔ the domain's own setting, read from the same view as the sender, so a change
         # in the interface takes effect on the next message with no restart.
@@ -193,18 +200,18 @@ def sender_lookup(conf_path, connect=None):
     def lookup(login):
         try:
             conn = connect()
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - the driver's errors are not a closed list
             raise LookupUnavailable(str(err)) from None
         try:
             with conn.cursor() as cur:
                 cur.execute(QUERY, (login,))
                 row = cur.fetchone()
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - the driver's errors are not a closed list
             raise LookupUnavailable(str(err)) from None
         finally:
             try:
                 conn.close()
-            except Exception:
+            except Exception:  # noqa: BLE001 - closing a broken connection may fail too
                 pass
         return Sender(row[0], row[1]) if row else None
 

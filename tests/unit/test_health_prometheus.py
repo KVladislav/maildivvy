@@ -19,6 +19,7 @@ import yaml
 from maildivvy.health import checks, report, run
 from maildivvy.health.report import FAIL, PASS, UNKNOWN, WARN, Check, Subsystem
 from maildivvy_preflight import HEALTH_USER, setting_errors, textfile_dir_errors
+from play_vars import play_vars
 
 UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 9, 23, 12, 0, 30, 250000, tzinfo=UTC)
@@ -128,7 +129,7 @@ def test_the_textfile_is_written_whole_and_readable_by_the_collector(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == [report.TEXTFILE]  # nothing half-written
 
 
-def fake_run(names=None, conf=None, now=None):
+def fake_run(names=None, conf=None, now=None, keep=False):
     chosen = names or list(checks.SUBSYSTEMS)
     return report.Report(NOW, [subsystem(n, FAIL if n == "store" else PASS) for n in chosen])
 
@@ -211,7 +212,7 @@ def test_a_textfile_directory_it_cannot_write_is_unknown_and_the_report_is_still
 
 
 def rendered_unit(textfile_dir):
-    values = {**yaml.safe_load((HEALTH / "vars" / "main.yml").read_text()),
+    values = {**play_vars("maildivvy_opt"), **yaml.safe_load((HEALTH / "vars" / "main.yml").read_text()),
               **yaml.safe_load((HEALTH / "defaults" / "main.yml").read_text())}
     if textfile_dir is not None:
         values["maildivvy_health_textfile_dir"] = textfile_dir

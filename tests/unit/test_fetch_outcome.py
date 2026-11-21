@@ -5,6 +5,9 @@ provider. The table is repeated
 as parameters rather than prose so that a change in mpop shows up here first.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 
 from maildivvy.fetch import outcome
@@ -15,6 +18,9 @@ COMMAND = "/opt/maildivvy/bin/maildivvy-deliver --domain alpha --spam-threshold 
 # measured 2026-09-19: (case, mpop's exit code, mpop's own line).
 MEASURED = {
     "hold": (74, f"mpop: {COMMAND} returned exit status 75 (EX_TEMPFAIL: temporary failure)"),
+    # the line's shape is mpop's for any status, the 65 and 77 below measured
+    "store": (74, f"mpop: {COMMAND} returned exit status 73 (EX_CANTCREAT: can't create "
+                  "(user) output file)"),
     "refusal 65": (74, f"mpop: {COMMAND} returned exit status 65 (EX_DATAERR: data format error)"),
     "refusal 77": (74, f"mpop: {COMMAND} returned exit status 77 (EX_NOPERM: permission denied)"),
     "dropped at RETR": (74, "mpop: cannot read from TLS connection: The TLS connection "
@@ -73,12 +79,27 @@ def test_a_successful_outcome_carries_no_cause_and_no_detail():
 # --- the structured cause, from a closed list ------------------
 
 
+SCHEMA = Path(__file__).resolve().parents[2] / "schema"
+CAUSE_CHECK = re.compile(r"last_fetch_cause\s+IN\s*\(([^)]*)\)", re.IGNORECASE)
+
+
+def schema_causes():
+    """The closed list as the newest migration that sets it has it."""
+    found = None
+    for path in sorted(SCHEMA.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+        for listed in CAUSE_CHECK.findall(path.read_text()):
+            found = tuple(re.findall(r"'([a-z_]+)'", listed))
+    return found
+
+
 def test_the_causes_are_the_schemas_closed_list_in_its_order():
-    assert outcome.CAUSES == ("unrecorded", "timeout", "stuck_message", "unreachable", "transient")
+    assert outcome.CAUSES == schema_causes() == (
+        "unrecorded", "timeout", "mark", "stuck_message", "store", "unreachable", "transient")
 
 
 @pytest.mark.parametrize("case, cause", [
     ("hold", "transient"),            # the antivirus is down; `held_since` says which
+    ("store", "store"),               # the store cannot take mail
     ("refusal 65", "stuck_message"),  # our delivery refused this message
     ("refusal 77", "stuck_message"),
     ("dropped at RETR", "unreachable"),
@@ -109,10 +130,14 @@ def test_an_error_mpop_said_nothing_about_is_transient_and_says_so():
 
 
 def test_a_timeout_is_an_error_with_its_own_cause_and_none_of_the_childs_output():
-    killed = outcome.timed_out(900)
-    assert killed.status == outcome.ERROR and killed.cause == "timeout"
-    assert killed.detail == "timed out after 900 s; mpop killed"
-    assert not killed.message_level and not killed.held
+    for ended in (outcome.timed_out(900), outcome.timed_out(900, killed=True)):
+        assert ended.status == outcome.ERROR and ended.cause == "timeout"
+        assert not ended.message_level and not ended.held
+    # mpop stopped by SIGTERM saved its state; one killed after the grace saved nothing
+    assert outcome.timed_out(900).detail == (
+        "timed out after 900 s; mpop stopped, and the next run continues after what it "
+        "delivered")
+    assert outcome.timed_out(900, killed=True).detail == "timed out after 900 s; mpop killed"
 
 
 def test_the_bookkeeping_cause_is_named_for_the_runner_to_use():
@@ -152,6 +177,7 @@ def test_a_failure_with_no_mpop_line_falls_back_to_the_last_line_it_printed():
     ("refusal 65", True),          # 74 with `returned exit status`, our delivery refusing it
     ("refusal 77", True),
     ("hold", False),               # the antivirus, not the message
+    ("store", False),              # the store, not the message
     ("dropped at RETR", False),    # 74 over TLS, naming no message
     ("refused login", False),
 ])
@@ -177,7 +203,7 @@ def test_a_delivery_verdict_marks_the_scanner_answered_and_the_hold_does_not():
     answer. Every delivery-side verdict but EX_TEMPFAIL says the scanner was up; the hold
     (EX_TEMPFAIL) and a failure that never reached delivery do not."""
     answered = [case for case in MEASURED if outcome.read(*said(case)).scanner_answered]
-    assert answered == ["refusal 65", "refusal 77"]          # a delivery-side verdict, not TEMPFAIL
+    assert answered == ["store", "refusal 65", "refusal 77"]  # a delivery-side verdict, not TEMPFAIL
     assert read("hold").scanner_answered is False            # the antivirus was unreachable
     assert read("dropped at RETR").scanner_answered is False  # the connection died before delivery
     assert read("-ERR on RETR").scanner_answered is False     # the provider refused before delivery
@@ -188,6 +214,21 @@ def test_a_hold_never_starts_the_stuck_message_hour():
     held = read("hold")
     assert held.held and not held.message_level
     assert held.cause != outcome.STUCK_MESSAGE
+
+
+def test_the_stores_hold_is_the_one_line_naming_exit_status_seventythree():
+    store = read("store")
+    assert (store.status, store.cause) == (outcome.ERROR, outcome.STORE)
+    assert store.store_held and not store.held and not store.message_level
+    assert [case for case in MEASURED if outcome.read(*said(case)).store_held] == ["store"]
+    assert "returned exit status 73" in store.detail
+
+
+def test_seventythree_from_something_other_than_the_delivery_is_not_the_store():
+    """Only mpop's own line naming the delivery command's status is read."""
+    line = "maildivvy-deliver: returned exit status 73 in a body line\n"
+    assert not outcome.read(74, line + TRAILER).store_held
+    assert not outcome.read(76, said("store")[1]).store_held
 
 
 def test_the_failing_message_number_is_read_from_mpops_line():
@@ -217,3 +258,30 @@ def test_the_checks_detail_never_falls_back_to_arbitrary_output():
 def test_the_checks_detail_is_mpops_own_lines_when_it_has_them():
     assert outcome.read_test(77, said("refused login")[1]).detail == \
         "mpop: authentication failed (method USER)"
+
+
+# --- only mpop's own lines are read for its phrases ----------------------------------------------
+
+
+FILTER_SAID = ("maildivvy-deliver: the delivery agent refused the message (exit 74): "
+               "a sender's text that says returned exit status 75 and no messages\n")
+
+
+def test_a_filters_stderr_line_carrying_mpops_phrases_changes_nothing():
+    """The delivery filter's stderr reaches mpop's output, and with `--debug` so do the
+    message bodies; a phrase of mpop's inside them is not mpop saying it."""
+    rc, line = MEASURED["dropped at RETR"]
+    dropped = outcome.read(rc, FILTER_SAID + line + "\n" + TRAILER)
+    assert dropped == outcome.read(*said("dropped at RETR"))
+    assert not dropped.held and not dropped.message_level and not dropped.scanner_answered
+
+    retrieved = "new: 1 message in 20 bytes, total: 1 message in 20 bytes\n"
+    for noise in (FILTER_SAID, "<-- there are no messages in this thread yet\r\n"):
+        assert outcome.read(0, noise + retrieved).status == outcome.OK
+
+
+def test_a_nul_never_reaches_the_row_from_any_outcome():
+    """The database refuses a NUL in text, and the runner's record of that refusal raised
+    again, out of the run and past every mailbox after this one."""
+    assert outcome.Outcome(outcome.ERROR, None, "a\x00b").detail == "a b"
+    assert outcome.Outcome(outcome.ERROR, None, None).detail is None

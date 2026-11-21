@@ -8,10 +8,12 @@ first, and delete the ones the settings no longer name. A rule of a
 shape the install never writes (an application profile, a route) is refused rather
 than guessed at. The role runs the commands under the self-reverting timer.
 
-The mail ports are not this step's: step 19 opens them to anywhere once the
-ban is proved. Those rules, exactly as step 19 writes them, are kept - never deleted,
+The mail ports are not this step's: step 19 opens them to anywhere on IPv4 once
+the ban is proved. Those rules, exactly as step 19 writes them, are kept - never deleted,
 never added here - and the kernel is expected to hold them, so a re-run of step 3 over a
-published machine neither closes the ports nor publishes an unproved one.
+published machine neither closes the ports nor publishes an unproved one. The IPv6 rule an
+earlier step 19 wrote beside each is deleted like any rule the settings do not name: the
+machine serves IPv4 only.
 """
 
 import ipaddress
@@ -53,10 +55,9 @@ CHAINS = {4: "ufw-user-input", 6: "ufw6-user-input"}
 
 
 def published_rules(current, ports):
-    """The rules step 19 wrote to publish `ports` (tcp from anywhere, per family) that are in
-    `current`: kept by this step, in the order ufw lists them."""
-    theirs = {("allow", "tcp", str(port), ANY[family], "any", ANY[family], "in")
-              for port in ports for family in (4, 6)}
+    """The rules step 19 writes to publish `ports` (tcp from anywhere on IPv4) that are
+    in `current`: kept by this step, in the order ufw lists them."""
+    theirs = {("allow", "tcp", str(port), ANY[4], "any", ANY[4], "in") for port in ports}
     return [rule for rule in current if rule in theirs]
 
 
@@ -86,13 +87,27 @@ def _expressible(rule):
     return len(rule) == 7 and rule[6] == "in" and rule[4] == "any" and rule[2] != "any"
 
 
+def _network(field):
+    try:
+        return ipaddress.ip_network(field, strict=False)
+    except ValueError:
+        return field
+
+
+def _key(rule):
+    """A rule with its destination and source parsed: ufw writes a network in its own spelling
+    (no host mask, a prefix for a dotted mask, IPv6 rewritten), the settings in theirs."""
+    return tuple(_network(f) if i in (3, 5) else f for i, f in enumerate(rule))
+
+
 def plan(current, wanted, kept=()):
     """(argv lists to add, argv lists to delete, errors) turning `current` into `wanted`, with
     the `kept` rules left as they are."""
-    add = [_argv(rule) for rule in wanted if rule not in current]
+    have, want, keep = ({_key(r) for r in rules} for rules in (current, wanted, kept))
+    add = [_argv(rule) for rule in wanted if _key(rule) not in have]
     delete, errors = [], []
     for rule in current:
-        if rule in wanted or rule in kept:
+        if _key(rule) in want or _key(rule) in keep:
             continue
         if _expressible(rule):
             delete.append(_argv(rule, delete=True))

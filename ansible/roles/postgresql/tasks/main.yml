@@ -33,11 +33,16 @@
     maildivvy_pg_etc: "/etc/postgresql/{{ maildivvy_pg_clusters.stdout.split()[0] }}/main"
     maildivvy_pg_service: "postgresql@{{ maildivvy_pg_clusters.stdout.split()[0] }}-main"
 
+# By address, never `localhost`: on a machine whose /etc/hosts is empty the name
+# is systemd-resolved's, and an upgrade that restarted the resolver beside the cluster left
+# it failed at its start ("could not translate host name"), with no Restart= to bring it
+# back. Postfix, the only consumer over TCP, dials 127.0.0.1; the rest use the socket.
 - name: Listen on loopback only, in a drop-in, never by editing the stock file
   ansible.builtin.copy:
     content: |
-      # Maildivvy, install step 6: every consumer is on this machine.
-      listen_addresses = 'localhost'
+      # Maildivvy, install step 6: every consumer is on this machine, and the
+      # start resolves no name.
+      listen_addresses = '127.0.0.1'
     dest: "{{ maildivvy_pg_etc }}/conf.d/10-listen.conf"
     owner: postgres
     group: postgres
@@ -83,9 +88,8 @@
 - name: The server listens on loopback only
   ansible.builtin.assert:
     that:
-      - maildivvy_pg_listening.stdout_lines[0] == 'localhost'
-      - "'127.0.0.1:' ~ maildivvy_db_port in maildivvy_pg_listening.stdout_lines[1:]"
-      - maildivvy_pg_listening.stdout_lines[1:] | difference(['127.0.0.1:' ~ maildivvy_db_port, '[::1]:' ~ maildivvy_db_port]) == []
+      - maildivvy_pg_listening.stdout_lines[0] == '127.0.0.1'
+      - maildivvy_pg_listening.stdout_lines[1:] == ['127.0.0.1:' ~ maildivvy_db_port]
     fail_msg: "PostgreSQL listens on {{ maildivvy_pg_listening.stdout_lines }}"
     quiet: true
 

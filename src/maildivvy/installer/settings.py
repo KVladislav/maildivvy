@@ -37,9 +37,14 @@ TUNABLES = (
     "maildivvy_rspamd_user", "maildivvy_rspamd_reject_score", "maildivvy_rspamd_add_header_score",
     "maildivvy_rspamd_greylist_score", "maildivvy_rspamd_provider_hosts", "maildivvy_rspamd_rbls",
     "maildivvy_rspamd_rbl_listed_probe", "maildivvy_rspamd_rbl_clean_probe",
-    "maildivvy_postfix_inet_protocols", "maildivvy_postfix_tls_protocols",
+    "maildivvy_postfix_tls_protocols",
     "maildivvy_postfix_message_size_limit",
 )
+# settings once offered and taken away, each refused with its reason rather than as unknown
+WITHDRAWN = {
+    "maildivvy_postfix_inet_protocols": "the machine serves IPv4 alone and the family is not a setting; "
+                                        "remove the line",
+}
 SECRETS = ("maildivvy_breakglass_password", "maildivvy_acme_dns_credentials")
 # the run's own values (run.run_values), never kept: the test certificate is chosen on the
 # command line alone, on each run
@@ -84,6 +89,8 @@ def parse(text, where):
         elif key == TEST_CERTIFICATE:
             problems.append(f"{key} in {where}: a test certificate is chosen on the command line alone, "
                             f"with {TEST_CERTIFICATE_OPTION}")
+        elif key in WITHDRAWN:
+            problems.append(f"{key} in {where}: {WITHDRAWN[key]}")
         elif key not in SETTINGS and key not in TUNABLES:
             problems.append(f"not a Maildivvy setting: {key} in {where} (the installation guide lists the "
                             "settings, the roles' README the defaults an operator may override)")

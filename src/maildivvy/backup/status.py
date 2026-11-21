@@ -2,8 +2,9 @@
 
 `/var/backups/maildivvy` is root's alone, so what other programs need to
 know about it is written beside, world-readable and holding no secret: the newest run's
-name and moment, what it held, and what the operator's store copy did. The pipeline's
-enable gate reads it; nothing in it is a credential or a row.
+name and moment, what it held, what the operator's store copy did, and the newest run
+whose store copy succeeded. The pipeline's enable gate reads it, and so does
+health; nothing in it is a credential or a row.
 """
 
 import json

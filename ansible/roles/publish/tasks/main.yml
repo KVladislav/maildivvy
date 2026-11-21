@@ -33,7 +33,7 @@
 
     - name: The ban reads PASS in health before anything is opened
       ansible.builtin.command:
-        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_publish_health }}", --subsystem, ban]
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_health_program }}", --subsystem, ban]
         chdir: /
       changed_when: false
 
@@ -90,11 +90,12 @@
         ordered: true
         family: 6
 
-    # Adding a rule never stops the firewall. ufw writes each for IPv4 and IPv6;
-    # step 3 keeps exactly these rules on a re-run (ansible/library/maildivvy_ufw.py).
-    - name: Open 993 and 465 to anywhere
+    # Adding a rule never stops the firewall. From 0.0.0.0/0, not `any`, which ufw
+    # writes for IPv6 too: the machine serves IPv4 only (0049). Step 3 keeps exactly these
+    # rules on a re-run (ansible/library/maildivvy_ufw.py).
+    - name: Open 993 and 465 to anywhere, over IPv4
       ansible.builtin.command:
-        argv: [ufw, allow, proto, tcp, from, any, to, any, port, "{{ item }}"]
+        argv: [ufw, allow, proto, tcp, from, 0.0.0.0/0, to, any, port, "{{ item }}"]
       loop: "{{ maildivvy_publish_ports }}"
       register: maildivvy_publish_opened
       changed_when: "'Rule added' in maildivvy_publish_opened.stdout"
@@ -118,11 +119,12 @@
       register: maildivvy_publish_open
       changed_when: false
 
-    - name: The kernel accepts 993 and 465 from anywhere, over IPv4 and IPv6
+    # 0049
+    - name: The kernel accepts 993 and 465 from anywhere over IPv4, and not over IPv6
       ansible.builtin.assert:
         that:
           - ('-A ufw-user-input -p tcp -m tcp --dport ' ~ item ~ ' -j ACCEPT') in maildivvy_publish_open.stdout_lines
-          - ('-A ufw6-user-input -p tcp -m tcp --dport ' ~ item ~ ' -j ACCEPT') in maildivvy_publish_open.stdout_lines
+          - maildivvy_publish_open.stdout_lines | select('match', '^-A ufw6-user-input .*--dport ' ~ item ~ ' ') | list == []
         fail_msg: "{{ item }} is not accepted: {{ maildivvy_publish_open.stdout_lines }}"
         quiet: true
       loop: "{{ maildivvy_publish_ports }}"
@@ -145,7 +147,7 @@
 
     - name: Health reads the ban as PASS, with the rate limits now judged
       ansible.builtin.command:
-        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_publish_health }}", --subsystem, ban]
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_health_program }}", --subsystem, ban]
         chdir: /
       changed_when: false
 
@@ -153,7 +155,7 @@
     # outside result gives it - UNKNOWN until there is one, printed below.
     - name: Health reads the network as PASS, but for the outside proof
       ansible.builtin.command:
-        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_publish_health }}", --subsystem, network]
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_health_program }}", --subsystem, network]
         chdir: /
       register: maildivvy_publish_network
       changed_when: false
@@ -189,5 +191,5 @@
          itself), with this repository's tools/outside-probe/:"
       - "    python3 maildivvy_outside_probe.py {{ maildivvy_cert_name }} [--address <public address>]{{
          '' if maildivvy_cert_mode | default('acme') == 'acme'
-         else ' --cafile <a copy of /etc/ssl/certs/' ~ maildivvy_cert_name ~ '.crt>' }} > probe-result.json"
+         else ' --cafile <a copy of ' ~ maildivvy_published_cert ~ '>' }} > probe-result.json"
       - "Then, on this machine:  sudo maildivvy-publication record < probe-result.json"

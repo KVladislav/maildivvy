@@ -36,6 +36,19 @@ Tags are for iterating: only a full run without them, on a fresh machine, proves
 installation. A run with `--tags` records no version, and only a control-machine run
 takes them: `maildivvy-install` always runs every step.
 
+**What a daemon's proof reads.** `doveconf`, `postconf`, `nginx -T` and `rspamadm
+configdump` parse the files, the same files the daemon read when it started; none of them
+asks the running daemon. Postfix and nginx keep no dump of the configuration they run,
+Dovecot's `doveadm config` is the files again, and rspamd's controller, which could answer
+for its workers, is off. What makes the files the running configuration is
+the restart: each of the four is restarted (rspamd's container recreated) whenever any of
+its configuration is newer than its last read of it - its unit's start, its container's,
+or the Postfix master's last `reload` line - read by `library/maildivvy_stale.py`, never
+whether this run wrote the file. A run stopped between the write and the restart is
+finished by the next one. nginx is restarted on a changed site rather than reloaded, since
+a reload leaves no time to compare with. Dovecot's files are written into a copy of
+`/etc/dovecot` and parsed there by `doveconf -c` before they replace the live ones.
+
 ## Settings
 
 Every setting is checked before anything changes, and a refusal lists every missing,
@@ -98,7 +111,6 @@ and `maildivvy_rspamd_rbls` (off, with the two probe names it tests a resolver w
 `maildivvy_rspamd_rbl_listed_probe` and `maildivvy_rspamd_rbl_clean_probe`).
 
 And for Postfix (`ansible/roles/postfix/defaults/main.yml`):
-`maildivvy_postfix_inet_protocols` (`ipv4`, the families actually served),
 `maildivvy_postfix_tls_protocols` (`>=TLSv1.2`, both ends) and
 `maildivvy_postfix_message_size_limit` (`52428800`, the largest message submission
 accepts, 50 MiB as the antivirus scans).
@@ -131,15 +143,23 @@ crosses the firewall, so its own connection can never cancel a timer. With
 `maildivvy_admin_ssh_source`, read from the journal records journald itself attributes
 to sshd; open a second SSH session from that address then. With none before the timer
 fires, the rules in force before the run come back and the step fails. Step 4 waits for
-a login of its own the same way after its reload. With `console` neither step waits,
+a login of its own the same way after its load. With `console` neither step waits,
 and each says in its output that nothing confirmed it.
 
 Step 4 adds the `DOCKER-USER` block to `/etc/ufw/after.rules` before Docker exists,
 keeping the file as it was in `/etc/ufw/after.rules.maildivvy-predocker` and arming a
-`maildivvy-docker-block-revert` timer that restores that copy. Every run compares the
-kernel's `DOCKER-USER` with the block rule by rule and fails if the chain is missing or
-differs, since a lost block fails open. A chain lost while the file keeps the block
-comes back with `ufw reload`; a file that lost the block is rewritten by a re-run. The
+`maildivvy-docker-block-revert` timer that restores that copy. Both the edit and the
+revert load the block into the running firewall as ufw loads the file, its chains replaced
+in one `iptables-restore --noflush`, never with `ufw reload`, which opens everything for a
+moment; ufw's own forward chain, which the block declares for boot, is left as it is, with
+its `ufw route` rules. A chain lost while the file keeps the block is loaded back the
+same way by the next run, which reports the step as changed; the runtime's own
+`FORWARD -j DOCKER-USER` jump, lost with it, goes back first in `FORWARD` once the
+runtime is installed. That load touches only the block's chains, never `INPUT`, so it
+arms no timer. A file that lost the block is rewritten by a re-run. Either way, a re-run
+is the way back, never `ufw reload`. Every run then compares the kernel's `DOCKER-USER`
+with the block rule by rule and fails if the chain is still missing or differs, since a
+lost block fails open. The
 runtime arriving in step 11 adds its own `FORWARD` jump and changes no rule of the block
 (measured 2026-09-20), and the tests then publish a throwaway container port to prove the
 block drops it.
@@ -165,7 +185,8 @@ block drops it.
 - `run`: `lego run` over DNS-01 (issue, or renew when due; lego 5 has no `renew`), store
   `/etc/lego` for production and `/etc/lego/staging` for staging.
 - `deploy`: lego's deploy hook. It republishes the certificate to
-  `/etc/ssl/certs/<name>.crt` (`0644 root:root`) and the key to
+  `/etc/maildivvy/tls/<name>.crt` (`0644 root:root`, in a `0755 root:root` directory no
+  trust store reads) and the key to
   `/etc/ssl/private/<name>.key` (`0640 root:ssl-cert`), naming a missing source
   file, then reloads every consumer in its one list (`CONSUMERS`: Dovecot,
   Postfix, the proxy) that is enabled, and skips the rest. A step that
@@ -180,6 +201,16 @@ checked against its checksums file by an anchored match and against the pin.
 The `maildivvy-cert-renew.timer` runs daily (4 h jitter, persistent); every install
 run starts its service once through systemd and reads that run from the journal.
 Not done: preflighting the CA's duplicate-certificate rate limit.
+
+An earlier version published the certificate to `/etc/ssl/certs/<name>.crt`, where every
+`update-ca-certificates` run (any `ca-certificates` upgrade) gave a self-signed one a hash
+link: a trusted root of the machine's default store. The step copies such a
+file, unchanged, to the new path before anything publishes, so nothing is reissued,
+remade or reloaded for the move. After the last step, once Dovecot, Postfix and the proxy
+have been restarted onto the new path, the playbook's closing tasks check that nothing
+under `/etc/postfix`, `/etc/dovecot` or `/etc/nginx` names the old path, remove the old
+file and every link to it in `/etc/ssl/certs`, and read the directory back. The key's
+path does not change: `/etc/ssl/private` is no CA path.
 
 ### Self-signed mode
 
@@ -231,7 +262,8 @@ groups and files lays out:
 - the code: `src/maildivvy` as `/opt/maildivvy/lib/maildivvy`, every file of `bin/`
   as `/opt/maildivvy/bin/`, and `schema/` as `/opt/maildivvy/schema/`. The controller packs the tree;
   `maildivvy_tree` compares every path, owner, mode and digest with the deployed one
-  and, when anything differs, removes `/opt/maildivvy` first and writes it whole.
+  and, when anything differs, writes the tree whole beside `/opt/maildivvy` and swaps it
+  in at once, so the Sent hook, the milter and the interface never find it missing.
   Everything is `root:root`, directories and programs `0755`, other files
   `0644`; caches are never deployed, and one the interpreter writes at
   run time is not a difference.
@@ -250,10 +282,12 @@ it and reads it back), both in `ansible/roles/programs/vars/main.yml`.
 `Persistent=true`, `RandomizedDelaySec=maildivvy_fetch_jitter` (20 s) and
 `AccuracySec=10s`. Only the timer is enabled; the
 service is `static`. The runner bounds each mpop at 900 s of its own,
-so the unit's `TimeoutStartSec` (`maildivvy_fetch_run_timeout`,
-3600 s) only has to be wider than a run of every mailbox: a run that overruns the
-period is not killed, because the next run takes the per-mailbox try-lock, finds it
-held and skips that mailbox.
+and a timed run takes the least recently collected mailbox first and
+starts none that could end more than 3,300 s after it began, so the unit's
+`TimeoutStartSec` (`maildivvy_fetch_run_timeout`, 3600 s) is a margin above the run's own
+bound; the mailboxes left are the next run's first. A run that overruns the period is not
+killed, because the next run takes the per-mailbox try-lock, finds it held and skips that
+mailbox.
 
 The runner writes one `mpoprc` per external mailbox under `/var/lib/maildivvy/fetch/<id>/`,
 beside mpop's own `uidls` state file. ⛔ **The credential is never in that file**: it
@@ -262,7 +296,9 @@ mpop on a pipe. ⛔ **The rendered file names no trust anchor and no
 transport switch** — `tls on` and `tls_starttls off` are literal — so
 mpop verifies the provider against the machine's own trust store. A `--trace` run
 writes `/var/lib/maildivvy/fetch/<id>/trace` `0600`: it holds the credential in clear,
-because `mpop --debug` prints every command verbatim.
+because `mpop --debug` prints every command verbatim. All of this is POP3's:
+an IMAP mailbox renders nothing and has no directory there, since its mark is on its row,
+and `--trace` refuses it.
 
 **The pass's unit and timer** use the same hook: `maildivvy-pass.service` is a
 `oneshot` run as `vmail` of `/opt/maildivvy/bin/maildivvy-pass`, and
@@ -274,6 +310,26 @@ is enabled. A run that overruns the period is not killed
 `FOR UPDATE`, so a second run queues per (domain, mailbox) instead of reading one range
 twice. The pass reads the archive through `doveadm` and makes the hardlinks itself, so
 it runs as the mail owner, like the fetch runner and the delivery filter.
+
+**The snapshot's unit and timer** use it too: `maildivvy-snapshot.service` is a
+`oneshot` run as `vmail` of `/opt/maildivvy/bin/maildivvy-fetch --snapshot`, which takes a
+slice of each IMAP mailbox's snapshot under way or asked for, and
+`maildivvy-snapshot.timer` starts it every ten minutes (`*:0/10`, `Persistent=false`: a
+missed slot only delays a snapshot). Only the timer is enabled. Each slice bounds itself
+at ten minutes and the message in hand. A run gives each snapshot under way one slice in
+turn, the one advanced longest ago first, and starts no slice that could end later than
+3,300 s after the run began, so it ends inside `TimeoutStartSec`
+(`maildivvy_snapshot_run_timeout`, 3600 s); snapshots it had no time for go first in the
+next run. A backup's or an upgrade's pause stops the timer and waits for the service,
+never killing it, so it waits at most for one such run: up to about an hour. Its one
+writable path, `/srv/maildivvy/store/_snapshots` (`maildivvy_snapshots`), is made `vmail`
+`0700` by this role before the unit first starts.
+
+**The import** is `maildivvy-import` in `/opt/maildivvy/bin` with the other
+programs, run by the operator as `vmail`; no unit or timer starts it. Its staging directory,
+`/srv/maildivvy/store/_imports` (`maildivvy_imports`), is made `vmail` `0700` beside the
+snapshots, on the store's filesystem in either disk layout, so a file staged there is
+renamed into the store rather than copied.
 
 **The same run drains the administration interface's request queue**, at the end and
 never before the fan-out: every act that touches a disk - making a domain's
@@ -288,8 +344,11 @@ mailbox it is asked to collect.
 
 **The hardening is one set, and the list of writable paths is per program**.
 Every unit of ours carries `ProtectSystem=strict`, `ProtectHome`,
-`PrivateTmp`, `NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
-`RestrictSUIDSGID`, `LockPersonality`, `MemoryDenyWriteExecute`,
+`PrivateTmp`, `NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+(`AF_UNIX` alone on the milter, the interface, the backup and health's store helper,
+which open no IP socket, and with
+`AF_NETLINK` on health and its system helper, which read the kernel through `ss` and
+iptables), `RestrictSUIDSGID`, `LockPersonality`, `MemoryDenyWriteExecute`,
 `SystemCallArchitectures=native`, an empty `CapabilityBoundingSet` and an empty
 `AmbientCapabilities` — nothing of ours binds a privileged port, since the interface's TLS
 moved to the proxy — and `UMask=0077`, except the milter, whose
@@ -299,6 +358,7 @@ socket needs its group. What differs is `ReadWritePaths=`:
 |---|---|---|
 | `maildivvy-fetch.service` | `/var/lib/maildivvy/fetch`, `/srv/maildivvy/store`, `/srv/maildivvy/index` | ⛔ **not the state alone**: mpop's delivery command is our filter and the filter runs `dovecot-lda`, and a child inherits this namespace. With the store left out the LDA fails `Read-only file system` on every message while mpop and the unit both report success — 21 scheduled runs delivered nothing |
 | `maildivvy-pass.service` | the same three | names in the store, index trees moved by a transfer, and the fetcher's state, which a refetch's child writes and a deletion removes |
+| `maildivvy-snapshot.service` | `/srv/maildivvy/store/_snapshots` | a slice copies a provider's folders there and delivers nothing: the store's domains, the index and the fetch state are not its |
 | `maildivvy-milter.service` | `-/var/spool/postfix/maildivvy` | its socket and nothing else; the `-` is for a path its own root `ExecStartPre` makes |
 
 Every path must exist before the unit starts, or the namespace is never built and the
@@ -313,8 +373,12 @@ self-signed test machine.
 owner's configuration directory. It installs the distribution's PostgreSQL and checks
 there is one cluster, `main`, on 5432, then:
 
-- `conf.d/10-listen.conf` sets `listen_addresses = 'localhost'`; the stock file is not
-  edited. Read back from `SHOW listen_addresses` and `ss`;
+- `conf.d/10-listen.conf` sets `listen_addresses = '127.0.0.1'`; the stock file is not
+  edited. An address, never the name `localhost`: on a machine whose
+  `/etc/hosts` is empty the name is the resolver's, and the server's start then fails
+  when an upgrade restarts `systemd-resolved` beside it, and nothing starts it again.
+  Postfix, the only consumer over TCP, dials `127.0.0.1`. Read back from
+  `SHOW listen_addresses` and `ss`;
 - four lines go at the top of `pg_hba.conf`, before the stock `local all all peer`:
   `postgres` by peer and every other role by password (scram-sha-256) on database
   `maildivvy`, and the owner refused over TCP, so it logs in over the socket only.
@@ -374,6 +438,7 @@ stock files it replaces by name (`10-auth`, `10-mail`, `10-master`, `10-ssl`,
   the store owner's fixed ids, `maildir_broken_filename_sizes = yes`, no compression;
 - IMAP only, 993 alone with TLS 1.2 at least and the product certificate, 143 closed by
   `port = 0`; the firewall keeps 993 closed until step 19;
+  `listen = *`, IPv4 alone, as Postfix and the interface;
 - one `\Sent` folder, `auto = subscribe`; FTS in `20-fts.conf` with
   `fts_search_read_fallback = no` and the stock `90-` files emptied; `acl_driver = vfile` with `acl_defaults_from_inbox = yes`, nothing shared;
   the Sieve plugins, `vnd.dovecot.pipe` global only and
@@ -388,12 +453,20 @@ stock files it replaces by name (`10-auth`, `10-mail`, `10-master`, `10-ssl`,
   sender's own copy. The program itself comes from the programs role,
   which runs before this step; the step refuses to bind a script whose program is not
   an executable file. Compiling here is what keeps the imap process from compiling it
-  per message into a directory it cannot write.
+  per message into a directory it cannot write;
+- **the pipeline's configuration hidden**: every IMAP process runs as `vmail`, which
+  reads the pipeline's passfile too. A drop-in,
+  `/etc/systemd/system/dovecot.service.d/maildivvy.conf`, sets
+  `InaccessiblePaths=/etc/maildivvy/pipeline`, and the step checks it from inside the
+  master's mount namespace as `vmail`: the Sent hook's passfile is readable, the
+  pipeline's is not there. It raises the cost of reading the file and is no
+  boundary, since a same-uid process outside Dovecot still exposes it through
+  `/proc/<pid>/root`.
 
 The step reads back the effective values with `doveconf -h`, exactly one passdb and
-userdb, Dovecot listening on 993 alone, a lookup of nobody answered "no such user"
+userdb, Dovecot listening on `0.0.0.0:993` alone, a lookup of nobody answered "no such user"
 (exit 67) rather than a temporary failure, `vmail` opening `auth-userdb` and `anvil`,
-the Sent hook's binding as the daemon holds it, and the compiled script not older than
+the Sent hook's binding as `doveconf` parses it, and the compiled script not older than
 the script.
 
 **The archive's door** (for the domain request handler and the Sent hook): the archive
@@ -467,13 +540,15 @@ What the step leaves:
   own users. A deliverable default transport opens every sender at once, and a relay
   host does not override the guard: the transport is chosen before the next hop. The
   text after `error:` is part of the value and comes back in the refusal.
-- **the five lookup maps**, `/etc/postfix/maildivvy-*.cf`, `0640 root:postfix`, one view
-  each, ⛔ keyed BY SENDER and never by host: the lookup falls back to the relay host on
-  a miss, so with several mailboxes at one provider a missing per-sender key
-  authenticates as some other mailbox. Each names the
-  database with a libpq URI carrying `passfile=`, so the password is in no file
-  `postconf -n` prints back, and ⚠️ every `%s` is quoted — Postfix escapes the value but
-  does not quote it, and the error that follows names a missing table.
+- **the six lookup maps**, `/etc/postfix/maildivvy-*.cf`, `0640 root:postfix`, one view
+  each. Five are ⛔ keyed BY SENDER and never by host: the lookup falls back to the relay
+  host on a miss, so with several mailboxes at one provider a missing per-sender key
+  authenticates as some other mailbox. The sixth,
+  `tls-policy`, is keyed by the server, `[host]:port`, as Postfix looks a TLS policy up
+  by next hop. Each names the database with a libpq URI carrying `passfile=`,
+  so the password is in no file `postconf -n` prints back, and ⚠️ every `%s` is quoted —
+  Postfix escapes the value but does not quote it, and the error that follows names a
+  missing table.
 - **the rewrite is the SMTP client's** (`smtp_generic_maps`), never cleanup's: a
   canonical rewrite runs before the per-sender maps are read and collapses the key they
   are looked up by. No canonical map is set at all.
@@ -488,11 +563,13 @@ What the step leaves:
   connection is TCP to `127.0.0.1`, because the chroot has no PostgreSQL socket and an
   empty `/etc/hosts`, and libpq matches the passfile's first field against the host it is
   given — so that field is `127.0.0.1` and not `localhost`.
-- **the certificate**: `postfix` joins `ssl-cert` now that the package has made the
-  account, and the deploy hook is run again (it is lego's, so there is nothing to re-run
-  in `self-signed` mode); `smtpd_tls_cert_file` and `_key_file` are set explicitly, or
+- **the certificate**: `smtpd_tls_cert_file` and `_key_file` are set explicitly, or
   465 serves the distribution's snakeoil pair and every client refuses it by name.
-  Both ends are TLS 1.2 at least.
+  Both ends are TLS 1.2 at least. `smtpd` opens the key as root, before it
+  drops to `postfix`, so `postfix` is in no group for it: a machine an earlier
+  version installed has it in `ssl-cert`, and it leaves there, with Postfix restarted so
+  no running `smtpd` keeps the group. The step's proof is the certificate 465 serves,
+  compared with the published one over loopback, never what `postfix` can open.
 
 ⛔ **The step runs `postfix check` before every restart**: it reports a
 syntax error while the running service is still the old one, and a restart on a broken
@@ -665,10 +742,21 @@ and runs before step 13 renders anything for it:
 - `./configure --with-tls=gnutls --with-libgsasl --with-libidn --without-libsecret
   --without-mpopd`, `make`, installed `0755 root:root` at `/usr/local/bin/mpop`;
 - the build's packages (`build-essential`, `pkg-config` and three `-dev` packages)
-  come in for the build and go after it: `maildivvy_runtime` marks every package
-  holding one of the binary's libraries as manually installed, then purges by name
-  what apt would autoremove among the packages the build brought, and nothing that was
-  there before. **Never run `apt autoremove` on the mail server**: the
+  come in for the build, once the tarball matches the pin, and go after it, and every
+  run proves none is left. Before the first build the packages installed are
+  recorded in `/var/lib/maildivvy/mpop-build-before`, for good: they are the
+  operator's, or an earlier step's, and a retry or a later build keeps that record. A
+  machine an earlier version built mpop on has none, and is recorded with everything
+  but the build packages' dependency closure (`apt-cache depends --recurse`), so a build
+  package there is taken for an old build's leftover. `maildivvy_runtime` marks every
+  package holding one of the binary's libraries as manually installed, marks the build
+  packages off the record automatic, then purges by name what apt would autoremove
+  among the closure's packages off the record, never anything outside the closure,
+  and fails if a build package off the record is still installed or anything of the
+  closure off the record is left for an autoremove. A build package something
+  installed later depends on is left as it was found and fails the step; one the
+  operator keeps on purpose goes into the record by name.
+  **Never run `apt autoremove` on the mail server**: the
   install does not, and the step's proof is that a simulated autoremove names none of
   the binary's libraries;
 - the distribution's `mpop` package, and its `mpopd`, are purged once the built one
@@ -719,10 +807,18 @@ What the step leaves:
   `unix:maildivvy/does-not-exist.sock`, reads a submission being refused `451`, clears
   the value and reads the control with nothing bound. A rollback first attempted during
   an incident is one nobody has run, so it runs on every application of the role and
-  leaves the machine as it found it. ⛔ The real binding is the drill's `always`:
-  a drill that fails after the binding was taken away still fails the run,
-  and leaves submission bound to the milter rather than open with no From check and no
-  scan.
+  leaves the machine as it found it.
+- ⛔ **the drill never touches the live service**: it runs on a copy of `submissions` on
+  `127.0.0.1:19465`, made from `postconf -M` and `-P` as the machine holds them, under a
+  log name of its own. Unbinding `submissions` itself left authenticated submission with
+  no From check and no scan for as long as the drill took, on every re-run, and an
+  `smtpd` that accepted a connection in that window kept its session unbound. The copy's
+  whole `-o` list is compared with the live one's, binding and log name aside, so the
+  drill stays a proof about a service configured like submission; it is asserted to
+  listen on the loopback alone, and to be gone from `master.cf` and from the port when
+  the step ends. Its removal and the real binding are the drill's `always`: a failed
+  drill still fails the run, leaves no copy behind and leaves submission bound. The real
+  binding is written only when the machine does not already hold it, and never cleared.
 - **`milter_default_action = tempfail`, `milter_protocol = 6`**, the global
   `smtpd_milters` and `non_smtpd_milters` empty, and the binding on `submissions` alone:
   a global binding would also put the milter in front of the pickup
@@ -731,10 +827,14 @@ What the step leaves:
   service that does not exist prints the same `warning: unmatched request` as a correctly
   absent override. Step 9's own module is told to `keep` this one override,
   so a re-run of that step neither writes it nor takes it away.
-- **a restart when the code changed**: this is the first long-running program of ours.
-  The timers' programs pick up new code at their next run; this one holds what it
-  imported at start, so the step restarts it when anything under `/opt/maildivvy` is
-  newer than the running daemon.
+- **a restart when the code or the unit changed**: this is the first long-running
+  program of ours. The timers' programs pick up new code at their next run; this one
+  holds what it imported at start, so the step restarts it when its unit file or anything
+  under `/opt/maildivvy` is newer than the running daemon (`library/maildivvy_stale.py`),
+  whichever run wrote it, and reloads systemd first when systemd reads the unit as
+  changed on disk (`NeedDaemonReload`). Step 15 restarts the interface by the same rule,
+  step 17 the health helpers' sockets, and steps 13, 16 and 17 reload systemd by it for
+  their timers and services.
 
 ⚠️ **A refusal's own words are flattened before they are handed to the library**
 (measured 2026-09-20): pymilter refuses a reply text with a newline in it, and one with
@@ -777,14 +877,16 @@ What the step leaves:
   address out of it or nothing at all, so the journal, the login throttle and the unit's
   own log can never be handed a name, a second hop or a newline;
 - **the proxy's one site**: 443 alone, `ssl_protocols TLSv1.2 TLSv1.3` stated explicitly,
-  the published certificate and key named explicitly, and `proxy_pass`
-  to the socket. The distribution's default site, which listens on port 80, is removed,
+  the published certificate and key named explicitly,
+  `Strict-Transport-Security` on every response (this name alone), and `proxy_pass` to
+  the socket. The distribution's default site, which listens on port 80, is removed,
   and nothing answers on 80. The firewall has kept 443 scoped to the administrator
   networks since step 3, and the interface is never published;
-- **the certificate**: `www-data` joins `ssl-cert`, the deploy hook is run again (it is
-  lego's, so there is nothing to re-run in `self-signed` mode), and the hook's consumer
-  list keeps `nginx` with the verb `reload` — nginx re-reads its certificate on a
-  reload, and the master process stays where it was. A unit test holds that
+- **the certificate**: nginx's master reads the pair as root, so `www-data` is in no
+  group for it; a machine an earlier version installed has it in `ssl-cert`, and
+  it leaves there, with the proxy restarted so no running worker keeps the group. The
+  hook's consumer list keeps `nginx` with the verb `reload` — nginx re-reads its
+  certificate on a reload, and the master process stays where it was. A unit test holds that
   entry to this role's own name for the proxy, so the two cannot drift.
 
 ⛔ **The step's proof is a real request**, by name, over TLS, verified against
@@ -808,11 +910,13 @@ What the step leaves:
 - `/opt/maildivvy/bin/maildivvy-backup` (`src/maildivvy/backup/`), run daily by
   `maildivvy-backup.timer` (`OnCalendar=daily`, up to an hour of jitter, `Persistent=true`)
   and by hand the same way. A run:
-  1. **pauses collection and fan-out**: the fetch and pass timers are stopped, then it
-     **waits** until neither service is running or has a job queued. It never kills a
-     run: a fetch holds its mailbox's lock and may take fifteen minutes, and each unit's
-     own timeout bounds it. Only a timer that was active is started again, so collection
-     an operator had stopped stays stopped;
+  1. **pauses collection and fan-out**: the fetch, pass and snapshot timers are stopped,
+     then it **waits** until none of their services, nor the provider requests'
+     unit, is running or has a job queued. It never kills a
+     run: a fetch holds its mailbox's lock and may take fifteen minutes, a run of the
+     snapshot's slices up to about an hour, and each unit's own timeout bounds it. Only a
+     timer that was active is started again, so collection an operator had stopped stays
+     stopped;
   2. dumps the database as `maildivvy_owner`, through the owner's own `db.conf` and
      passfile over the unix socket, which puts the backup's identity on the socket rather
      than on loopback, and archives `/var/lib/maildivvy/fetch`;
@@ -848,11 +952,12 @@ What the step leaves:
   writes `/var/backups/maildivvy` and `/var/lib/maildivvy/backup` and nothing else.
 
 **Restore** (as root, by hand): `maildivvy-backup --restore <stamp>` pauses the same way,
-unpacks the state beside the live one and checks it, restores the dump in one transaction
-(`pg_restore --clean --single-transaction`), and only then swaps the state in; a database
-that will not restore leaves the state as it was. Put the store back first from the copy
-that same run made inside its pause, and no other (amended 2026-09-24), and keep
-its hardlinks.
+unpacks the state beside the live one and checks it, swaps it in, and only then restores
+the dump in one transaction, so a restore stopped between the two leaves the state older
+than the database (mail fetched again), never newer (mail skipped). A database known to
+have restored nothing gets the live state back; one that may have committed keeps the
+run's state and leaves collection stopped until the restore runs again. Put the store
+back first from the copy that same run made inside its pause, and no other (amended 2026-09-24), and keep its hardlinks.
 
 The step's proof is a first run taken through the unit itself, so its sandbox, its
 capability and its pause are what is exercised, then read back from the disk. A re-run
@@ -885,6 +990,13 @@ What the step leaves:
   `systemd-journal`) with the hardening set, writing only the report's directory. The unit
   succeeds for every report state (`SuccessExitStatus=1 2 3`); it fails only when the
   program cannot run, and then no report is written and it goes stale.
+- `maildivvy-health-ledger.timer`, daily at 03:30 (persistent), runs
+  `maildivvy-health-ledger.service`, `maildivvy-health --ledger-pass` as the same user
+  with the same hardening, which asks the store helper to hold every name in the store to
+  the ledger and keeps the result in `ledger-pass.json` beside the report (`0600`); every
+  health run reports it. The five-minute run reads only the names changed since its last
+  one, from where `ledger-window.json` says it began. The step takes one pass
+  through the unit before its own run.
 - with `maildivvy_health_textfile_dir` set, the unit runs with `--textfile-dir` and may
   write that directory too; the step makes it `0755 maildivvy-health`, and each run
   replaces `maildivvy.prom` whole (`0644`, through `.maildivvy.prom.partial`, which
@@ -897,8 +1009,9 @@ What the step leaves:
   readings asked for, from a closed list, and answers one JSON document ending
   `"complete": true`, so a helper cut short reads UNKNOWN:
   - `maildivvy-health-store@` runs **as `vmail`**: the ledger's consistency check
-    (`fanout/ledger.py`) and the link counts, through the pipeline's role in a read-only
-    session; the `keep` line of each rendered mpop configuration; a body search against
+    (`fanout/ledger.py`), over the names changed since the last run and, for the daily
+    pass, over every name with the link counts, through the pipeline's role in a
+    read-only session; the window is the one argument a reading is given, numbers only; the `keep` line of each rendered mpop configuration; a body search against
     an archive's index. It may write the store and the index trees, because `doveadm`
     keeps Dovecot's index and control files as any reader does;
   - `maildivvy-health-system@` runs **as root** with two capabilities that read -
@@ -971,7 +1084,13 @@ Until step 19, 993 and 465 have listeners and the firewall drops them.
   not write, and the self-reverting timer, which puts the saved file back whole, would
   drop live bans or bring back lifted ones;
 - the daemon **restarted** when a file changed, never `enable --now`: the package starts
-  it at install, and the new jails would never appear.
+  it at install, and the new jails would never appear;
+- ⛔ **`nftables.service` masked**, and read back masked and inactive on every run: the
+  `nftables` package ships it disabled, but its start and reload load
+  `/etc/nftables.conf`, which begins with `flush ruleset`, and its stop is
+  `nft flush ruleset`, so it would empty ufw's tables, fail2ban's and Docker's rules.
+  The package's upgrade unmasks only a mask its own helper made, never this one.
+  Step 1 refuses a machine where the unit is already enabled or running.
 
 The proof is `maildivvy-ban prove` (`files/maildivvy_ban.py`, installed in
 `/usr/local/sbin`), which proves each jail in four halves, since `attempt` bypasses the
@@ -1013,13 +1132,14 @@ nor the live counter; then health must read `ban` PASS again:
   after `# End required lines`, which ufw loads at boot) and loaded into the running
   firewall with `iptables-restore --noflush` and one inserted jump, never `ufw reload`;
   the kernel chain is then compared with the file rule by rule;
-- `ufw allow proto tcp from any to any port 993` and `465`, which never stops the firewall
-  and writes each rule for IPv4 and IPv6. ⛔ Step 3 keeps exactly these rules on a re-run
+- `ufw allow proto tcp from 0.0.0.0/0 to any port 993` and `465`, which never stops the
+  firewall and writes each rule for IPv4 alone: the machine serves IPv4 only, and
+  `from any` would write an IPv6 rule too. ⛔ Step 3 keeps exactly these rules on a re-run
   (`maildivvy_ufw.py`'s `published`), neither deleting them nor ever adding them itself;
 - `/var/lib/maildivvy/publication.json` = `{"published_at": …}`, `0644 root`, written once:
   health counts 993 and 465 open without it as a FAIL.
 
-Its proof: the kernel accepts both ports from anywhere in both families; both answer here
+Its proof: the kernel accepts both ports from anywhere over IPv4 and not over IPv6; both answer here
 (an IMAP greeting and an SMTP banner over TLS); health reads `ban` PASS with the rate limits
 now judged, and `network` PASS in every check but `publication`, which only an outside
 result can make PASS. The step then prints the probe's command.
@@ -1055,6 +1175,8 @@ from staging.
   a machine that carries another mail system: a transfer agent or IMAP server this install
   never puts there (Exim, Sendmail, OpenSMTPD, Courier, Cyrus and the like, or rspamd
   outside its container), or Postfix or Dovecot on a machine it has not installed.
+  Step 1 also refuses a machine whose `nftables.service` is enabled or running: that is
+  someone's own ruleset, and the unit flushes every rule on the machine.
 - In separate mode, a disk for the store and one for the index beside the system disk,
   of any sizes, and optionally a swap disk. The data disks must be empty whole disks: a
   disk with partitions, a mount or a filesystem the install did not make is refused,

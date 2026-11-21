@@ -19,10 +19,17 @@ then closed with a note naming the release that carries it, and the changelog li
   ```
   python3.14 -m venv .venv
   .venv/bin/pip install pytest==9.0.2 pyyaml==6.0.3 flask==3.1.3 jinja2==3.1.6 \
-      ansible-core==2.20.1 ansible-lint==26.9.0
+      ansible-core==2.20.1 ansible-lint==26.9.0 ruff==0.17.4
   ```
 - Run the unit tests: `make test-unit`. They run locally in seconds and need no mail
-  machine. A change to the programs or the roles comes with its test.
+  machine. A change to the programs or the roles comes with its test. The target runs
+  `ruff check` first, with the rules in `pyproject.toml`; a finding is fixed, or marked in
+  place with `# noqa: <rule>` and the reason.
+- A change to the database is a new migration in `schema/`, never an edit of
+  `0001_initial.sql`. An upgrade applies it while the previous release's programs still
+  run, so it only adds: a drop, a rename, a retyped column, a new constraint an old writer
+  can break waits for the release after the one that stopped using what it removes, and
+  says why in a `-- previous release:` comment. The applier refuses one that does not.
 - Keep a pull request to one change. Say what it fixes or adds and why.
 - Changes to the installation roles should still pass `make lint`: `ansible-lint`, with
   the exceptions `.ansible-lint-ignore` lists and says why, and

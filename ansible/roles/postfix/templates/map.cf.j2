@@ -6,6 +6,6 @@
 #
 # ⚠️ Every %s is QUOTED. Postfix escapes the value but does not quote it, and the error
 # that follows names a missing table rather than a missing quote.
-hosts = postgresql://{{ maildivvy_postfix_db_role }}@{{ maildivvy_postfix_db_host }}/{{ maildivvy_postfix_db_name }}?passfile={{ maildivvy_postfix_passfile }}
-dbname = {{ maildivvy_postfix_db_name }}
+hosts = postgresql://{{ maildivvy_postfix_db_role }}@{{ maildivvy_postfix_db_host }}/{{ maildivvy_db_name }}?passfile={{ maildivvy_postfix_passfile }}
+dbname = {{ maildivvy_db_name }}
 query = SELECT mvalue FROM {{ item.view }} WHERE mkey = '%s'

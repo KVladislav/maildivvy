@@ -26,7 +26,7 @@ import datetime
 from flask import current_app, g
 
 from maildivvy.admin import app
-from maildivvy.admin.screens.common import spell, timer_period
+from maildivvy.admin.screens.common import moment, spell, timer_period
 from maildivvy.health import report, settings
 
 REPORT = settings.REPORT
@@ -45,7 +45,8 @@ VOICES = {report.PASS: "ok", report.WARN: "attn", report.FAIL: "bad", report.UNK
 # A stale report is an amber flash with the clock, no report a red one with the alert,
 # each said once above the subsystems. Each subsystem is a box: its name and state in
 # the head, its checks a table beneath.
-PAGE = """
+PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import flash, refused %}
 {%- set heading %}Health{% endset %}
 {%- set lede %}
 {%- if health.condition != 'unreadable' -%}
@@ -56,7 +57,7 @@ The whole reads <span class="badge {{ voice[health.state] }}">{{ health.state }}
 {%- else %} The health timer's period could not be read from the machine.{% endif %}
 A report older than {{ health.bound }} is stale.
 {%- else %}.{% endif %}
-{%- endif %}{% endset %}
+{%- endif %}{% endset %}{% block body %}
 {%- if health.condition == 'unreadable' %}
 {%- set unread %}No health report could be read: {{ health.why }}. Nothing on this screen
 says the machine is well.{% endset %}
@@ -91,8 +92,7 @@ one, run <code>maildivvy-health</code> on the machine as its own user. A check i
 <code>PASS</code>, <code>WARN</code>, <code>UNKNOWN</code> or <code>FAIL</code>, and a
 subsystem takes its worst check. <code>UNKNOWN</code> means a reading could not be taken;
 it is never a <code>PASS</code>.</p>
-</div>
-"""
+</div>{% endblock %}"""
 
 
 def age_words(age):
@@ -165,8 +165,7 @@ def reading(report_path=REPORT, conf_path=settings.CONF, timer_path=HEALTH_TIMER
     return {**said,
             "condition": "stale" if stale else "current",
             "state": whole.state,
-            "taken": whole.taken_at.astimezone(datetime.timezone.utc)
-                     .strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "taken": moment(whole.taken_at),
             "age": "dated in the future" if future else age_words(age),
             "why": why,
             "subsystems": shown,
@@ -234,6 +233,6 @@ def status():
 def register(app_):
     @app_.get("/health")
     def health():
-        return app.render("Health", PAGE, section="health", health=configured(),
+        return app.render("Health", "health.PAGE", section="health", health=configured(),
                           path=current_app.config.get("MAILDIVVY_HEALTH_REPORT", REPORT),
                           voice=VOICES)

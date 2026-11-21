@@ -33,12 +33,11 @@
     - name: Refuse a machine from before 0.1.0, or one that cannot tell
       when: maildivvy_installed_version.content is not defined
       block:
-        - name: Read whether this machine has our schema, for a run from a control machine with no version
-          ansible.builtin.command:
-            argv: [runuser, -u, postgres, --, psql, -X, -At, -d, maildivvy, -c, SELECT count(*) FROM schema_version]
+        # The same reading as maildivvy-install's (installer.upgrade.schema_versions and
+        # used): answers asked as data, never an error's words, which another locale translates.
+        - name: Read whether this machine has our schema and whether anyone used it, for a run from a control machine with no version
+          maildivvy_installed:
           register: maildivvy_schema_read
-          changed_when: false
-          failed_when: false
 
         - name: Read whether a first install is unfinished, for a run from a control machine with no version
           ansible.builtin.stat:
@@ -48,8 +47,7 @@
         - name: A run from a control machine never takes over a machine from before 0.1.0
           ansible.builtin.assert:
             that: >-
-              not (maildivvy_schema_read.rc | default(1) == 0
-                   and (maildivvy_schema_read.stdout | default('0') | int) > 0
+              not (maildivvy_schema_read.versions | length > 0
                    and not maildivvy_unfinished.stat.exists)
             fail_msg: >-
               this machine runs Maildivvy from before 0.1.0 (our schema, no /etc/maildivvy/version):
@@ -65,13 +63,51 @@
           ansible.builtin.assert:
             that: >-
               maildivvy_unfinished.stat.exists
-              or maildivvy_schema_read.rc | default(1) in [0, 127]
-              or 'does not exist' in maildivvy_schema_read.stderr | default('')
+              or maildivvy_schema_read.error is none
             fail_msg: >-
               cannot tell whether this machine runs Maildivvy from before 0.1.0 (no /etc/maildivvy/version):
-              its database did not answer (exit {{ maildivvy_schema_read.rc | default('none') }}:
-              {{ maildivvy_schema_read.stderr | default(maildivvy_schema_read.msg | default('')) | trim }});
-              start PostgreSQL and run again
+              its database did not answer ({{ maildivvy_schema_read.error }}); start PostgreSQL and run again
+            quiet: true
+
+        # an unfinished install another release began, used before it finished (an
+        # account, a domain or an external mailbox, which only the interface makes), is that
+        # release installed: maildivvy-install upgrades it from there, with a backup and its
+        # version rule (installer.upgrade.installed, the same reading).
+        # A control machine's run would apply this tree's migrations with neither.
+        - name: Read the release an unfinished install began, for a run from a control machine with no version
+          ansible.builtin.slurp:
+            src: /etc/maildivvy/installing
+          register: maildivvy_unfinished_record
+          when: maildivvy_unfinished.stat.exists
+
+        - name: Tell whether an unfinished install another release began is there, for a run from a control machine
+          ansible.builtin.set_fact:
+            maildivvy_unfinished_other: >-
+              {{ maildivvy_unfinished_record.content is defined
+                 and (maildivvy_unfinished_record.content | b64decode | trim) != maildivvy_release_version }}
+
+        - name: A run from a control machine never takes over a used, unfinished install another release began
+          ansible.builtin.assert:
+            that: >-
+              not (maildivvy_unfinished_other | bool and maildivvy_schema_read.used)
+            fail_msg: >-
+              this machine holds an unfinished installation of
+              {{ maildivvy_unfinished_record.content | default('') | b64decode | trim }}, used before it
+              finished (an account, a domain or an external mailbox exists), and this tree is
+              {{ maildivvy_release_version }}: finish it with the release that began it, or upgrade it with
+              maildivvy-install from the unpacked release, which takes a backup first
+            quiet: true
+
+        # Fails closed, as installer.upgrade.used does.
+        - name: A run from a control machine refuses an unfinished install another release began whose database does not answer
+          ansible.builtin.assert:
+            that: >-
+              not maildivvy_unfinished_other | bool
+              or maildivvy_schema_read.error is none
+            fail_msg: >-
+              cannot tell whether the unfinished installation of
+              {{ maildivvy_unfinished_record.content | default('') | b64decode | trim }} was used: its database
+              did not answer ({{ maildivvy_schema_read.error }}); start PostgreSQL and run again
             quiet: true
 
 - name: Check every setting and identify the data disks
@@ -195,13 +231,13 @@
 # Without it, one that stopped past step 6 leaves our schema and no version file, which
 # maildivvy-install takes for a machine from before 0.1.0 and would upgrade. Only where
 # the installer would find nothing (installer.upgrade.schema_versions, read above): no psql,
-# no postgres account, no database or no table - never on a machine with our schema, nor
-# one whose PostgreSQL does not answer.
+# no postgres account, no database, no table or no migration recorded - never on a machine
+# with our schema, nor one whose PostgreSQL does not answer.
 - name: Tell whether this is a first install from a control machine
   ansible.builtin.set_fact:
     maildivvy_control_first_install: >-
-      {{ maildivvy_schema_read.rc is defined and (maildivvy_schema_read.rc == 127
-         or 'does not exist' in maildivvy_schema_read.stderr | default('')) }}
+      {{ maildivvy_schema_read.versions is defined and maildivvy_schema_read.error is none
+         and maildivvy_schema_read.versions | length == 0 }}
 
 - name: /etc/maildivvy exists, for the unfinished record
   ansible.builtin.file:

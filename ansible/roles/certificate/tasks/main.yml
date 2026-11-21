@@ -63,6 +63,36 @@
     group: root
     mode: "0755"
 
+# not a directory any trust store reads, so no rehash makes the certificate a root
+- name: The certificate's directory is 0755 root:root
+  ansible.builtin.file:
+    path: "{{ maildivvy_published_cert | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Read the certificate an earlier version served from the CA directory
+  ansible.builtin.stat:
+    path: "{{ maildivvy_retired_cert }}"
+    get_checksum: false
+  register: maildivvy_retired
+
+# The same bytes at the new path, so nothing below finds the pair changed: no reissue, no
+# new self-signed key, no reload while the consumers still name the old path. The old
+# file and its hash links go once every consumer names the new one, after the last step
+# (site.yml's post_tasks).
+- name: Carry an earlier version's certificate over to its new path
+  when: maildivvy_retired.stat.exists
+  ansible.builtin.copy:
+    src: "{{ maildivvy_retired_cert }}"
+    dest: "{{ maildivvy_published_cert }}"
+    remote_src: true
+    force: false
+    owner: root
+    group: root
+    mode: "0644"
+
 - name: Write the certificate configuration; no secret, readable by health (mode, name, paths)
   ansible.builtin.template:
     src: certificate.json.j2

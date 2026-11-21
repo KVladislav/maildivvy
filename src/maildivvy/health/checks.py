@@ -40,10 +40,11 @@ def wants_of(names):
     return found
 
 
-def run(names=None, conf=None, now=None):
-    """A report of the subsystems named, or of all fifteen, in their order."""
+def run(names=None, conf=None, now=None, keep=False):
+    """A report of the subsystems named, or of all fifteen, in their order.
+    `keep`: the run whose report is kept, which keeps what its checks carry forward."""
     names = list(SUBSYSTEMS) if names is None else [n for n in SUBSYSTEMS if n in names]
-    ctx = Context(conf=conf, now=now, wants=wants_of(names))
+    ctx = Context(conf=conf, now=now, wants=wants_of(names), given=data.given(names), keep=keep)
     try:
         subsystems = []
         for name in names:

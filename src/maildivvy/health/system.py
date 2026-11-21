@@ -11,12 +11,13 @@ import ipaddress
 import json
 import os
 import re
+from pathlib import Path
 
 from maildivvy.health import probe, services
 from maildivvy.health.context import check, passed
 from maildivvy.health.probe import Unreadable
 from maildivvy.health.report import FAIL, PASS, UNKNOWN, WARN, Check
-from maildivvy.health.settings import DISKS, PUBLICATION
+from maildivvy.health.settings import DISKS, PUBLICATION, disk_bounds
 from maildivvy.lib import store
 
 GIB = 1024 ** 3
@@ -97,21 +98,34 @@ def judge_shared(label, path, holding):
     return passed(name, reading)
 
 
+def free_percent(stat, blocks=0, inodes=0):
+    """(the share of a filesystem's space free, of its inodes free), in percent, by its
+    `statvfs`, less `blocks` and `inodes` taken besides; inodes 100 on a filesystem that
+    counts none. The snapshot's reserve (`fetch/snapshot.py`) counts by it as health does."""
+    return (100.0 * (stat.f_bavail - blocks) / stat.f_blocks,
+            100.0 * (stat.f_favail - inodes) / stat.f_files if stat.f_files else 100.0)
+
+
+# What a full filesystem stops, by what it holds.
+FULL = {"store": "a full store refuses every message",
+        "system": "a full root filesystem stops PostgreSQL, and with it every login, the "
+                  "fan-out and the interface",
+        "backups": "a full backup filesystem fails the night's backup"}
+
+
 def judge_free(label, path, stat, conf, mode="separate"):
     name = f"{label} free space"
     if stat.f_blocks == 0:
         raise Unreadable(f"statvfs {path} reported a filesystem of no size")
-    free = 100.0 * stat.f_bavail / stat.f_blocks
-    inodes = 100.0 * stat.f_favail / stat.f_files if stat.f_files else 100.0
+    free, inodes = free_percent(stat)
     lowest = min(free, inodes)
     reading = (f"{free:.1f}% free of {stat.f_blocks * stat.f_frsize / GIB:.1f} GiB, "
                f"{inodes:.1f}% of inodes free")
     # one disk: mail and the system fill the same filesystem, so the bounds are higher
-    fail, warn = ((conf.single_disk_fail_percent, conf.single_disk_warn_percent) if mode == "single"
-                  else (conf.disk_fail_percent, conf.disk_warn_percent))
+    fail, warn = disk_bounds(conf, mode)
     if lowest < fail:
         return Check(name, FAIL, reading, f"{path} has less than {fail}% free: "
-                                          "a full store refuses every message")
+                                          f"{FULL.get(label, FULL['store'])}")
     if lowest < warn:
         return Check(name, WARN, reading, f"{path} has less than {warn}% free")
     return passed(name, reading)
@@ -177,6 +191,30 @@ def free_check(label, path):
     return read
 
 
+def device_of(path):
+    try:
+        return os.stat(path).st_dev
+    except OSError as err:
+        raise Unreadable(f"stat {path}: {err.strerror}") from None
+
+
+def shared_free_check(label, path, read_at):
+    """`free_check` for a filesystem that may be one already read: with one disk
+    the root filesystem is the store's, and the backups are the root's unless the
+    operator mounted another there. Then it is read once, where `read_at` names it first."""
+    own = free_check(label, path)
+
+    @check(f"{label} free space")
+    def read(ctx):
+        device = device_of(path)
+        for other_label, other in read_at:
+            if device_of(other) == device:
+                return passed(f"{label} free space",
+                              f"{path} is on the filesystem of {other}: read as {other_label} free space")
+        return own(ctx)
+    return read
+
+
 def read_meminfo():
     try:
         with open("/proc/meminfo") as handle:
@@ -195,8 +233,15 @@ def swap(ctx):
     return judge_swap(read_meminfo())
 
 
+# The root filesystem holds PostgreSQL's data, the journal and the container images, and
+# by default the kept backups.
+ROOT = Path("/")
+BACKUPS = Path("/var/backups/maildivvy")   # backup/run.py's BACKUPS
 HOST = [mount_check("store", store.STORE_ROOT), mount_check("index", store.INDEX_ROOT),
         free_check("store", store.STORE_ROOT), free_check("index", store.INDEX_ROOT),
+        shared_free_check("system", ROOT, [("store", store.STORE_ROOT), ("index", store.INDEX_ROOT)]),
+        shared_free_check("backups", BACKUPS, [("store", store.STORE_ROOT), ("index", store.INDEX_ROOT),
+                                               ("system", ROOT)]),
         memory, swap]
 
 

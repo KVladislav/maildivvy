@@ -1,0 +1,3 @@
+# Install step 7. The package's queue directory, which `submissions` is chrooted to:
+# step 8's SASL listener, step 9's passfile and step 14's milter socket are inside it.
+maildivvy_postfix_queue: /var/spool/postfix

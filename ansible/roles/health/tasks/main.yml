@@ -1,7 +1,8 @@
 # Install step 17: health.
 #
 # What the step leaves: `maildivvy-health` and its timer, keeping the JSON report current
-# every five minutes, and with `maildivvy_health_textfile_dir` set, node_exporter's
+# every five minutes; the ledger's daily pass and its timer, whose result every run
+# reports; and with `maildivvy_health_textfile_dir` set, node_exporter's
 # `maildivvy.prom` beside it; the two helpers' sockets, through which the store (as vmail) and
 # what only root can read (as root) are handed to it. The product pushes nothing:
 # the operator's monitoring reads the report, or runs the command per subsystem.
@@ -53,33 +54,64 @@
     owner: root
     group: root
     mode: "0644"
-  loop:
-    - "{{ maildivvy_health_unit }}"
-    - "{{ maildivvy_health_timer }}"
-    - maildivvy-health-store.socket
-    - maildivvy-health-store@.service
-    - maildivvy-health-system.socket
-    - maildivvy-health-system@.service
+  loop: "{{ [maildivvy_health_unit, maildivvy_health_timer, maildivvy_health_ledger_unit,
+    maildivvy_health_ledger_timer] + maildivvy_health_sockets
+    + ['maildivvy-health-store@.service', 'maildivvy-health-system@.service'] }}"
   register: maildivvy_health_units_written
+
+# A run stopped between the units and the reload leaves them written and not loaded;
+# systemd says so, and the next run reloads. `systemctl show` refuses a template's name,
+# so the helpers' two services are not asked: one rewritten alone waits for the next reload.
+- name: Read whether systemd has loaded each unit as written
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, NeedDaemonReload, --value, "{{ item }}"]
+  loop: "{{ [maildivvy_health_unit, maildivvy_health_timer, maildivvy_health_ledger_unit,
+    maildivvy_health_ledger_timer] + maildivvy_health_sockets }}"
+  register: maildivvy_health_units_stale
+  changed_when: false
 
 - name: Tell systemd the units changed
   ansible.builtin.systemd_service:
     daemon_reload: true
-  when: maildivvy_health_units_written is changed
+  when: maildivvy_health_units_written is changed or maildivvy_health_unloaded | length > 0
+  vars:
+    maildivvy_health_unloaded: "{{ maildivvy_health_units_stale.results | selectattr('stdout', 'eq', 'yes')
+      | map(attribute='item') | list }}"
 
-# a socket whose unit changed is restarted, so it listens as the file now says
+# A socket listens as its unit said when it started. Not "this run wrote it": a run
+# stopped before the restart wrote it too (ansible/library/maildivvy_stale.py).
+- name: Is a helper's socket unit newer than its listening socket?
+  maildivvy_stale:
+    unit: "{{ item }}"
+    paths: ["/etc/systemd/system/{{ item }}"]
+  loop: "{{ maildivvy_health_sockets }}"
+  register: maildivvy_health_sockets_stale
+
 - name: The helpers' sockets listen, and come back at boot
+  ansible.builtin.systemd_service:
+    name: "{{ item.item }}"
+    enabled: true
+    state: "{{ 'restarted' if item.stale or item.item in maildivvy_health_unloaded else 'started' }}"
+  loop: "{{ maildivvy_health_sockets_stale.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  vars:
+    maildivvy_health_unloaded: "{{ maildivvy_health_units_stale.results | selectattr('stdout', 'eq', 'yes')
+      | map(attribute='item') | list }}"
+
+- name: The timers run and start at boot; each service is started by its timer alone
   ansible.builtin.systemd_service:
     name: "{{ item }}"
     enabled: true
-    state: "{{ 'restarted' if maildivvy_health_units_written is changed else 'started' }}"
-  loop: [maildivvy-health-store.socket, maildivvy-health-system.socket]
-
-- name: The timer runs and starts at boot; the service is started by it alone
-  ansible.builtin.systemd_service:
-    name: "{{ maildivvy_health_timer }}"
-    enabled: true
     state: started
+  loop: ["{{ maildivvy_health_timer }}", "{{ maildivvy_health_ledger_timer }}"]
+
+# The daily pass once now, so the run below and every one until the night reports a
+# result of its own rather than none. A year's volume takes minutes.
+- name: Take the ledger's daily pass, through its unit
+  ansible.builtin.command:
+    argv: [systemctl, start, "{{ maildivvy_health_ledger_unit }}"]
+  changed_when: false
 
 # `systemctl start` on a oneshot returns when the run has ended. The unit succeeds for
 # every report state; it fails only when the program could not run at all.
@@ -127,7 +159,7 @@
   ansible.builtin.command:
     argv: [python3, -c, "{{ maildivvy_health_proof }}", "{{ maildivvy_health_report }}",
            "{{ maildivvy_health_later_steps | join(',') }}",
-           "{{ maildivvy_health_no_data_yet | join(',') }}",
+           "{{ maildivvy_health_no_data_yet | to_json }}",
            "{{ maildivvy_health_not_stopping | join(',') }}"]
   register: maildivvy_health_proved
   changed_when: false

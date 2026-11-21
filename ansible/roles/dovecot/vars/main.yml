@@ -19,16 +19,21 @@ maildivvy_dovecot_stock: /etc/dovecot/conf.d.stock
 
 # The database: the unix socket, as the daemon's own role, its password only
 # in a passfile 0600 owned by the user the SQL auth worker runs as.
-maildivvy_dovecot_db_name: maildivvy
 maildivvy_dovecot_db_role: maildivvy_dovecot
 maildivvy_dovecot_db_socket: /var/run/postgresql
 maildivvy_dovecot_passfile: /etc/dovecot/maildivvy.pgpass
 maildivvy_dovecot_auth_user: dovecot
 
-maildivvy_dovecot_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
-maildivvy_dovecot_key: /etc/ssl/private/{{ maildivvy_cert_name }}.key
-maildivvy_dovecot_postfix_auth: /var/spool/postfix/private/auth
-maildivvy_dovecot_pipe_bin_dir: /opt/maildivvy/bin
+# Every IMAP process runs as vmail, the pipeline's reader too. The unit hides the
+# pipeline's configuration from Dovecot's mount namespace, which every imap process and
+# the Sent hook's children inherit; the hook reads its own directory only. A cost
+# on reading the pipeline's passfile, not a boundary: the uid is the same.
+maildivvy_dovecot_dropin: /etc/systemd/system/dovecot.service.d/maildivvy.conf
+maildivvy_dovecot_hidden: /etc/maildivvy/pipeline
+maildivvy_dovecot_hook_passfile: /etc/maildivvy/senthook/pgpass
+
+maildivvy_dovecot_postfix_auth: "{{ maildivvy_postfix_queue }}/private/auth"
+maildivvy_dovecot_pipe_bin_dir: "{{ maildivvy_opt }}/bin"
 
 # The Sent hook: its script and the compiled binary Dovecot loads,
 # installed in this step because this step binds them. The program itself

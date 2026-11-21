@@ -1,7 +1,7 @@
 # Install step 19: publication.
 #
-# The two published ports. Step 3 keeps exactly the rules this step writes for them
-# (ansible/roles/firewall, `maildivvy_mail_ports` there); a unit test holds the two equal.
+# The two published ports. Step 3 never opens them, and on a re-run it keeps exactly the
+# rules this step wrote for them, reading this same list.
 maildivvy_publish_ports: [993, 465]
 
 # The per-source connection budgets: IMAP's is higher, because a client
@@ -22,4 +22,3 @@ maildivvy_publish_before_rules:
 # added to it by maildivvy-publication. Health reads it (health/settings.py).
 maildivvy_publish_record: /var/lib/maildivvy/publication.json
 maildivvy_publish_program: /usr/local/sbin/maildivvy-publication
-maildivvy_publish_health: /opt/maildivvy/bin/maildivvy-health

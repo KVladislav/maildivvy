@@ -69,10 +69,14 @@ def test_the_acts_are_a_closed_declared_list_the_interface_the_pipeline_and_the_
         assert source_name not in journal.DECLARED, source_name
 
 
+
 def test_the_pipelines_act_names_are_the_request_kinds_the_schema_declares():
-    kinds = re.search(r"kind\s+text NOT NULL CHECK \(kind IN \((.*?)\)\)",
-                      SCHEMA.read_text(), re.S).group(1)
-    assert set(re.findall(r"'([a-z_]+)'", kinds)) == set(journal.PIPELINE_ACTS)
+    kinds = None
+    for path in sorted(SCHEMA.parent.glob("[0-9][0-9][0-9][0-9]_*.sql")):  # the newest list
+        for listed in re.findall(r"CHECK \(kind IN \((.*?)\)\)", path.read_text(), re.S):
+            kinds = set(re.findall(r"'([a-z_]+)'", listed))
+    assert "discard_snapshot" in kinds  # the control: the newest list, 0008's
+    assert kinds == set(journal.PIPELINE_ACTS)
 
 
 @pytest.mark.parametrize("module,writer,index,declared", [
@@ -119,7 +123,7 @@ def test_every_act_the_interface_writes_by_name_is_declared():
 WRITERS = (
     ("record", 1, sorted((PACKAGE / "screens").glob("*.py"))),         # screens: record(conn, act)
     ("journal", 2, [ROOT / "src" / "maildivvy" / "fanout" / "requests.py"]),
-    ("audit", 1, [ROOT / "src" / "maildivvy" / "fetch" / "runner.py"]),
+    ("audit", 1, [ROOT / "src" / "maildivvy" / "fetch" / f for f in ("runner.py", "imap_collect.py")]),
 )
 
 
@@ -226,6 +230,40 @@ def test_what_is_written_is_what_the_filter_returned():
     assert json.loads(params[3]) == {"credential_set": True, "typed": journal.WITHHELD}
 
 
+# --- a login under the field that carries one is written as itself (0051) -----------------
+
+LOGIN_FIELDS = [("transfer", "to_login"), ("create_mailbox", "login"),
+                ("set_pop3_login", "before"), ("set_pop3_login", "after"),
+                ("set_smtp_login", "before"), ("set_smtp_login", "after")]
+
+
+def written(action, detail):
+    conn = FakeConnection()
+    journal.record(conn, actor="admin", action=action, target="t", detail=detail)
+    (_, params), = conn.calls
+    return json.loads(params[3])
+
+
+@pytest.mark.parametrize("action,key", LOGIN_FIELDS)
+@pytest.mark.parametrize("login", ["ivan_petrov_01", "office_sales2024"])
+def test_a_login_with_three_character_classes_is_written_as_itself(action, key, login):
+    assert written(action, {key: login}) == {key: login}
+
+
+@pytest.mark.parametrize("action,key", LOGIN_FIELDS)
+@pytest.mark.parametrize("password", ["Kq7mX2pL9wZ4b", "ivan_petr0v!1"])
+def test_a_password_under_a_login_field_is_still_withheld(action, key, password):
+    """The control: the field lets through what a login can be, and nothing else, so a
+    password typed into the login field is withheld."""
+    assert written(action, {key: password}) == {key: journal.WITHHELD}
+
+
+def test_the_same_login_under_any_other_field_or_act_is_judged_by_its_shape():
+    assert written("transfer", {"note": "ivan_petrov_01"}) == {"note": journal.WITHHELD}
+    assert written("set_spam_policy", {"after": "ivan_petrov_01"}) == \
+        {"after": journal.WITHHELD}
+
+
 # --- the host rule the filter borrows ----------------------
 
 @pytest.mark.parametrize("value", ["pop.example.org", "a.b", "192.0.2.1", "2001:db8::1",
@@ -290,9 +328,10 @@ def test_the_range_takes_the_whole_of_its_last_day():
 def test_a_date_that_is_not_a_date_is_refused_with_a_sentence_never_ignored():
     assert journal.date_filter("") is None
     assert journal.date_filter("2026-09-30") == date(2026, 9, 30)
-    with pytest.raises(validate.Refused) as raised:
-        journal.date_filter("30.09.2026")
-    assert "YYYY-MM-DD" in str(raised.value)
+    for typed in ("30.09.2026", "2026-W40", "2026-W40-2", "20260930", "2026-09-30T00:00"):
+        with pytest.raises(validate.Refused) as raised:
+            journal.date_filter(typed)
+        assert "YYYY-MM-DD" in str(raised.value), typed
 
 
 def test_the_outcome_of_the_request_that_was_asked_for_is_joined_to_the_row():

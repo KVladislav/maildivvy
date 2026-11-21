@@ -9,6 +9,8 @@ neither scanned nor given a header block, and the inbound hold.
 The same filter runs against the real scanners and the real agent on the test VM.
 """
 
+import email
+import email.policy
 import io
 import json
 import os
@@ -73,14 +75,21 @@ def filter_run(tmp_path, monkeypatch):
     monkeypatch.setenv("MAILDIVVY_TEST_AGENT_RECORD", str(record))
 
     def run(*argv, raw=PLAIN, virus=None, score=None, agent_exit=0, folder_error=None,
-            quarantine=()):
-        """`quarantine`: the withheld ids the archive's quarantine already holds."""
+            quarantine=(), store_down=None, scanning=None):
+        """`quarantine`: the withheld ids the archive's quarantine already holds;
+        `store_down`: what the probe finds wrong with the store, None for nothing;
+        `scanning`: called with each body the antivirus is handed, to raise."""
         virus = virus if virus is not None else scan.Verdict(scan.CLEAN, "stream: OK")
         score = score if score is not None else scan.Score(0.5, "no action")
         scanned, folders = [], []
         monkeypatch.setenv("MAILDIVVY_TEST_AGENT_EXIT", str(agent_exit))
-        monkeypatch.setattr(deliver.scan, "scan_virus",
-                            lambda body, **kw: scanned.append(("virus", body)) or virus)
+        def scan_virus(body, **kw):
+            scanned.append(("virus", body))
+            if scanning is not None:
+                scanning(body)
+            return virus
+
+        monkeypatch.setattr(deliver.scan, "scan_virus", scan_virus)
         monkeypatch.setattr(deliver.scan, "scan_spam",
                             lambda body, **kw: scanned.append(("spam", body)) or score)
         def create_folder(login, folder):
@@ -97,12 +106,17 @@ def filter_run(tmp_path, monkeypatch):
                     for uid, held in enumerate(quarantine, 1)]
 
         monkeypatch.setattr(deliver.doveadm, "fetch", fetch)
+        probed = []
+        monkeypatch.setattr(deliver, "store_failure",
+                            lambda domain, folder, size: probed.append(folder) or store_down)
         monkeypatch.setattr(deliver.sys, "stdin", io.TextIOWrapper(io.BytesIO(raw)))
         code = deliver.main(["--domain", DOMAIN, "--lda", str(agent), *argv])
         calls = json.loads(record.read_text()) if record.exists() else []
         if record.exists():
             os.remove(record)
-        return Run(code, calls, scanned, folders)
+        result = Run(code, calls, scanned, folders)
+        result.probed = probed
+        return result
 
     return run
 
@@ -150,6 +164,7 @@ def test_the_agents_own_temporary_failure_is_never_the_antivirus_hold(filter_run
     run = filter_run(virus=scan.Verdict(verdict, "detail"), agent_exit=75)
     assert run.code == deliver.EX_IOERR == 74
     assert len(run.calls) == 1  # it stopped at the first refusal
+    assert run.probed  # and the store was asked about first, and could take mail
 
 
 def test_the_agent_is_told_to_answer_a_rejection_with_an_exit_code(filter_run):
@@ -256,6 +271,20 @@ def test_the_report_says_what_the_verdict_was_and_nothing_else(filter_run):
     assert "found malware in it" in infected and "malware" not in unscanned
 
 
+def test_a_message_the_scanner_failed_on_is_withheld_with_no_hold_and_its_own_report(filter_run):
+    """The daemon failed on this message and still answers PING: *unscanned*, withheld in
+    the quarantine with a report that says the scanner failed, and exit 0 - never the
+    hold's 75, which would keep the mailbox and read as an outage."""
+    run = filter_run(virus=scan.Verdict(
+        scan.UNSCANNED, "clamd: Error writing to temporary file ERROR; the daemon answers "
+        "PING, so it failed on this message", failed=True))
+    assert run.code == 0
+    assert run.folders == [(ARCHIVE, store.QUARANTINE)]
+    assert header(run.bodies[0], marks.SCAN_HEADER) == scan.UNSCANNED
+    assert header(run.bodies[1], report.REASON_HEADER) == scan.UNSCANNED
+    assert "scanner failed on it" in run.bodies[1] and "too large" not in run.bodies[1]
+
+
 def test_a_message_that_is_both_infected_and_spam_keeps_its_mark_in_quarantine(filter_run):
     run = filter_run("--spam-threshold", "1.00", score=scan.Score(9.0, "reject"),
                      virus=scan.Verdict(scan.INFECTED, "stream: Eicar FOUND"))
@@ -293,6 +322,20 @@ def test_every_message_filed_with_our_block_carries_our_own_report_fields(filter
         assert withheld not in (report.NONE, "a" * 32) and len(withheld) == 32
 
 
+def test_input_that_starts_with_a_folded_line_does_not_continue_our_block(filter_run):
+    """mpop writes its own `Received:` first, so this does not arrive from a fetch; the
+    block must not depend on that. A first line that begins with whitespace is a
+    continuation, and it must continue no header the product reads."""
+    folded = f" {report.REASON_HEADER}: infected\r\n".encode() + PLAIN
+    run = filter_run(raw=folded)
+    stored = run.bodies[0]
+    assert stored.encode().endswith(folded), "the sender's bytes are kept as they came"
+    message = email.message_from_string(stored, policy=email.policy.default)
+    for name in (report.REASON_HEADER, report.WITHHELD_HEADER):
+        assert message[name] == report.NONE, name
+    assert message[marks.SCAN_HEADER] == scan.CLEAN
+
+
 def test_a_retried_withheld_message_is_not_stored_in_the_quarantine_twice(filter_run):
     """The report is saved after the quarantine copy; when its
     save fails the message stays at the provider, and every retry stored another copy
@@ -326,6 +369,117 @@ def test_the_withheld_id_is_the_same_on_every_retrieval_of_one_message():
 def test_a_refused_report_comes_back_as_the_agents_exit_code(filter_run):
     run = filter_run(virus=scan.Verdict(scan.INFECTED, "found"), agent_exit=77)
     assert run.code == 77 and len(run.calls) == 1  # it stopped at the message
+
+
+# --- the store, or this message -----------------------------------------------------
+
+
+@pytest.mark.parametrize("agent_exit", [75, 77, 1])
+def test_a_store_that_cannot_take_mail_is_the_stores_own_exit_whatever_the_agent_said(
+        filter_run, capsys, agent_exit):
+    run = filter_run(agent_exit=agent_exit, store_down="/srv/maildivvy/store has 0 bytes free")
+    assert run.code == deliver.EX_CANTCREAT == 73
+    assert run.probed == [None]  # INBOX, the folder this message was for
+    said = capsys.readouterr().err
+    assert f"exit {agent_exit}" in said and "0 bytes free" in said
+
+
+def test_a_delivery_that_succeeds_never_asks_the_probe(filter_run):
+    run = filter_run(store_down="never asked")
+    assert run.code == 0 and run.probed == []
+
+
+def test_the_agents_own_73_is_never_the_stores(filter_run):
+    """73 from the filter means the store and nothing else."""
+    assert filter_run(agent_exit=73).code == deliver.EX_IOERR
+
+
+@pytest.mark.parametrize("store_down, code", [(None, 74), ("Dovecot did not answer", 73)])
+def test_an_agent_that_does_not_answer_is_caught_and_asked_about(filter_run, monkeypatch,
+                                                                 store_down, code):
+    """The agent past its bound used to raise out of the filter."""
+    def hung(*args, **kwargs):
+        raise deliver.subprocess.TimeoutExpired("dovecot-lda", deliver.LDA_TIMEOUT)
+
+    monkeypatch.setattr(deliver, "run_lda", hung)
+    assert filter_run(store_down=store_down).code == code
+
+
+def test_a_quarantine_store_that_cannot_take_mail_is_asked_about_its_own_folder(filter_run):
+    run = filter_run(virus=scan.Verdict(scan.INFECTED, "found"), agent_exit=75,
+                     store_down="no room")
+    assert run.code == 73 and run.probed == [store.QUARANTINE]
+    refused = deliver.doveadm.DoveadmError("doveadm mailbox create timed out after 300 s")
+    run = filter_run(virus=scan.Verdict(scan.INFECTED, "found"), folder_error=refused,
+                     store_down="Dovecot did not answer")
+    assert run.code == 73 and run.calls == []
+
+
+class FS:
+    """An `os.statvfs` answer with room, unless the test says otherwise."""
+    f_flag, f_bavail, f_frsize, f_files, f_favail = 0, 1 << 20, 4096, 1000, 900
+
+    def __init__(self, **changed):
+        self.__dict__.update(changed)
+
+
+@pytest.fixture
+def probe_store(tmp_path, monkeypatch):
+    """The probe against a store and an index tree under `tmp_path`, Dovecot answering."""
+    root, index_root = tmp_path / "store", tmp_path / "index"
+    maildir = store.maildir(store.archive_home(DOMAIN, root))
+    (maildir / "tmp").mkdir(parents=True)
+    store.index_paths(DOMAIN, store.ARCHIVE, index_root)[0].mkdir(parents=True)
+    asked = []
+    monkeypatch.setattr(deliver.doveadm, "run",
+                        lambda verb, login, *a, **kw: asked.append((verb, login, a)) or [{}])
+
+    def probe(folder=None, size=100):
+        return deliver.store_failure(DOMAIN, folder, size, root=root, index_root=index_root)
+
+    probe.maildir, probe.asked = maildir, asked
+    return probe
+
+
+def test_a_store_with_room_that_dovecot_answers_for_is_not_the_failure(probe_store):
+    assert probe_store() is None
+    assert probe_store.asked == [(("mailbox", "status"), ARCHIVE, ("messages", "INBOX"))]
+
+
+@pytest.mark.parametrize("fs, says", [
+    (FS(f_bavail=0), "0 bytes free"),
+    (FS(f_bavail=10), "40960 bytes free"),      # room, but not for this message and a margin
+    (FS(f_favail=0), "no free inode"),
+    (FS(f_flag=os.ST_RDONLY), "mounted read-only"),
+])
+def test_a_full_or_read_only_filesystem_is_the_stores_failure(probe_store, monkeypatch, fs, says):
+    monkeypatch.setattr(deliver.os, "statvfs", lambda path: fs)
+    assert says in probe_store()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into any directory")
+def test_a_folder_the_mail_owner_may_not_write_is_the_stores_failure(probe_store):
+    tmp = probe_store.maildir / "tmp"
+    tmp.chmod(0o500)
+    try:
+        assert "not writable" in probe_store()
+    finally:
+        tmp.chmod(0o700)
+
+
+def test_dovecot_not_answering_is_the_stores_failure(probe_store, monkeypatch):
+    def silent(*args, **kwargs):
+        raise deliver.doveadm.DoveadmError("doveadm mailbox status -u a timed out after 30 s")
+
+    monkeypatch.setattr(deliver.doveadm, "run", silent)
+    assert probe_store().startswith("Dovecot did not answer: ")
+
+
+def test_a_folder_not_made_yet_is_probed_where_its_save_would_begin(probe_store, monkeypatch):
+    seen = []
+    monkeypatch.setattr(deliver.os, "statvfs", lambda path: seen.append(path) or FS())
+    assert probe_store(folder=store.QUARANTINE) is None
+    assert seen[0] == probe_store.maildir  # its own tmp/ is not there yet: the maildir is
 
 
 # --- the antivirus hold ------------------------------------------------------
@@ -488,3 +642,51 @@ def test_run_by_hand_with_no_retrieval_behind_it_the_filter_files_as_before(filt
     monkeypatch.delenv(retrieval.VARIABLE, raising=False)
     run = filter_run()
     assert run.code == 0 and len(run.calls) == 1
+
+
+# --- a fault of the filter's own -------------------------------------------------------
+
+
+def unreadable_conf(body):
+    raise ValueError("StreamMaxLength is '50 M', which is not a size clamd would read")
+
+
+def test_a_fault_that_a_message_of_the_filters_own_meets_too_holds_collection(filter_run,
+                                                                              capsys):
+    """A clamd.conf size it cannot read fails every message: exit 1 was read as this
+    message's, and after the stuck hour it was skipped in every mailbox."""
+    run = filter_run(scanning=unreadable_conf)
+    assert run.code == deliver.EX_CANTCREAT and run.calls == []
+    assert [body for _, body in run.scanned] == [PLAIN, deliver.CANNED]
+    said = capsys.readouterr().err
+    held = [line for line in said.splitlines() if line.startswith(deliver.STORE_SAID)]
+    assert len(held) == 1 and "'50 M'" in held[0] and "collection holds" in held[0]
+
+
+def test_a_delivery_agent_that_is_not_there_holds_collection(filter_run, tmp_path, capsys):
+    run = filter_run("--lda", str(tmp_path / "no-such-agent"))
+    assert run.code == deliver.EX_CANTCREAT and run.probed == [None]
+    held = [line for line in capsys.readouterr().err.splitlines()
+            if line.startswith(deliver.STORE_SAID)]
+    assert "FileNotFoundError" in held[0] and "cannot be run" in held[0]
+
+
+def test_a_fault_only_this_message_meets_is_its_own_and_the_store_is_not_blamed(filter_run,
+                                                                               capsys):
+    def this_one(body):
+        if body == PLAIN:
+            raise KeyError("something in this message")
+
+    run = filter_run(scanning=this_one)
+    assert run.code == deliver.EX_SOFTWARE and run.calls == []
+    said = capsys.readouterr().err
+    assert "KeyError" in said and deliver.STORE_SAID not in said
+
+
+def test_the_canned_message_is_never_stored_and_never_handed_to_the_agent(filter_run,
+                                                                          monkeypatch):
+    stored = []
+    monkeypatch.setattr(deliver, "run_lda", lambda *a, **kw: stored.append(a) or 1 / 0)
+    run = filter_run()
+    assert run.code == deliver.EX_SOFTWARE
+    assert len(stored) == 1 and stored[0][2] != deliver.CANNED

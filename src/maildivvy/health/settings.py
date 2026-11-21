@@ -13,6 +13,11 @@ CONF = Path("/etc/maildivvy/health.conf")
 STATE_DIR = Path("/var/lib/maildivvy/health")
 REPORT = STATE_DIR / "health.json"
 UPSTREAM = STATE_DIR / "upstream.json"
+# The ledger's five-minute window: where the last scan began and what it carried; and the
+# daily pass's last result. Health's own, and nobody else's: a carried finding
+# names an inode.
+LEDGER_WINDOW = STATE_DIR / "ledger-window.json"
+LEDGER_PASS = STATE_DIR / "ledger-pass.json"
 CERTIFICATE = Path("/etc/maildivvy/certificate.json")
 SCANNER = Path("/etc/maildivvy/scanner.json")
 # Written by the disks step (install step 2): the disk mode, and the filesystems by UUID.
@@ -63,15 +68,31 @@ class Settings:
     sent_failure_hours: int = 24
     retrieval_failure_hours: int = 24     # deliveries the filter could not check
     request_failure_hours: int = 24
+    fanout_skip_hours: int = 24           # messages the pass could not record
     # the fan-out runs every minute
     fanout_minutes: int = 10
+    # a request still queued after this long, the pass's timer running: over the longest
+    # handler's own bound (a refetch's 30 min), so one slow request ahead does not warn
+    request_queued_minutes: int = 60
     # no finished fetch run, or a collected row not fetched, for this long is FAIL; the
     # bound is at least three of the fetch timer's periods
     collection_minutes: int = 30
     # the newest dump of the database and the fetch state (48 h)
     backup_hours: int = 48
+    # the ledger's daily pass over every name: one missed run, as the backup's
+    ledger_pass_hours: int = 48
     # how old the outside probe's result may be
     publication_days: int = 30
+
+
+def disk_bounds(conf, mode):
+    """(fail, warn): the free share of a mail filesystem, in percent of its space and of its
+    inodes, below which health fails and warns, for the disk layout. One disk
+    holds mail and the system together, so its bounds are higher. The warn is also the
+    reserve a snapshot never takes the store under."""
+    if mode == "single":
+        return conf.single_disk_fail_percent, conf.single_disk_warn_percent
+    return conf.disk_fail_percent, conf.disk_warn_percent
 
 
 def read(path=CONF):

@@ -1,8 +1,10 @@
 # Install step 8: Dovecot 2.4 from the distribution, configured by conf.d files that
 # replace the stock ones by name; its database role given LOGIN and
 # a passfile; the index on its own filesystem through the view's
-# paths; one \Sent mailbox. The effective configuration is
-# read back from the daemon, never from the files. 993 stays closed by
+# paths; one \Sent mailbox. The configuration is checked
+# in a copy of the tree before it replaces the live files, and the daemon is restarted
+# whenever any of it is newer than the daemon's start, so the effective values `doveconf`
+# reads back from the files are the ones it runs. 993 stays closed by
 # the firewall until publication (step 19): the packages answer on 993 and 143 with a
 # certificate of their own until this step replaces their configuration.
 
@@ -51,44 +53,20 @@
 
 # --- the database role ---------------------------------
 
-- name: Give the daemon's role LOGIN, which step 6 withheld until its user existed
-  ansible.builtin.command:
-    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
-    stdin: |
-      DO $$
-      BEGIN
-          IF NOT (SELECT rolcanlogin FROM pg_roles WHERE rolname = '{{ maildivvy_dovecot_db_role }}') THEN
-              ALTER ROLE {{ maildivvy_dovecot_db_role }} LOGIN;
-              RAISE NOTICE 'granted login';
-          END IF;
-      END
-      $$;
-  register: maildivvy_dovecot_login
-  changed_when: "'granted login' in maildivvy_dovecot_login.stderr"
-
-# Before the configuration that names it; the password never leaves the machine
-- name: Give the role its password in a passfile owned by the SQL auth worker's user
-  ansible.builtin.command:
-    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ maildivvy_dovecot_db_role }}", "{{ maildivvy_dovecot_passfile }}",
-           "{{ maildivvy_dovecot_auth_user }}", --db, "{{ maildivvy_dovecot_db_name }}"]
-  register: maildivvy_dovecot_password
-  changed_when: (maildivvy_dovecot_password.stdout | from_json).changed
-
-- name: Read the passfile back by owner, mode and shape, never printing it
-  ansible.builtin.command:
-    argv: [sh, -c, 'stat -c "%U %a" "$1" && awk -F: "END { print NR, NF }" "$1" && cut -d: -f1-4 "$1"', -,
-           "{{ maildivvy_dovecot_passfile }}"]
-  register: maildivvy_dovecot_passfile_read
-  changed_when: false
-  failed_when: >-
-    maildivvy_dovecot_passfile_read.rc != 0 or maildivvy_dovecot_passfile_read.stdout_lines !=
-    [maildivvy_dovecot_auth_user ~ ' 600', '1 5',
-     'localhost:5432:' ~ maildivvy_dovecot_db_name ~ ':' ~ maildivvy_dovecot_db_role]
+# Before the configuration that names it: LOGIN, the passfile owned by the
+# SQL auth worker's user, read back
+- name: Give the daemon's role LOGIN and its passfile
+  ansible.builtin.import_tasks: ../../postgresql/tasks/daemon_role.yml
+  vars:
+    maildivvy_daemon_db_role: "{{ maildivvy_dovecot_db_role }}"
+    maildivvy_daemon_passfile: "{{ maildivvy_dovecot_passfile }}"
+    maildivvy_daemon_reader: "{{ maildivvy_dovecot_auth_user }}"
+    maildivvy_daemon_db_host: localhost
 
 - name: The role logs in as itself with that passfile, as the auth worker's user
   ansible.builtin.command:
     argv: [runuser, -u, "{{ maildivvy_dovecot_auth_user }}", --, env, "PGPASSFILE={{ maildivvy_dovecot_passfile }}",
-           psql, -X, -w, -At, -U, "{{ maildivvy_dovecot_db_role }}", -d, "{{ maildivvy_dovecot_db_name }}", -c,
+           psql, -X, -w, -At, -U, "{{ maildivvy_dovecot_db_role }}", -d, "{{ maildivvy_db_name }}", -c,
            "SELECT count(*) FROM mailbox_opens"]
   changed_when: false
 
@@ -140,32 +118,138 @@
     mode: "0644"
   register: maildivvy_dovecot_sieve_written
 
-- name: Write the configuration
-  ansible.builtin.template:
-    src: "{{ item }}.j2"
-    dest: /etc/dovecot/conf.d/{{ item }}
+# Rendered into a copy of /etc/dovecot and parsed there first: a file that does not parse
+# never reaches the live tree, where the daemon's next start would read it. The copy's
+# dovecot.conf includes conf.d relative to itself, so the check reads the new files with
+# everything else as it is.
+- name: Check the configuration in a copy of the tree before it replaces the live files
+  block:
+    - name: Make a scratch directory for the copy
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: .dovecot
+      register: maildivvy_dovecot_staging
+      changed_when: false
+
+    - name: Copy the live tree into it
+      ansible.builtin.command:
+        argv: [cp, -a, /etc/dovecot/., "{{ maildivvy_dovecot_staging.path }}"]
+      changed_when: false
+
+    - name: Write the configuration into the copy
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "{{ maildivvy_dovecot_staging.path }}/conf.d/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ maildivvy_dovecot_conf }}"
+      changed_when: false
+
+    # A dovecot.conf naming /etc/dovecot/conf.d by its absolute path would have the check
+    # read the live files, and the new ones would go unchecked
+    - name: The copy's dovecot.conf includes conf.d relative to itself
+      ansible.builtin.command:
+        argv: [grep, -Eq, '^!include +conf\.d/', "{{ maildivvy_dovecot_staging.path }}/dovecot.conf"]
+      changed_when: false
+
+    - name: The whole configuration parses, read from the copy
+      ansible.builtin.command:
+        argv: [doveconf, -c, "{{ maildivvy_dovecot_staging.path }}/dovecot.conf", -n]
+      changed_when: false
+
+    - name: Replace the live files with the ones checked
+      ansible.builtin.copy:
+        src: "{{ maildivvy_dovecot_staging.path }}/conf.d/{{ item }}"
+        dest: /etc/dovecot/conf.d/{{ item }}
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ maildivvy_dovecot_conf }}"
+  always:
+    - name: Remove the copy
+      ansible.builtin.file:
+        path: "{{ maildivvy_dovecot_staging.path }}"
+        state: absent
+      when: maildivvy_dovecot_staging.path is defined
+      changed_when: false
+
+# No Dovecot process sees the pipeline's configuration. A missing directory
+# fails the unit's start rather than hiding nothing: the programs role made it before.
+- name: Make the directory for Dovecot's unit drop-in
+  ansible.builtin.file:
+    path: "{{ maildivvy_dovecot_dropin | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Hide the pipeline's configuration from every Dovecot process
+  ansible.builtin.copy:
+    content: |
+      # Maildivvy, install step 8. Every IMAP process runs as vmail, the pipeline's reader
+      # too; this hides the pipeline's passfile from them and from the Sent hook.
+      [Service]
+      InaccessiblePaths={{ maildivvy_dovecot_hidden }}
+    dest: "{{ maildivvy_dovecot_dropin }}"
     owner: root
     group: root
     mode: "0644"
-  loop: "{{ maildivvy_dovecot_conf }}"
-  register: maildivvy_dovecot_written
+  register: maildivvy_dovecot_unit_written
 
-- name: The whole configuration parses
+# A run stopped between the drop-in and the restart leaves it written and not loaded;
+# systemd says so, and the next run restarts.
+- name: Read whether systemd has loaded Dovecot's unit as written
   ansible.builtin.command:
-    argv: [doveconf, -n]
+    argv: [systemctl, show, -p, NeedDaemonReload, --value, dovecot]
+  register: maildivvy_dovecot_unit_stale
   changed_when: false
+
+# Not "this run wrote it": a run stopped between the write and the restart leaves the
+# files as this step writes them and the daemon on the old ones, for ever. The daemon's
+# own start is what the files are compared with (ansible/library/maildivvy_stale.py).
+- name: Is any of the configuration newer than the running daemon?
+  maildivvy_stale:
+    unit: dovecot
+    paths: "{{ maildivvy_dovecot_conf | map('regex_replace', '^', '/etc/dovecot/conf.d/') | list
+               + [maildivvy_dovecot_dropin] }}"
+  register: maildivvy_dovecot_stale
 
 - name: Restart Dovecot for the new configuration
   ansible.builtin.systemd:
     name: dovecot
     state: restarted
-  when: maildivvy_dovecot_written.changed
+    daemon_reload: "{{ maildivvy_dovecot_unit_written.changed or maildivvy_dovecot_unit_stale.stdout == 'yes' }}"
+  when: maildivvy_dovecot_stale.stale or maildivvy_dovecot_unit_stale.stdout == 'yes'
 
 - name: Dovecot runs and starts at boot
   ansible.builtin.systemd:
     name: dovecot
     state: started
     enabled: true
+
+# Read from inside the unit's own namespace, as the uid IMAP runs as: a transient unit
+# given the same property would prove the property, not this unit.
+- name: Read Dovecot's master process
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, MainPID, --value, dovecot]
+  register: maildivvy_dovecot_master
+  changed_when: false
+  failed_when: maildivvy_dovecot_master.stdout in ['', '0']
+
+- name: Inside Dovecot the mail owner reads the Sent hook's passfile and finds no pipeline's
+  ansible.builtin.command:
+    argv: [nsenter, -t, "{{ maildivvy_dovecot_master.stdout }}", -m, --,
+           runuser, -u, vmail, --, test, -r, "{{ item.path }}"]
+  loop:
+    - {path: "{{ maildivvy_dovecot_hook_passfile }}", rc: 0}
+    - {path: "{{ maildivvy_dovecot_hidden }}/pgpass", rc: 1}
+  loop_control:
+    label: "{{ item.path }}"
+  register: maildivvy_dovecot_seen
+  changed_when: false
+  failed_when: maildivvy_dovecot_seen.rc != item.rc
 
 # --- the Sent hook's script, compiled once the configuration is in place -----------------------
 
@@ -199,7 +283,9 @@
     group: root
     mode: "0644"
 
-# --- read back from the daemon --------------------------------------------------
+# --- read back ---------------------------------------------------------------------
+# `doveconf` and `doveadm config` read the files, never the running daemon; what makes them
+# the daemon's values is the restart above, whenever the files are newer than its start.
 
 - name: Read the effective values this step relies on
   ansible.builtin.command:
@@ -231,13 +317,14 @@
 
 - name: Read Dovecot's TCP listeners
   ansible.builtin.shell:
-    cmd: ss -ltnpH | grep '"dovecot"' | awk '{print $4}' | sed 's/.*://' | sort -u
+    cmd: ss -ltnpH | grep '"dovecot"' | awk '{print $4}' | sort -u
   register: maildivvy_dovecot_ports
   changed_when: false
 
-- name: Dovecot listens on 993 alone; 143 is closed
+# IPv4 alone, as Postfix's 465 and the interface's 443 (0049): no [::]:993.
+- name: Dovecot listens on 993 alone, over IPv4 alone; 143 is closed
   ansible.builtin.assert:
-    that: maildivvy_dovecot_ports.stdout_lines == ['993']
+    that: maildivvy_dovecot_ports.stdout_lines == ['0.0.0.0:993']
     fail_msg: "Dovecot listens on {{ maildivvy_dovecot_ports.stdout_lines }}"
     quiet: true
 
@@ -270,7 +357,7 @@
   loop: [auth-userdb, anvil]
   changed_when: false
 
-- name: Read the Sent hook's binding as the daemon holds it
+- name: Read the Sent hook's binding as doveconf parses it
   ansible.builtin.shell:
     cmd: doveconf -n | grep -A3 'sieve_script maildivvy_sent'
   register: maildivvy_dovecot_binding

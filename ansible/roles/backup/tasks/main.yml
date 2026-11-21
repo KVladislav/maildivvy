@@ -44,10 +44,19 @@
   loop: ["{{ maildivvy_backup_unit }}", "{{ maildivvy_backup_timer }}"]
   register: maildivvy_backup_units_written
 
+# a run stopped between the units and the reload leaves them written and not loaded
+- name: Read whether systemd has loaded each unit as written
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, NeedDaemonReload, --value, "{{ item }}"]
+  loop: ["{{ maildivvy_backup_unit }}", "{{ maildivvy_backup_timer }}"]
+  register: maildivvy_backup_units_stale
+  changed_when: false
+
 - name: Tell systemd the units changed
   ansible.builtin.systemd_service:
     daemon_reload: true
   when: maildivvy_backup_units_written is changed
+    or 'yes' in maildivvy_backup_units_stale.results | map(attribute='stdout') | list
 
 - name: The timer runs and starts at boot; the service is started by it alone
   ansible.builtin.systemd_service:

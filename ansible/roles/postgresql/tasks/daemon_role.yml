@@ -1,0 +1,41 @@
+# A daemon's own database role, finished by the daemon's step:
+# Dovecot's (step 8) and Postfix's (step 9) import this with
+#   maildivvy_daemon_db_role   the role step 6 made without LOGIN
+#   maildivvy_daemon_passfile  where its passfile goes
+#   maildivvy_daemon_reader    the account the daemon reads it as
+#   maildivvy_daemon_db_host   the passfile's first field: `localhost` for the unix socket,
+#                              an address for a daemon that connects over TCP
+
+- name: Give the daemon's role LOGIN, which step 6 withheld until its user existed
+  ansible.builtin.command:
+    argv: [runuser, -u, postgres, --, psql, -X, -q, -v, ON_ERROR_STOP=1, -d, postgres]
+    stdin: |
+      DO $$
+      BEGIN
+          IF NOT (SELECT rolcanlogin FROM pg_roles WHERE rolname = '{{ maildivvy_daemon_db_role }}') THEN
+              ALTER ROLE {{ maildivvy_daemon_db_role }} LOGIN;
+              RAISE NOTICE 'granted login';
+          END IF;
+      END
+      $$;
+  register: maildivvy_daemon_login
+  changed_when: "'granted login' in maildivvy_daemon_login.stderr"
+
+# Before the configuration that names it; the password never leaves the machine
+- name: Give the role its password in a passfile owned by the account the daemon reads it as
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/maildivvy-pg, password, "{{ maildivvy_daemon_db_role }}", "{{ maildivvy_daemon_passfile }}",
+           "{{ maildivvy_daemon_reader }}", --db, "{{ maildivvy_db_name }}", --host, "{{ maildivvy_daemon_db_host }}"]
+  register: maildivvy_daemon_password
+  changed_when: (maildivvy_daemon_password.stdout | from_json).changed
+
+- name: Read the passfile back by owner, mode and shape, never printing it
+  ansible.builtin.command:
+    argv: [sh, -c, 'stat -c "%U %a" "$1" && awk -F: "END { print NR, NF }" "$1" && cut -d: -f1-4 "$1"', -,
+           "{{ maildivvy_daemon_passfile }}"]
+  register: maildivvy_daemon_passfile_read
+  changed_when: false
+  failed_when: >-
+    maildivvy_daemon_passfile_read.rc != 0 or maildivvy_daemon_passfile_read.stdout_lines !=
+    [maildivvy_daemon_reader ~ ' 600', '1 5',
+     maildivvy_daemon_db_host ~ ':' ~ maildivvy_db_port ~ ':' ~ maildivvy_db_name ~ ':' ~ maildivvy_daemon_db_role]

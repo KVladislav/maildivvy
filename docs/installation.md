@@ -16,6 +16,9 @@ Placeholders are written `<like this>`. No value in this guide belongs to a real
   must be the only mail system on it: step 1 refuses a machine with another mail server
   installed (Exim, Sendmail, OpenSMTPD, Courier, Cyrus and the like), or with Postfix or
   Dovecot that this installation did not put there.
+- Maildivvy owns the machine's firewall: step 1 refuses a machine whose `nftables.service`
+  is enabled or running, since that service flushes every firewall rule on the machine.
+  Installation masks it.
 - Memory: 4 GiB carries the product. ClamAV with its signature databases peaks at about
   1.4 GB, and rspamd holds about 70 MiB.
 - If the root filesystem is LVM made with `sizing-policy: all`, leave at least 256 MiB
@@ -89,9 +92,13 @@ settings: leave them out, since `/etc/maildivvy/install.yml` refuses them.
   CA and your DNS provider's API over HTTPS; public resolvers and your zone's
   nameservers on port 53; the lego and
   mpop release downloads (`github.com`, `marlam.de`); the container registry for the
-  rspamd image and `hub.docker.com`'s tag listing; ClamAV's and Sanesecurity's signature
-  mirrors, and the DNS record `current.cvd.clamav.net`; and each mail provider's POP3 and
-  SMTP servers.
+  rspamd image and `hub.docker.com`'s tag listing; rspamd's lists from `maps.rspamd.com`
+  over HTTPS, and a DNS lookup at `asn.rspamd.com` of each message's sending address;
+  ClamAV's and Sanesecurity's signature mirrors, and the DNS record
+  `current.cvd.clamav.net`; and each mail provider's POP3 or IMAP server and its SMTP
+  server. rspamd sends
+  no hash of a message to rspamd.com and follows no link in one, and its DNS blocklists
+  are off.
 - **Inbound from the internet**, if people read mail from outside: forward 993 (IMAP)
   and 465 (submission) from your router to the machine. The product opens them at its
   own firewall in the last step. It never configures the router. Never forward 443 or 22.
@@ -225,7 +232,7 @@ their sections above.
 | `maildivvy_container_pool` | no, default `172.16.0.0/12` | the range the container firewall block treats as containers. It must not overlap an administrator network | one CIDR network |
 | `maildivvy_breakglass_password` | yes | the break-glass password (§ 4). Stored only as a hash | 15 characters or more |
 | `maildivvy_backup_keep` | no, default 8 | how many backup runs are kept, counted and never aged | 1 to 1000 |
-| `maildivvy_backup_store_copy` | no, default none | your command that copies the mail store, run as root inside each backup ([administration guide § 1](administration.md#1-backup-and-restore)) | one line of shell |
+| `maildivvy_backup_store_copy` | no, default none | your command that copies the mail store and the backup run off the machine, run as root inside each backup ([administration guide § 1](administration.md#1-backup-and-restore)) | one line of shell |
 | `maildivvy_health_textfile_dir` | no, default none | a directory for node_exporter's textfile collector, where health writes `maildivvy.prom` ([administration guide § 3](administration.md#3-health)). Step 17 creates it, owned by the health user, when it does not exist. An existing directory must already be the health user's, `maildivvy-health`: step 1 refuses one that is not, and nothing re-owns it | an absolute path without spaces |
 
 A settings file for an install on the machine itself, written as `<settings file>` on
@@ -251,8 +258,17 @@ maildivvy_backup_store_copy: "<one-line store copy command>"
 It holds no secret: the installer asks for the break-glass password and the DNS
 credentials, or reads them on its standard input (§ 3). From a control machine, add
 both to the file instead, as `maildivvy_breakglass_password` and
-`maildivvy_acme_dns_credentials` (the secrets file of § 3 shows them), and leave out the
-two firewall confirmation lines: a control machine confirms by a new session of its own.
+`maildivvy_acme_dns_credentials`, and leave out the two firewall confirmation lines: a
+control machine confirms by a new session of its own. Tag each secret `!unsafe`:
+Ansible reads what `-e @<settings file>` gives it as a template, so a password or a token
+holding `{{`, `{%` or `{#` would otherwise be changed or stop the run (`maildivvy-install`
+tags them itself):
+
+```yaml
+maildivvy_breakglass_password: !unsafe "<15 characters or more>"
+maildivvy_acme_dns_credentials:
+  DESEC_TOKEN: !unsafe "<token scoped to the challenge record>"
+```
 
 Each role also has defaults, such as the antivirus's limits, the rspamd pin and the fetch
 period. [The roles' README](../ansible/README.md) lists them. A role default is not an
@@ -425,6 +441,10 @@ It refuses too a machine installed before 0.1.0 (our database, no version file a
 unfinished installation): `maildivvy-install` of a 0.1 release upgrades it. With no version
 file and no unfinished installation, a database that does not answer is refused as well,
 since the run cannot tell such a machine from a clean one: start PostgreSQL and run again.
+An unfinished installation that another release began and someone used (an account, a
+domain or an external mailbox exists) is refused too, and so is one whose database does
+not answer: finish it with the release that began it, or upgrade it with
+`maildivvy-install`, which takes a backup first.
 At its end the run records the release's version in `/etc/maildivvy/version`, so a later
 `maildivvy-install` finds the machine at that version. Until then a first installation is
 recorded in `/etc/maildivvy/installing`, as `maildivvy-install` records its own, so one
@@ -501,25 +521,29 @@ The person's mail client uses `<mail hostname>` for both IMAP (993) and submissi
 ### An external mailbox
 
 **External mailboxes → Add external mailbox.** This is the provider mailbox the domain's
-mail is collected from, and sent through. You give the address, the POP3 login if it is
-not the address, the SMTP login if it is not the POP3 login, the provider password, the
-POP3 and SMTP hosts and ports, the deletion window in days, and the domain in front of
-it. It is saved **disabled**.
+mail is collected from, and sent through. You give the address; the **Protocol** it is
+collected over, **POP3** or **IMAP** (below); its login if it is not the address; the SMTP
+login if it is not that login; the provider password; the POP3 or IMAP host and port and
+the SMTP host and port; for POP3, the deletion window in days; and the domain in front
+of it. The server's fields are named for either protocol here, such as **POP3 or IMAP
+host**, since the page cannot rename them when IMAP is chosen; the mailbox's own page names
+them by its protocol, such as **IMAP host**. It is saved **disabled**.
 
 ⛔ **Give both hosts by name, never by IP address.** The relay verifies the provider's
 certificate against the host name the mailbox is configured with before it sends the
 password, and a host given as an IP address never matches. The forms and the database
 refuse an IP address for either host.
 
-- The POP3 port is implicit TLS. An SMTP port of 465 is sent with implicit TLS; any other
-  SMTP port, such as 587, uses STARTTLS.
+- The POP3 or IMAP port is implicit TLS, never STARTTLS. Left empty, it is the protocol's
+  own: 995 for POP3, 993 for IMAP. An SMTP port of 465 is sent with implicit TLS; any
+  other SMTP port, such as 587, uses STARTTLS.
 - Changing either host clears the stored password: type it again.
 - Changing the POP3 login makes the fetcher treat the mailbox as new and collect its
   whole window again.
-- The relay logs in with the SMTP login, or with the POP3 login when the SMTP login is
-  empty, or with the address when both are, or when the POP3 login holds a colon, as a
-  `recent:` login does. The password is the same one. Nothing checks the SMTP login
-  before a message is sent: **Check password** asks the POP3 server alone.
+- The relay logs in with the SMTP login, or with the POP3 or IMAP login when the SMTP
+  login is empty, or with the address when both are, or when that login holds a colon, as
+  a POP3 `recent:` login does. The password is the same one. Nothing checks the SMTP
+  login before a message is sent: **Check password** asks the POP3 or IMAP server alone.
 - The deletion window counts from when the fetcher first saw a message. After it, the
   message is deleted at the provider, and this machine holds the only copy.
 - **Keep mail at the provider** deletes nothing there, whatever the window. The
@@ -527,29 +551,74 @@ refuse an IP address for either host.
   window applies from each message's first sighting, so mail kept past it is deleted at
   the next fetch.
 
+#### A mailbox collected over IMAP
+
+Choose **IMAP** for a provider that offers no POP3, or whose mail must stay exactly as it
+is at the provider.
+
+- **Nothing at the provider changes.** Every folder is opened read-only and every message
+  read without marking it as read; nothing is deleted, moved or flagged there, by any
+  fetch, check or snapshot. So an IMAP mailbox keeps all its mail at the provider: the
+  form refuses **IMAP** unless **Keep mail at the provider** is ticked. No deletion window
+  applies, and the mailbox's settings show **Deletion at the provider** as *None* in its
+  place. The provider's mailbox fills up until its owner empties it.
+- **The INBOX is collected from the moment the mailbox is enabled.** Enabling records
+  where the provider's INBOX stands, and each fetch then takes, in order, every message
+  that arrived in the INBOX after that point. Mail already in the INBOX when it is
+  enabled, and the mail in every other folder, is not collected: a snapshot copies it
+  into the store for a later import ([administration guide § 6](administration.md#6-collection-over-imap-and-snapshots)).
+  Disabling the mailbox keeps that starting point, so enabling it again collects what
+  arrived while it was disabled. Only a new host, login or protocol, or a provider that
+  numbers its INBOX afresh, makes the next enabling start from where the INBOX then
+  stands.
+- **Only the INBOX.** Mail the provider's own rules file into another folder, or that
+  someone moves out of the INBOX before the next fetch, is never collected.
+- **A new IMAP host or login clears the starting point**, since it belongs to that
+  server and login. On an enabled mailbox collection stops until it is disabled and
+  enabled again; on a disabled one, the next enabling sets a new starting point. Either
+  way, mail that arrived in the INBOX since the last fetch comes in only through a
+  snapshot. The mailbox's page says so when you save. A new host also clears the
+  password: type it again before you enable the mailbox.
+- **The protocol changes only while the mailbox is disabled.** Changing it asks for a
+  password check, as a new login does. It does not change the port: set it under
+  **Provider servers** (993 for IMAP).
+- ⛔ **Switching an IMAP mailbox back to POP3 collects its INBOX again.** IMAP left every
+  message at the provider, and the POP3 fetcher has no record of what IMAP collected, so
+  its first fetch takes every message the provider offers that it has not taken before,
+  mail already collected over IMAP included: each is filed again and reaches every person
+  of the domain a second time, which cannot be undone. The form says so beside the
+  protocol, and the page again when you save.
+- **Check password** logs in and opens the INBOX read-only, and reads no message.
+
 #### A provider certificate that cannot be verified
 
 A provider whose certificate is self-signed, names another host, or has expired cannot
 be verified, so nothing is fetched from it or sent through it. If you have checked that
 the certificate really is the provider's, pin it: give its SHA-256 fingerprint in
-**POP3 certificate fingerprint** or **SMTP certificate fingerprint** on the mailbox's
-servers form. A pinned server is trusted when it presents that certificate, whatever it
+**POP3 certificate fingerprint** (**IMAP certificate fingerprint** for an IMAP mailbox) or
+**SMTP certificate fingerprint** on the mailbox's servers form. A pinned server is trusted when it presents that certificate, whatever it
 names and whatever its dates, and refused otherwise; its password is never sent to
 another. Read the fingerprint from a machine you trust:
 
 ```sh
 openssl s_client -connect <pop3 host>:995 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+openssl s_client -connect <imap host>:993 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
 openssl s_client -connect <smtp host>:587 -starttls smtp </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
 ```
 
 Use `:465` without `-starttls smtp` for a provider on 465. The form takes the line as
 openssl prints it.
 
+- Setting or changing a pin clears the stored password, as changing a host does: type
+  it again in Settings. A pin trusts a certificate in place of the usual checks, so the
+  password must never follow a pin someone else put there. Removing a pin keeps it.
 - When the provider replaces its certificate, fetching or sending stops until the pin
-  is updated. Health reports the failed fetch, and relayed mail waits in the queue.
-- An SMTP pin belongs to the server and port, not to the mailbox: it holds for every
-  external mailbox sending through that host and port, and a second pin there is
-  accepted beside the first.
+  is updated, and the password is typed again with the new pin. Health reports the
+  failed fetch, and relayed mail waits in the queue.
+- An SMTP pin belongs to the server and port, not to the mailbox: every external
+  mailbox sending through that host and port must name the same one. While they differ,
+  or some name none, nothing is relayed there; the mailbox's page, beside its SMTP pin,
+  and the list name the mailboxes that differ.
 
 Then **Check password** asks the pipeline to log in at the provider, and pressing the
 mailbox's state switch, which reads *disabled* (a screen reader names it **Enable**),
@@ -559,9 +628,10 @@ on the mailbox's page.
 
 ### Copy the store before you enable the first external mailbox
 
-The pipeline refuses to enable an external mailbox until a backup has been taken. That
-gate checks only the product's half: the database and the fetch state. **The store's
-copy is yours, and nothing checks it.** Once an external mailbox is enabled its deletion
+The pipeline refuses to enable an external mailbox until a backup has been taken, an IMAP
+mailbox too. That gate checks only the product's half: the database and the fetch state. **The store's
+copy is yours, and the gate does not check it**; health warns only when the backup's run
+of your command fails, never whether what it wrote can be restored. Once an external mailbox is enabled its deletion
 window starts running, and after it the provider no longer holds the mail. So before the
 first enable:
 
@@ -576,7 +646,8 @@ first enable:
    ```
 3. In what it prints, `store_copy` must be `ok`, not `none configured` and not
    `failed, exit <n>`.
-4. Check the copy itself where your command wrote it: every file there, owners kept, and
-   hardlinks kept ([administration guide § 1](administration.md#what-the-store-copy-must-do)).
+4. Check the copy itself where your command wrote it, off the machine: every file there,
+   owners kept, hardlinks kept, and the run's directory beside it
+   ([administration guide § 1](administration.md#what-the-store-copy-must-do)).
 
 Only then enable the external mailbox.

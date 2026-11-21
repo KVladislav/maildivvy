@@ -1,0 +1,45 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# The requests that wait on a provider: a refetch, a password check, an enable, the
+# deletion of an external mailbox and the discard of a snapshot, which waits for a slice
+# in progress (docs/architecture.md § The path of a message, Record and fan out). They run
+# for up to half an hour, so they are drained here, beside the pass and never inside it,
+# where one would hold every domain's fan-out.
+# It has no timer: maildivvy-pass.service Wants= it, so each tick of the pass's timer
+# starts both, and a start while a run is still going joins that run.
+[Unit]
+Description=Maildivvy: perform the requests that wait on a provider
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/fanout/requests.py
+After=network-online.target postgresql.service dovecot.service
+Wants=network-online.target
+# A pause holds this unit, whatever starts it: while a record of one is there a
+# start is skipped, not failed, so a timer that fires inside a pause, after a reboot too,
+# starts nothing; the program never runs on a schema or a fetch state it may not pair with.
+ConditionPathExists=!{{ maildivvy_upgrade_pause_record }}
+ConditionPathExists=!{{ maildivvy_backup_pause_record }}
+
+[Service]
+Type=oneshot
+User=vmail
+Group=vmail
+ExecStart={{ maildivvy_opt }}/bin/maildivvy-pass --provider-requests
+# A refetch is bounded at 1800 s and a password check at 600 by the handlers themselves;
+# this only has to be wider than a run of them.
+TimeoutStartSec={{ maildivvy_pass_run_timeout }}
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# What the fetch runner and its children write, since a refetch runs it as a CHILD OF
+# THIS UNIT: the fetcher's state, and the store and the index through the delivery
+# filter's dovecot-lda. Deleting an external mailbox removes its state.
+ReadWritePaths={{ maildivvy_store }} {{ maildivvy_index }} {{ maildivvy_var }}/fetch
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+# Nothing it does needs a capability, in either set.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

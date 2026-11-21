@@ -4,7 +4,7 @@
 # message, Outgoing).
 [Unit]
 Description=Maildivvy: bind a submitted message's sender and scan it
-Documentation=file://{{ maildivvy_milter_opt }}/lib/maildivvy/milter/decision.py
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/milter/decision.py
 # ⛔ on boot Postfix must not accept a submission before this can answer - with
 # `tempfail` it would refuse every one - and the sender directory is the database.
 After=network-online.target postgresql.service
@@ -28,7 +28,7 @@ ExecStartPre=+/bin/rm -f {{ maildivvy_milter_socket }}
 # ⚠️ the sender directory is named EXPLICITLY: without it the program would fall back
 # on another consumer's connection file, which this user cannot read, and every
 # submission would be deferred while its own files read exactly as expected.
-ExecStart={{ maildivvy_milter_program }} --socket {{ maildivvy_milter_socket }} --db-conf {{ maildivvy_milter_db_conf }} --clamd-socket {{ maildivvy_milter_clamd_socket }}
+ExecStart={{ maildivvy_milter_program }} --socket {{ maildivvy_milter_socket }} --db-conf {{ maildivvy_milter_db_conf }} --clamd-socket {{ maildivvy_clamav_socket }}
 Restart=on-failure
 RestartSec=5
 ProtectSystem=strict
@@ -41,10 +41,13 @@ NoNewPrivileges=true
 # the store - which is why the mail disks are absent here and present on the two
 # pipeline units.
 ReadWritePaths=-{{ maildivvy_milter_socket_dir }}
-# The rest of install step 13's set, the same on every program of ours.
+# The rest of install step 13's set, the same on every program of ours but the
+# address families, which are what each opens.
 # It binds a unix socket, not a port: no capability in either set.
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# ⚠️ UNIX ALONE: its own socket, the database (its db.conf names no host) and clamd are
+# all unix sockets, so an IP socket is nothing it opens.
+RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

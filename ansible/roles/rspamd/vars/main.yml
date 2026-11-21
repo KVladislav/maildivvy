@@ -35,6 +35,15 @@ maildivvy_rspamd_files:
   - {src: local.d/classifier-bayes.conf.j2, dest: local.d/classifier-bayes.conf}
   - {src: local.d/external_relay.conf.j2, dest: local.d/external_relay.conf}
   - {src: local.d/rbl.conf.j2, dest: local.d/rbl.conf}
+  - {src: local.d/fuzzy_check.conf.j2, dest: local.d/fuzzy_check.conf}
+  - {src: local.d/url_redirector.conf.j2, dest: local.d/url_redirector.conf}
+  - {src: local.d/mx_check.conf.j2, dest: local.d/mx_check.conf}
+  - {src: local.d/rspamd_update.conf.j2, dest: local.d/rspamd_update.conf}
+
+# The image's modules that would send something about a message off this machine, or take
+# verdicts from a third party while it runs: each is off in a file of its own, by name, and
+# the step reads every one back as a module disabled explicitly.
+maildivvy_rspamd_call_outs_off: [fuzzy_check, url_redirector, mx_check, rspamd_update]
 
 # The step's proof, and the last act of a repin: a message scored through the
 # product's own client, as the mail owner, over the socket the delivery filter will use.

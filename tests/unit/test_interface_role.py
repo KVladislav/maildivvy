@@ -16,6 +16,7 @@ import yaml
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from maildivvy.admin import run
+from play_vars import play_vars
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROOT / "ansible" / "roles" / "interface"
@@ -29,8 +30,11 @@ spec.loader.exec_module(cert)
 
 
 def variables(**changes):
-    """The role's own variables, resolved as Ansible resolves them, with a run's settings."""
-    values = yaml.safe_load((ROLE / "vars" / "main.yml").read_text())
+    """The role's own variables and those it reads from earlier steps, resolved as Ansible
+    resolves them, with a run's settings."""
+    values = play_vars("maildivvy_published_cert", "maildivvy_published_key", "maildivvy_cert_program",
+                       "maildivvy_opt")
+    values.update(yaml.safe_load((ROLE / "vars" / "main.yml").read_text()))
     values["maildivvy_cert_name"] = CERT_NAME
     values["maildivvy_cert_mode"] = "self-signed"
     values.update(changes)
@@ -74,10 +78,17 @@ def test_the_tls_minimum_is_1_2_and_it_is_written_out():
 
 def test_the_certificate_and_key_are_named_explicitly_and_are_the_published_pair():
     values = variables()
-    assert directives(site(), "ssl_certificate") == [f"/etc/ssl/certs/{CERT_NAME}.crt"]
+    assert directives(site(), "ssl_certificate") == [f"/etc/maildivvy/tls/{CERT_NAME}.crt"]
     assert directives(site(), "ssl_certificate_key") == [f"/etc/ssl/private/{CERT_NAME}.key"]
     assert directives(site(), "server_name") == [CERT_NAME]
-    assert values["maildivvy_interface_cert"] == f"/etc/ssl/certs/{CERT_NAME}.crt"
+    assert values["maildivvy_published_cert"] == f"/etc/maildivvy/tls/{CERT_NAME}.crt"
+
+
+def test_every_response_tells_the_browser_to_use_tls_for_this_name_alone():
+    # `always`: on a refusal and an error page too; no `includeSubDomains`, since the
+    # operator's other names under this one are not this proxy's to decide. The one
+    # add_header is the server's: a location with its own would drop it there.
+    assert directives(site(), "add_header") == ['Strict-Transport-Security "max-age=31536000" always']
 
 
 def test_the_proxy_listens_on_443_alone_and_talks_to_the_unix_socket():
@@ -98,6 +109,15 @@ def test_the_client_address_is_written_by_the_proxy_and_never_appended_to():
     written = [line for line in site().splitlines() if not line.strip().startswith("#")]
     assert "proxy_add_x_forwarded_for" not in "\n".join(written)
     assert "X-Forwarded-Proto https" in site()
+
+
+def test_the_proxy_forwards_the_host_the_browser_sent_port_included():
+    # `$host` drops the port, so a browser reaching the interface on another port (a
+    # tunnel, NAT) names a port in `Origin` that the application never sees, and every
+    # POST, the sign-in included, is refused as cross-origin
+    hosts = [value for value in directives(site(), "proxy_set_header")
+             if value.split()[0].lower() == "host"]
+    assert hosts == ["Host $http_host"]
 
 
 # --- the interface's unit ---------------------------------------------------------------------
@@ -154,11 +174,12 @@ def test_the_certificates_deploy_hook_names_this_proxy_and_reloads_it():
     assert [name for name, _ in cert.CONSUMERS if name == unit_name] == [unit_name]
 
 
-def test_the_key_is_reached_by_the_proxys_user_and_by_nothing_of_ours():
+def test_the_key_is_reached_by_no_account_of_the_proxy_or_of_ours():
     values = variables()
-    # reversed the entry: our interface holds no certificate at all, so it is the
-    # proxy's user that joins ssl-cert, and the interface's user stays in no group but its own.
-    assert values["maildivvy_interface_proxy_groups"] == ["ssl-cert"]
+    # reversed the entry: our interface holds no certificate at all, and that
+    # the proxy's user reads it: nginx's master does, as root. So no variable gives any
+    # account a group for the key, and the interface's user stays in no group but its own.
+    assert not [name for name in values if name.endswith("_groups")]
     users = yaml.safe_load((PROGRAMS / "vars" / "main.yml").read_text())["maildivvy_program_users"]
     admin = [user for user in users if user["name"] == values["maildivvy_interface_user"]]
     assert admin and admin[0]["groups"] == []
@@ -182,3 +203,27 @@ def test_the_unit_hides_nothing_of_the_health_report_it_reads():
     tasks = (ROOT / "ansible" / "roles" / "health" / "tasks" / "main.yml").read_text()
     assert 'path: "{{ maildivvy_health_dir }}"' in tasks.split("mode: \"0755\"")[0]
     assert "maildivvy_health_report_file.stat.mode == '0644'" in tasks
+
+
+# --- the step's read-back of the proxy -------------------------------------------------------
+
+
+def proxy_read_back_holds(effective):
+    """Whether the step's assert on `nginx -T` passes for this output."""
+    task = next(task for task in yaml.safe_load((ROLE / "tasks" / "main.yml").read_text())
+                if task.get("name") == "It serves the product's pair, with the TLS floor stated")
+    env = Environment(undefined=StrictUndefined)
+    env.filters["regex_findall"] = lambda value, pattern, multiline=False: re.findall(
+        pattern, value, re.MULTILINE if multiline else 0)
+    values = {**variables(), "maildivvy_interface_effective": {"stdout": effective}}
+    return all(env.compile_expression(that)(**values) for that in task["ansible.builtin.assert"]["that"])
+
+
+def test_the_read_back_refuses_a_listener_on_80_on_any_address():
+    dumped = f"# configuration file /etc/nginx/sites-enabled/maildivvy-admin:\n{site()}"
+    assert proxy_read_back_holds(dumped)              # the control: the site as the step writes it
+    # the stock nginx.conf's commented examples are no listener
+    assert proxy_read_back_holds(dumped + "\n#\tlisten     localhost:110;\n")
+    for other in ("listen 80;", "listen [::]:80;", "listen 0.0.0.0:80 default_server;",
+                  "listen 8080;", "listen [::]:443 ssl;"):
+        assert not proxy_read_back_holds(dumped + f"\nserver {{\n    {other}\n}}\n"), other

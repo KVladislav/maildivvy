@@ -11,13 +11,14 @@
   register: maildivvy_publish_rules_now
   changed_when: false
 
+# Each family by its own source: step 19 opens IPv4 alone (0049), and an earlier release
+# opened IPv6 too.
 - name: Delete the publication's rules, both families
   ansible.builtin.command:
-    argv: [ufw, delete, allow, proto, tcp, from, any, to, any, port, "{{ item }}"]
-  loop: "{{ maildivvy_publish_ports }}"
+    argv: [ufw, delete, allow, proto, tcp, from, "{{ item.1 }}", to, any, port, "{{ item.0 }}"]
+  loop: "{{ maildivvy_publish_ports | product(['0.0.0.0/0', '::/0']) | list }}"
   when: >-
-    ('### tuple ### allow tcp ' ~ item ~ ' 0.0.0.0/0 any 0.0.0.0/0 in') in maildivvy_publish_rules_now.stdout
-    or ('### tuple ### allow tcp ' ~ item ~ ' ::/0 any ::/0 in') in maildivvy_publish_rules_now.stdout
+    ('### tuple ### allow tcp ' ~ item.0 ~ ' ' ~ item.1 ~ ' any ' ~ item.1 ~ ' in') in maildivvy_publish_rules_now.stdout
 
 - name: Forget the publication
   ansible.builtin.file:

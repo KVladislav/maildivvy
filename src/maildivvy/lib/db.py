@@ -12,6 +12,7 @@ is refused, so the named passfile is the only source.
 """
 
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -67,11 +68,31 @@ def libpq_environment(consumer, etc=ETC, base=None):
     return environment
 
 
-def connect(consumer, etc=ETC, autocommit=False):
-    return connect_at(db_conf_path(consumer, etc), autocommit=autocommit)
+def connect(consumer, etc=ETC, autocommit=False, settings=None):
+    return connect_at(db_conf_path(consumer, etc), autocommit=autocommit, settings=settings)
 
 
-def connect_at(path, autocommit=False):
+# A setting's name and value as `settings` takes them: a word, and a word or a duration,
+# so the startup options libpq sends need no quoting.
+SETTING = re.compile(r"[a-z_]+")
+SETTING_VALUE = re.compile(r"[A-Za-z0-9_.]+")
+
+
+def startup_options(settings):
+    """libpq's `options` for server settings made at connection start, or None.
+
+    A setting given here holds for the whole session: a transaction rolled back does not
+    take it away, as it would a `SET` sent on a connection that is not in autocommit.
+    """
+    if not settings:
+        return None
+    for name, value in settings.items():
+        if not SETTING.fullmatch(name) or not SETTING_VALUE.fullmatch(str(value)):
+            raise ValueError(f"not a setting this helper sends: {name}={value!r}")
+    return " ".join(f"-c {name}={value}" for name, value in settings.items())
+
+
+def connect_at(path, autocommit=False, settings=None):
     """A connection made from one named `db.conf`, and from nothing else.
 
     A program whose unit points it explicitly at its own file connects this way:
@@ -85,6 +106,7 @@ def connect_at(path, autocommit=False):
 
     import psycopg2
 
-    conn = psycopg2.connect(**info)
+    options = startup_options(settings)
+    conn = psycopg2.connect(**info, **({"options": options} if options else {}))
     conn.autocommit = autocommit
     return conn

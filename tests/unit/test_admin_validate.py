@@ -6,6 +6,9 @@ same rules as a second lock; the tests that read them back off the running schem
 on the test machine.
 """
 
+import re
+import unicodedata
+from pathlib import Path
 from decimal import Decimal
 
 import pytest
@@ -44,21 +47,24 @@ def test_the_screens_label_rule_is_the_schemas_own_rule():
 # ⚠️ The screens that take a login came later. The RULE is here with every other
 # one, because one function has to serve the form and the journal's filter alike.
 
-@pytest.mark.parametrize("typed", ["Ivan", "IVAN", "_ivan", "ivan_", ".ivan", "ivan.",
+@pytest.mark.parametrize("typed", ["_ivan", "ivan_", ".ivan", "ivan.",
                                    "iv an", "iv@n", "i" * 65, "", "   "])
 def test_a_login_the_schema_would_refuse_is_refused_as_typed(typed):
     assert refusal(validate.login, typed)
 
 
 @pytest.mark.parametrize("typed,stored", [("ivan", "ivan"), ("iv.an_9-x", "iv.an_9-x"),
-                                          ("  ivan  ", "ivan"), ("i" * 64, "i" * 64)])
-def test_a_login_is_stripped_and_never_lowercased(typed, stored):
+                                          ("  ivan  ", "ivan"), ("i" * 64, "i" * 64),
+                                          ("Ivan", "ivan"), ("IV.AN_9-X", "iv.an_9-x")])
+def test_a_login_is_stripped_and_folded_to_lowercase(typed, stored):
     assert validate.login(typed) == stored
 
 
-def test_a_login_with_a_capital_is_refused_rather_than_folded():
-    # a spelling nobody typed is one nobody was told, so it is never stored
-    assert refusal(validate.login, "Ivan")
+def test_only_ascii_capitals_are_folded_as_dovecot_folds_them():
+    # str.lower() would make the Kelvin sign a `k`; no mail client sends that spelling
+    assert refusal(validate.login, "\u212aate")
+    assert auth.account_login("\u212aate") == "\u212aate"
+    assert auth.account_login("  Ivan@Example.ORG ") == "ivan"
 
 
 def test_the_match_is_whole_string_so_a_trailing_newline_cannot_pass():
@@ -90,7 +96,11 @@ def test_a_calendar_date_is_taken_as_yyyy_mm_dd():
     assert validate.calendar_date(" 2026-09-22 ", "start date").isoformat() == "2026-09-22"
 
 
-@pytest.mark.parametrize("typed", ["22/09/2026", "yesterday", "2026-13-01", "2026-09"])
+@pytest.mark.parametrize("typed", ["22/09/2026", "yesterday", "2026-13-01", "2026-09",
+                                   # what `date.fromisoformat` also takes, and the text
+                                   # goes on to the query as typed
+                                   "2026-W45-2", "2026W452", "20260922", "2026-265",
+                                   "2026-09-22T10:00", "２０２６-09-22"])
 def test_a_text_that_is_not_a_date_says_how_to_write_one(typed):
     assert refusal(validate.calendar_date, typed, "start date") == \
         "The start date is not a date. Give it as YYYY-MM-DD."
@@ -107,7 +117,9 @@ def test_an_empty_date_is_refused_and_never_widened():
 
 @pytest.mark.parametrize("typed,canonical", [
     ("A.B+tag@gmail.com", "ab@gmail.com"),
-    ("a.b@googlemail.com", "ab@googlemail.com"),
+    # Google's two names for one mailbox are one host in the canonical form
+    ("a.b@googlemail.com", "ab@gmail.com"),
+    ("A.B+x@GoogleMail.com", "ab@gmail.com"),
     ("ab@gmail.com", "ab@gmail.com"),
 ])
 def test_a_consumer_hosts_dots_and_tag_are_folded_away(typed, canonical):
@@ -131,12 +143,19 @@ def test_the_consumer_host_list_is_a_constant_of_the_code():
 
 
 @pytest.mark.parametrize("typed", ["", "   ", "nobody", "@example.org", "a@example",
-                                   "+tag@gmail.com", ".@gmail.com"])
+                                   "+tag@gmail.com", ".@gmail.com", "x@.", "a@b@c.d",
+                                   "a@.example.org", "a@example..org", "a@example.org."])
 def test_an_address_that_is_not_one_is_refused(typed):
     assert refusal(validate.external_address, typed)
 
 
-@pytest.mark.parametrize("inside", [" ", "\t", "\n", "\r", "\x00", "\x1f", "\x7f"])
+def test_the_duplicate_check_also_reads_a_googlemail_row_saved_before_the_two_were_one():
+    assert validate.legacy_spellings("ab@gmail.com") == ["ab@gmail.com", "ab@googlemail.com"]
+    assert validate.legacy_spellings("ab@example.org") == ["ab@example.org"]
+
+
+@pytest.mark.parametrize("inside", [" ", "\t", "\n", "\r", "\x00", "\x1f", "\x7f", "\x81",
+                                    "\x9f"])
 def test_an_address_with_whitespace_or_a_control_character_inside_it_is_refused(inside):
     assert "no spaces, line breaks or control characters" in refusal(
         validate.external_address, f"some{inside}body@example.org")
@@ -146,7 +165,8 @@ def test_an_address_with_whitespace_or_a_control_character_inside_it_is_refused(
 
 # --- the POP3 login -------------------------------------------------------
 
-@pytest.mark.parametrize("inside", [" ", "\t", "\n", "\r", "\x00", "\x1f", "\x7f"])
+@pytest.mark.parametrize("inside", [" ", "\t", "\n", "\r", "\x00", "\x1f", "\x7f", "\x81",
+                                    "\x9f"])
 def test_a_login_with_whitespace_or_a_control_character_inside_it_is_refused(inside):
     assert "no spaces, line breaks or control characters" in refusal(
         validate.pop3_login, f"recent:some{inside}body")
@@ -163,6 +183,29 @@ def test_one_rule_serves_the_address_and_the_login():
     # one function for both, so the two cannot drift
     assert "no_inner_whitespace" in validate.external_address.__code__.co_names
     assert "no_inner_whitespace" in validate.pop3_login.__code__.co_names
+
+
+def test_the_screens_character_rule_refuses_all_the_schemas_check_refuses():
+    """One class on both sides: the columns' CHECK is `SCHEMA_CLASS`, which in the
+    machine's database refuses C0, DEL, the C1 controls and Unicode's spaces; the screen
+    refuses every control Unicode names and every space Python knows, so a value the
+    form takes is never one the INSERT refuses with an error page."""
+    schema = (__import__("pathlib").Path(__file__).resolve().parents[2]
+              / "schema" / "0001_initial.sql").read_text()
+    for column in ("address", "address_canonical", "pop3_login"):
+        assert f"{column} ~ '^[^{validate.SCHEMA_CLASS}]+$'" in schema, column
+    later = (__import__("pathlib").Path(__file__).resolve().parents[2]
+             / "schema" / "0002_provider_login_keep_and_pins.sql").read_text()
+    assert f"smtp_login ~ '^[^{validate.SCHEMA_CLASS}:]+$'" in later
+    refused = [code for code in range(0x110000)
+               if unicodedata.category(chr(code)) == "Cc" or chr(code).isspace()]
+    # the control that the class was read at all: C0, DEL and all 32 C1 controls
+    assert {*range(0x20), *range(0x7F, 0xA0)} <= set(refused)
+    for code in refused:
+        assert validate.INNER.search(f"a{chr(code)}b"), hex(code)
+        assert "control characters" in refusal(validate.external_address,
+                                                f"a{chr(code)}b@example.org"), hex(code)
+    assert validate.external_address("a\xe9b@example.org")[1] == "a\xe9b@example.org"
 
 
 # --- the SMTP login ----------------------------------------------------------------
@@ -211,6 +254,15 @@ def test_anything_but_a_sha256_fingerprint_is_refused(typed):
                                    "localhost", "192.0.2.256"])
 def test_a_host_that_is_not_a_name_or_an_address_is_refused(typed):
     assert "host" in refusal(validate.host, typed, "POP3 host", "pop.example.org")
+
+
+@pytest.mark.parametrize("typed", ["pop\n.example.org", "pop.example\n.org"])
+def test_a_line_break_ending_a_label_is_refused_by_the_field_not_by_the_column(typed):
+    # `$` matches before a final newline: with `.match` these reached the CHECK
+    assert not validate.is_host(typed)
+    assert "host" in refusal(validate.host, typed, "POP3 host", "pop.example.org")
+    # and the journal's filter no longer passes one as a host name
+    assert not validate.is_host("pop.example.org\n")
 
 
 @pytest.mark.parametrize("typed", ["pop.example.org", "pop3.mail.example.org", "xn--80ak6aa92e.com",
@@ -270,21 +322,59 @@ def test_the_host_field_and_the_journals_filter_are_one_function():
     assert "is_host" in validate.host.__code__.co_names
 
 
-@pytest.mark.parametrize("typed", ["0", "65536", "-1", "abc", "99 5", " 995 ", "9.5"])
+@pytest.mark.parametrize("typed", ["0", "65536", "-1", "abc", "99 5", " 995 ", "9.5",
+                                   "1" * 5000, "0" * 5000])
 def test_a_port_outside_one_to_65535_is_refused(typed):
     assert refusal(validate.port, typed, "POP3 port") == \
         "The POP3 port must be a whole number from 1 to 65535."
 
 
-@pytest.mark.parametrize("typed", ["1", "995", "65535"])
-def test_a_port_inside_the_range_is_taken_as_a_number(typed):
-    assert validate.port(typed, "POP3 port") == int(typed)
+@pytest.mark.parametrize("typed,number", [("1", 1), ("995", 995), ("65535", 65535),
+                                          ("0" * 5000 + "995", 995)])
+def test_a_port_inside_the_range_is_taken_as_a_number(typed, number):
+    assert validate.port(typed, "POP3 port") == number
 
 
 def test_an_empty_port_takes_the_forms_default_where_there_is_one_and_is_refused_where_there_is_not():
     assert validate.port("", "POP3 port", default=995) == 995
     assert validate.port(None, "SMTP port", default=587) == 587
     assert refusal(validate.port, "", "POP3 port") == "The POP3 port is needed."
+
+
+# --- the protocol ------------------------------------------------------------------
+
+@pytest.mark.parametrize("typed,default,chosen", [
+    ("imap", "pop3", "imap"), ("pop3", "imap", "pop3"), (" imap ", "pop3", "imap"),
+    (None, "pop3", "pop3"), (None, "imap", "imap"), ("", "imap", "imap")])
+def test_a_protocol_is_pop3_or_imap_and_a_form_without_one_keeps_the_default(
+        typed, default, chosen):
+    assert validate.protocol(typed, default) == chosen
+
+
+@pytest.mark.parametrize("typed", ["IMAP", "smtp", "imap4", "pop3 imap"])
+def test_anything_else_is_refused_with_a_sentence(typed):
+    assert refusal(validate.protocol, typed) == "The protocol is POP3 or IMAP."
+
+
+def test_the_protocol_changes_only_while_the_mailbox_is_disabled():
+    assert refusal(validate.protocol_change, "active", "pop3", "imap") == \
+        validate.PROTOCOL_WHILE_ENABLED
+    assert validate.protocol_change("active", "imap", "imap") == "imap"
+    assert validate.protocol_change("deactivated", "pop3", "imap") == "imap"
+
+
+def test_an_imap_mailbox_keeps_its_mail_at_the_provider_and_a_pop3_one_may_not():
+    assert refusal(validate.keeps_at_provider, "imap", False) == validate.IMAP_KEEPS
+    validate.keeps_at_provider("imap", True)
+    validate.keeps_at_provider("pop3", False)
+
+
+def test_the_protocols_the_screen_takes_are_the_schemas_own_list():
+    """A protocol the column refuses would be an error page where a sentence was owed."""
+    schema = Path(__file__).resolve().parents[2] / "schema" / "0008_collection_over_imap.sql"
+    listed = re.search(r"CHECK \(protocol IN \(([^)]*)\)\)", schema.read_text()).group(1)
+    assert set(re.findall(r"'([a-z0-9]+)'", listed)) == set(validate.PROTOCOLS) \
+        == set(validate.PROVIDER_PORTS)
 
 
 # --- the deletion window ---------------------------------------------------
@@ -299,6 +389,8 @@ def test_the_window_defaults_to_fourteen_and_takes_a_positive_whole_number(typed
     ("many", "whole number of days"), ("4.5", "whole number of days"),
     ("0", "more than zero days"), ("-3", "more than zero days"),
     ("1000001", "at most 1000000 days"),
+    # past the 4300 digits `int()` reads, which raised rather than refused
+    ("9" * 5000, "at most 1000000 days"), ("-" + "9" * 5000, "more than zero days"),
 ])
 def test_a_window_that_is_not_a_positive_number_of_days_says_which(typed, says):
     assert says in refusal(validate.window, typed)
@@ -310,6 +402,18 @@ def test_the_windows_bound_is_the_date_arithmetics_and_the_columns():
     schema = (__import__("pathlib").Path(__file__).resolve().parents[2]
               / "schema" / "0001_initial.sql").read_text()
     assert f"delete_window_days BETWEEN 1 AND {validate.WINDOW_MAX}" in schema
+
+
+@pytest.mark.parametrize("typed,high,read", [
+    ("7", 10, 7), ("-7", 10, -7), ("0010", 10, 10), ("0" * 5000 + "3", 10, 3),
+    ("11", 10, 11), ("1" * 5000, 10, 11), ("-" + "1" * 5000, 10, -11),
+    (str(2 ** 63 - 1), 2 ** 63 - 1, 2 ** 63 - 1),
+])
+def test_a_number_spelt_longer_than_its_bound_reads_as_past_the_bound_without_int(
+        typed, high, read):
+    # `int()` raises past 4300 digits, so a field that read every number with it answered
+    # a long one with an error page; one past the bound is all the check needs to know
+    assert validate.whole_number(typed, high) == read
 
 
 # --- the spam score threshold ----------------------------------------------
@@ -363,13 +467,14 @@ def test_a_password_shorter_than_fifteen_characters_is_refused_and_nothing_else_
 
 
 def test_a_password_past_the_hashers_limit_is_a_sentence_not_a_five_hundred():
-    # The screen refuses a too-long password rather than letting make_hash raise
-    assert validate.PASSWORD_MAX == auth.PASSWORD_MAX
-    over = "e" * (validate.PASSWORD_MAX + 1)
-    assert f"at most {validate.PASSWORD_MAX}" in refusal(validate.password_twice, over, over)
-    with pytest.raises(ValueError):        # make_hash would indeed have raised on it
-        auth.make_hash(over)
-    assert validate.password_twice("e" * validate.PASSWORD_MAX, "e" * validate.PASSWORD_MAX)
+    # The limit is the hasher's 256 bytes of UTF-8: 129 Cyrillic letters pass it
+    for over in ("e" * (auth.PASSWORD_MAX + 1), "я" * (auth.PASSWORD_MAX // 2 + 1)):
+        said = refusal(validate.password_twice, over, over)
+        assert "at most 256 bytes" in said and "128 Cyrillic letters" in said
+        with pytest.raises(ValueError):    # make_hash would indeed have raised on it
+            auth.make_hash(over)
+    for most in ("e" * auth.PASSWORD_MAX, "я" * (auth.PASSWORD_MAX // 2)):
+        assert validate.password_twice(most, most) == most
 
 
 def test_a_password_carrying_a_line_break_is_refused_because_it_could_not_be_checked_whole():

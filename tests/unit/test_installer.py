@@ -183,6 +183,14 @@ def test_the_test_certificate_flag_is_the_command_lines_alone(tmp_path):
         settings.load(path, owner=os.getuid())
 
 
+def test_the_ip_family_setting_is_refused_by_name_with_its_reason(tmp_path):
+    path = settings_file(tmp_path, {**GOOD, "maildivvy_postfix_inet_protocols": "all"})
+    with pytest.raises(settings.Refusal) as refusal:
+        settings.load(path, owner=os.getuid())
+    assert "maildivvy_postfix_inet_protocols" in str(refusal.value)
+    assert "IPv4" in str(refusal.value) and "not a Maildivvy setting" not in str(refusal.value)
+
+
 @pytest.mark.parametrize("values, words", [
     (["maildivvy_hostname"], "not a mapping"),
     ({**GOOD, "ansible_connection": "ssh"}, "not a Maildivvy setting: ansible_connection"),
@@ -227,6 +235,19 @@ def test_the_role_defaults_install_yml_takes_are_the_ones_the_roles_readme_offer
     assert [name for name in settings.TUNABLES if name not in defaults or f"`{name}`" not in readme] == []
     path_like = {"maildivvy_lego", "maildivvy_cert_program", "maildivvy_credentials_dir", "maildivvy_ban_program"}
     assert path_like <= defaults and not path_like & set(settings.TUNABLES)
+
+
+def test_no_role_variable_is_defined_in_two_roles():
+    """A role variable outranks every default whatever the order, so with two definitions
+    the default the README offers is not the value in force. Another role's default is
+    read from where it is: `import_role` exposes it to the whole play."""
+    import yaml
+    where = {}
+    for path in sorted((REPO / "ansible" / "roles").glob("*/*/main.yml")):
+        if path.parent.name in ("defaults", "vars"):
+            for name in yaml.safe_load(path.read_text()) or {}:
+                where.setdefault(name, []).append(path.parent.parent.name)
+    assert {name: roles for name, roles in where.items() if len(roles) > 1} == {}
 
 
 def test_every_setting_the_questions_write_is_a_setting():
@@ -304,7 +325,7 @@ def test_the_secrets_reach_ansible_in_a_root_only_file_that_is_gone_after_the_ru
     with run.values_file({"maildivvy_breakglass_password": PASSWORD}, base=tmp_path) as path:
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
-        assert yaml.load(path.read_text(), Loader=literal_loader()) == {"maildivvy_breakglass_password": PASSWORD}
+        assert yaml.load(path.read_text(), Loader=literal_loader()) == {"maildivvy_breakglass_password": PASSWORD}  # noqa: S506 - a SafeLoader that also reads !unsafe
     assert not path.exists() and not path.parent.exists()
 
 
@@ -320,7 +341,7 @@ def test_every_string_the_run_is_given_is_marked_never_a_template():
               "maildivvy_acme_dns_credentials": {"DESEC_TOKEN": TEMPLATE_LIKE[1], "OTHER": TEMPLATE_LIKE[2]},
               "maildivvy_admin_networks": ["192.0.2.0/24"], "maildivvy_backup_store_copy": TEMPLATE_LIKE[3],
               "maildivvy_cert_name": TEMPLATE_LIKE[4], "maildivvy_vmail_uid": 900, "maildivvy_installer_run": True}
-    loaded = yaml.load(run.values_yaml(values), Loader=literal_loader())
+    loaded = yaml.load(run.values_yaml(values), Loader=literal_loader())  # noqa: S506 - a SafeLoader that also reads !unsafe
     assert loaded == values
     assert all(isinstance(s, Literal) for s in strings(loaded))
     assert loaded["maildivvy_vmail_uid"] == 900 and loaded["maildivvy_installer_run"] is True
@@ -419,7 +440,7 @@ def test_a_control_machines_first_install_is_unfinished_until_its_version_and_le
     assert record["ansible.builtin.copy"]["dest"] == str(upgrade.UNFINISHED)
     read = next(t for t in preflight if t["name"].startswith("Read whether this machine has our schema"))
     assert f"not {settings.INSTALLER_RUN} | default(false)" in read["when"]
-    assert "SELECT count(*) FROM schema_version" in read["ansible.builtin.command"]["argv"]
+    assert "maildivvy_installed" in read
     # after every check of step 1: a refused run records nothing
     assert preflight.index(record) > [t["name"] for t in preflight].index(
         "Check every setting and identify the data disks")
@@ -429,7 +450,6 @@ def test_a_control_machine_never_takes_over_a_machine_from_before_0_1_0():
     """A machine with our schema, no version file and no unfinished install is one from
     before 0.1.0: only maildivvy-install moves it on, with a backup, a pause and its version
     rule. Step 1 of a control machine's run refuses it before anything changes."""
-    import yaml
     preflight = preflight_tasks()
     names = [t["name"] for t in preflight]
     guard = next(t for t in preflight if t["name"].startswith("A run from a control machine never takes over"))
@@ -446,64 +466,102 @@ def test_a_control_machine_never_takes_over_a_machine_from_before_0_1_0():
 
 
 NOT_ANSWERING = ('psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" '
-                 'failed: No such file or directory\n\tIs the server running locally and accepting '
+                 'failed: No such file or directory Is the server running locally and accepting '
                  'connections on that socket?')
 
 
-@pytest.mark.parametrize("rc, stdout, stderr, unfinished, passes", [
-    (127, "", "runuser: failed to execute psql: No such file or directory", False, True),  # no psql
-    (1, "", "runuser: user postgres does not exist", False, True),        # no postgres account
-    (2, "", 'psql: error: FATAL:  database "maildivvy" does not exist', False, True),
-    (1, "", 'ERROR:  relation "schema_version" does not exist', False, True),
-    (0, "0", "", False, True),                                             # our table, no rows
-    (0, "1", "", False, False),                                            # from before 0.1.0
-    (0, "1", "", True, True),                                              # an unfinished install
-    (2, "", NOT_ANSWERING, False, False),                                  # cannot tell: refused
-    (2, "", NOT_ANSWERING, True, True),
-    (None, "", "", False, False),                                          # the read did not run
+def preflight_guards(facts):
+    """Each control-machine guard of step 1 with whether it holds on `facts`, and the facts
+    its set_fact tasks add, in the role's order."""
+    import base64
+    import jinja2
+    env = jinja2.Environment(undefined=jinja2.ChainableUndefined)
+    env.filters["b64decode"] = lambda s: base64.b64decode(s).decode()
+    env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip() == "True"
+    facts, held = dict(facts), []
+    for task in preflight_tasks():
+        if "ansible.builtin.set_fact" in task:
+            for name, value in task["ansible.builtin.set_fact"].items():
+                facts[name] = env.from_string(value).render(**facts).strip() == "True"
+        elif "ansible.builtin.assert" in task and f"not {settings.INSTALLER_RUN} | default(false)" in task.get("when", []):
+            that = task["ansible.builtin.assert"]["that"]
+            ok = all(bool(env.compile_expression(c)(**facts)) for c in ([that] if isinstance(that, str) else that))
+            held.append((task, ok, env.from_string(task["ansible.builtin.assert"]["fail_msg"]).render(**facts)))
+    return held, facts
+
+
+@pytest.mark.parametrize("record, used, error, passes", [
+    (None, False, None, True),                    # no unfinished install
+    ("0.2.1\n", True, None, True),                # this tree began it
+    ("0.1.3\n", False, None, True),               # another, unused, or stopped before step 6
+    ("0.1.3\n", True, None, False),               # another, used: refused
+    ("0.1.3\n", False, NOT_ANSWERING, False),     # cannot tell: refused
+    ("0.2.1\n", False, NOT_ANSWERING, True),      # this tree began it: nothing to tell
+])
+def test_a_control_machine_never_takes_over_a_used_unfinished_install_another_release_began(
+        record, used, error, passes):
+    """With no version file, an unfinished install another release began and someone used
+    is the installer's to upgrade, with a backup and its version rule: step 1 of a control
+    machine's run reads the record, and the database with maildivvy_installed as
+    installer.upgrade.installed does, refuses what it would upgrade, and fails closed on a
+    database that does not answer."""
+    import base64
+    preflight = preflight_tasks()
+    names = [t["name"] for t in preflight]
+    slurp = next(t for t in preflight if t["name"].startswith("Read the release an unfinished install began"))
+    assert slurp["ansible.builtin.slurp"]["src"] == str(upgrade.UNFINISHED)
+    read = next(t for t in preflight if "maildivvy_installed" in t)
+    first_change = names.index("Preseed Postfix's mailer-type question, so its install never waits")
+    assert names.index(read["name"]) < names.index(slurp["name"]) < first_change
+
+    facts = {"maildivvy_release_version": "0.2.1",
+             "maildivvy_schema_read": {"versions": ["1"] if used else [], "used": used, "error": error},
+             "maildivvy_unfinished": {"stat": {"exists": record is not None}},
+             "maildivvy_unfinished_record": (
+                 {"content": base64.b64encode(record.encode()).decode()} if record else {"skipped": True})}
+    held, _ = preflight_guards(facts)
+    assert held and all(ok for _, ok, _ in held) is passes
+    if not passes:
+        message = next(m for _, ok, m in held if not ok)
+        assert "0.1.3" in message and ("did not answer" in message if error else "maildivvy-install" in message)
+
+
+@pytest.mark.parametrize("versions, error, unfinished, passes, first", [
+    ([], None, False, True, True),              # no psql, account, database, table or migration
+    (["1"], None, False, False, False),         # from before 0.1.0
+    (["1"], None, True, True, False),           # an unfinished install
+    ([], NOT_ANSWERING, False, False, False),   # cannot tell: refused
+    ([], NOT_ANSWERING, True, True, False),
 ])
 def test_a_control_machines_run_with_no_version_passes_only_where_the_installer_would_install(
-        rc, stdout, stderr, unfinished, passes):
-    """Step 1 of a control machine's run on a machine with no version file reads the schema as
-    installer.upgrade.schema_versions does, and fails closed as it does: a database that does
-    not answer cannot tell a machine from before 0.1.0 from a clean one, and is refused unless
-    the install is recorded as unfinished."""
-    import jinja2
-    import yaml
-    preflight = preflight_tasks()
-    guards = [t for t in preflight if "ansible.builtin.assert" in t
-              and "maildivvy_installed_version.content is not defined" in t.get("when", [])]
-    assert len(guards) >= 1
-    read = {"stdout": stdout, "stderr": stderr} | ({} if rc is None else {"rc": rc})
-    names = {"maildivvy_schema_read": read, "maildivvy_unfinished": {"stat": {"exists": unfinished}}}
-    env = jinja2.Environment(undefined=jinja2.ChainableUndefined)
-    held = []
-    for guard in guards:
-        that = guard["ansible.builtin.assert"]["that"]
-        for condition in [that] if isinstance(that, str) else that:
-            held.append(bool(env.compile_expression(condition)(**names)))
-    assert all(held) is passes
-    if not passes and rc == 2:
-        refusing = next(g for g in guards if not bool(env.compile_expression(
-            g["ansible.builtin.assert"]["that"])(**names)))
-        message = env.from_string(refusing["ansible.builtin.assert"]["fail_msg"]).render(**names)
+        versions, error, unfinished, passes, first):
+    """Step 1 of a control machine's run on a machine with no version file reads the schema
+    with maildivvy_installed, as installer.upgrade.schema_versions does, and fails closed as
+    it does: a database that does not answer cannot tell a machine from before 0.1.0 from a
+    clean one, and is refused unless the install is recorded as unfinished. It records a
+    first install only where that reading finds nothing."""
+    facts = {"maildivvy_release_version": "0.2.1",
+             "maildivvy_schema_read": {"versions": versions, "used": False, "error": error},
+             "maildivvy_unfinished": {"stat": {"exists": unfinished}},
+             "maildivvy_unfinished_record": {"content": "MC4yLjEK"} if unfinished else {"skipped": True}}
+    held, facts = preflight_guards(facts)
+    assert all(ok for _, ok, _ in held) is passes
+    if not passes and error:
+        message = next(m for _, ok, m in held if not ok)
         assert "did not answer" in message and "No such file or directory" in message
-    if rc is None:
-        return
-    # the same read by the installer: step 1 refuses only what it refuses, and records a
-    # first install only where it finds nothing there (no psql, no account, database or table)
-    def run(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, rc, stdout, stderr)
-    try:
-        found = upgrade.schema_versions(run=run, psql="/nonexistent/psql" if rc == 127 else sys.executable)
-    except settings.Refusal:
-        found = None
-    closed = next(g for g in guards if "[0, 127]" in g["ansible.builtin.assert"]["that"])
-    assert bool(env.compile_expression(closed["ansible.builtin.assert"]["that"])(**names)) is (
-        unfinished or found is not None)
-    fact = next(t for t in preflight if t["name"] == "Tell whether this is a first install from a control machine")
-    first = env.from_string(fact["ansible.builtin.set_fact"]["maildivvy_control_first_install"]).render(**names)
-    assert (first == "True") is (rc != 0 and found == [])
+    assert facts["maildivvy_control_first_install"] is first
+
+
+def test_step_1_and_the_installer_read_the_machine_with_one_module():
+    """One reading, never two copies kept equal: preflight calls maildivvy_installed, and
+    the installer imports it from the same file."""
+    import maildivvy_installed
+    reads = [t for t in preflight_tasks() if "maildivvy_installed" in t]
+    assert [t["register"] for t in reads] == ["maildivvy_schema_read"]
+    assert upgrade.maildivvy_installed is maildivvy_installed
+    assert Path(maildivvy_installed.__file__).resolve() == REPO / "ansible" / "library" / "maildivvy_installed.py"
+    assert not any("psql" in str(t.get("ansible.builtin.command", "")) for t in preflight_tasks())
+    assert "does not exist" not in (REPO / "ansible" / "roles" / "preflight" / "tasks" / "main.yml").read_text()
 
 
 def test_the_local_inventory_is_the_machine_itself_over_a_local_connection():
@@ -777,7 +835,7 @@ def test_what_a_loop_item_says_is_shown_whole():
 
 
 def test_step_4s_wait_after_the_reload_asks_for_a_new_login_too():
-    shown = screen_of("TASK [docker_block : Waiting for a new SSH login from 192.0.2.7 after the reload] ***\n")
+    shown = screen_of("TASK [docker_block : Waiting for a new SSH login from 192.0.2.7 after the load] ***\n")
     text = "\n".join(shown)
     assert "step 4: container firewall block" in text
     assert "open a NEW SSH session to this machine from 192.0.2.7 now" in text

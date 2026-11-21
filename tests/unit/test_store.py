@@ -212,3 +212,61 @@ def test_any_other_name_is_not_found_since_the_directory_is_never_scanned(tmp_pa
 def test_a_storage_id_that_is_not_a_bare_base_name_is_refused(tmp_path, base):
     with pytest.raises(StoreError):
         store.resolve(tmp_path, base)
+
+
+# --- a message's file in a person's own folder -----------------------------------------
+
+
+@pytest.mark.parametrize("name", [f"cur/{BASE}:2,FS", f"cur/{BASE}:2,Sa", f"cur/{BASE}:2,R",
+                                  f"cur/{BASE}:2,DFRST", f"new/{BASE}:2,F",
+                                  # the archive's names are a person's too
+                                  f"new/{BASE}", f"cur/{BASE}:2,S", f"cur/{BASE}"])
+def test_a_persons_own_folder_resolves_whatever_flags_the_client_appended_with(tmp_path, name):
+    for sub in ("new", "cur", "tmp"):
+        (tmp_path / sub).mkdir()
+    (tmp_path / name).write_text("m")
+    assert store.resolve_own(tmp_path, BASE) == tmp_path / name
+
+
+@pytest.mark.parametrize("name", [f"tmp/{BASE}:2,S", f"cur/{BASE}.copy", f"cur/{BASE}0:2,S",
+                                  f"cur/{BASE}:1,S"])
+def test_a_persons_own_folder_finds_no_other_messages_name_and_nothing_in_tmp(tmp_path, name):
+    for sub in ("new", "cur", "tmp"):
+        (tmp_path / sub).mkdir()
+    (tmp_path / name).write_text("m")
+    assert store.resolve_own(tmp_path, BASE) is None
+
+
+def test_the_archives_resolver_stays_exact_and_the_two_are_not_one(tmp_path):
+    (tmp_path / "cur").mkdir()
+    (tmp_path / "cur" / f"{BASE}:2,FS").write_text("m")
+    assert store.resolve(tmp_path, BASE) is None  # the archive's ACL never gives that name
+    assert store.resolve_own(tmp_path, BASE) == tmp_path / "cur" / f"{BASE}:2,FS"
+    assert store.resolve_own(tmp_path / "absent", BASE) is None  # no folder, no file
+    with pytest.raises(StoreError):
+        store.resolve_own(tmp_path, f"{BASE}:2,FS")
+
+
+# --- the year folder of imported history (0090) ---------------------------------------------------
+
+SHA = "a" * 64
+
+
+@pytest.mark.parametrize(("epoch", "folder"), [
+    (1577836799, "Archives/2019"),   # 2019-12-31 23:59:59 UTC
+    (1577836800, "Archives/2020"),   # 2020-01-01 00:00:00 UTC
+    (0, "Archives/1970"),
+])
+def test_an_imported_message_goes_to_the_utc_year_its_name_carries(epoch, folder):
+    base = store.import_base(epoch, SHA, 10, 12)
+    assert store.year_folder(base, store.ARCHIVES) == folder
+    assert store.year_folder(base, store.SENT) == folder.replace("Archives", "Sent")
+    assert store.maildir("/h", store.year_folder(base, store.SENT)) == Path(
+        f"/h/Maildir/.Sent.{folder[-4:]}")
+
+
+@pytest.mark.parametrize("base", ["1700000000.M1P2.host,S=10,W=12", "4.5.snapshot,S=10",
+                                  f"x1577836800.{SHA}.import,S=10,W=12"])
+def test_no_other_message_has_a_year_folder(base):
+    with pytest.raises(store.StoreError):
+        store.year_folder(base, store.ARCHIVES)

@@ -4,7 +4,7 @@
 # It takes nothing but the names of its readings, from a closed list, and answers JSON.
 [Unit]
 Description=Maildivvy: read the store and the fetch state for health
-Documentation=file://{{ maildivvy_health_opt }}/lib/maildivvy/health/helper.py
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/health/helper.py
 After=postgresql.service dovecot.service
 
 [Service]
@@ -15,20 +15,25 @@ ExecStart={{ maildivvy_health_helper }} store
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
-TimeoutStartSec={{ maildivvy_health_run_timeout }}
+# the daily pass's reading is the longest
+TimeoutStartSec={{ maildivvy_health_ledger_timeout }}
+# A reading that outgrows this fails health's reading, not clamd: the daily
+# pass holds an archive's listing and inodes and one mailbox's rows at a time.
+MemoryMax={{ maildivvy_health_store_memory_max }}
 
 # Install step 13's hardening, one set on every program of ours.
 ProtectSystem=strict
 # ⚠️ It writes no mail, but doveadm, reading an archive for the ledger and searching its
 # index, keeps Dovecot's index and control files as any reader does, and the search
 # indexes what is not indexed yet (fts_search_add_missing): the pass's two mail paths.
-ReadWritePaths={{ maildivvy_health_store }} {{ maildivvy_health_index }}
+ReadWritePaths={{ maildivvy_store }} {{ maildivvy_index }}
 PrivateTmp=true
 ProtectHome=true
 NoNewPrivileges=true
 UMask=0077
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Its connection is handed to it, and doveadm reads local files: no socket of its own but unix.
+RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

@@ -16,6 +16,7 @@ import argparse
 import datetime
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -163,7 +164,7 @@ def run_install(root, args, values, secrets, log, log_path, write, plan):
     return 0
 
 
-def finish(plan, root, steps, write, log, store_copy=True):
+def finish(plan, root, steps, write, log, store_copy=True, systemd=None):
     """Run `steps` as the plan says and record the version they installed; 0, or FAILED."""
     if plan.action == "upgrade":
         return upgrade.upgrade(plan, root, steps, write, log, store_copy=store_copy)
@@ -174,8 +175,28 @@ def finish(plan, root, steps, write, log, store_copy=True):
         write(f"The installation stopped (exit {code}): nothing after the failed step ran. Fix what it "
               "says and run ./maildivvy-install again.")
         return FAILED
-    upgrade.finished(plan.release)
+    upgrade.finished(plan.release, write, systemd)
     return 0
+
+
+class Stopped(BaseException):
+    """A hangup or a SIGTERM: the run unwinds through every `finally`, the upgrade's pause
+    among them, instead of ending where it stands. A BaseException, so no handler
+    of a failure takes it for one and prints a way back."""
+
+
+def _stopped(signum, frame):
+    raise Stopped(f"told to stop (signal {signum})")
+
+
+def stop_on_signals():
+    """⛔ SIGHUP'S DEFAULT ENDS THE PROCESS WITHOUT ITS `finally`. An SSH session that dropped
+    outside tmux left an upgrade's timers stopped and its record for good, read by health
+    as a pause no run would end. Unwound, the pause resumes them unless the upgrade's
+    migrations hold them (installer/upgrade.py). Ctrl-C is Python's KeyboardInterrupt
+    already."""
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(signum, _stopped)
 
 
 def main(argv, root, write=say):
@@ -185,7 +206,7 @@ def main(argv, root, write=say):
     if not problems:
         try:   # read-only: the version files and the database's schema_version
             release = upgrade.release_version(root)
-            plan = upgrade.decide(upgrade.installed(), release)
+            plan = upgrade.decide(upgrade.installed(release), release)
         except Refusal as refusal:
             problems = str(refusal).splitlines()
     if problems:
@@ -211,8 +232,17 @@ def main(argv, root, write=say):
                 write(f"refused: {line}")
             write("the installation steps did not run")
             return REFUSED
+        stop_on_signals()
         try:
             return run_install(root, args, values, secrets, log, log_path, write, plan)
+        except Stopped as stop:
+            log.write(f"{stop}\n{traceback.format_exc()}")
+            log.flush()
+            try:   # a hangup leaves no terminal to say it on
+                write(f"stopped: {stop}. The full log: {log_path}")
+            except OSError:
+                pass
+            return FAILED
         except Exception as failure:   # noqa: BLE001 - said on the screen, the traceback in the log
             log.write(traceback.format_exc())
             write(f"failed: {type(failure).__name__}: {failure}")

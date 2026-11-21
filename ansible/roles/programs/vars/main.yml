@@ -10,10 +10,20 @@ maildivvy_var: /var/lib/maildivvy
 # STORE_ROOT and INDEX_ROOT; a unit test holds the two spellings together.
 maildivvy_store: /srv/maildivvy/store
 maildivvy_index: /srv/maildivvy/index
+# The snapshots of IMAP mailboxes, beside the domains in the store: the library's
+# SNAPSHOT_ROOT, and the snapshot unit's one writable path.
+maildivvy_snapshots: /srv/maildivvy/store/_snapshots
+# The import's staging directory beside them: the library's IMPORTS_ROOT. A file
+# the operator puts here is on the store's filesystem in either disk layout, so the import
+# renames it into the store instead of copying it.
+maildivvy_imports: /srv/maildivvy/store/_imports
 
-# The host group that names the rspamd image's gid, so the mail uid can open its
-# socket. 11333 is rspamd 4.1.5's; the image is pinned in step 11.
-maildivvy_rspamd_gid: 11333
+# A pause's two records: an upgrade's (installer/upgrade.py's PAUSE_RECORD) and a
+# backup's or a restore's (backup/run.py's PAUSED, beside status.json). Each unit the pause
+# waits for refuses to start while either is there; step 13 starts no timer while the
+# backup's is there, since its holder starts them. A unit test holds them to the library.
+maildivvy_upgrade_pause_record: /etc/maildivvy/upgrade-paused.json
+maildivvy_backup_pause_record: /var/lib/maildivvy/backup/paused.json
 
 # The interface's own library, from the distribution. It goes with the code rather than
 # with step 15, because the code in /opt/maildivvy is what imports it and the tests of
@@ -21,6 +31,10 @@ maildivvy_rspamd_gid: 11333
 maildivvy_program_packages: [python3-flask]
 
 # vmail itself is step 2's, with its fixed ids; these are its groups.
+# `maildivvy-rspamd` takes the rspamd image's gid, `maildivvy_rspamd_gid`, so the mail uid
+# can open its socket. It is the rspamd role's default and defined nowhere
+# else: `import_role` exposes it to this earlier step, and a role variable here would
+# outrank the default an operator reads.
 maildivvy_vmail_groups: [clamav, maildivvy-rspamd]
 
 # Allocated system users, each with its own group and exactly these others.
@@ -50,11 +64,16 @@ maildivvy_fetch_jitter: 20s
 maildivvy_fetch_run_timeout: 3600
 
 # The pass's schedule (once a minute per domain) and how long one run over
-# every domain may take. A run that overruns takes each cursor row with FOR UPDATE, so
-# the next run queues behind it per (domain, mailbox) rather than reading a range twice.
+# every domain may take, which bounds maildivvy-requests.service's run too. A tick that
+# comes while a run lasts joins it: no second pass starts beside the first.
 maildivvy_pass_interval: 1min
 maildivvy_pass_calendar: "*:0/1"
 maildivvy_pass_run_timeout: 3600
+
+# How long one run of the snapshots may take: each snapshot's slice bounds itself at ten
+# minutes and the message in hand, and a run starts no slice that could end past
+# 3300 s (the runner's SNAPSHOT_RUN_SECONDS), so this is a margin above it.
+maildivvy_snapshot_run_timeout: 3600
 
 # The hook (tasks/units.yml, run at step 13's place): each program task adds its own
 # units and configuration here.
@@ -69,3 +88,8 @@ maildivvy_program_units:
   # The pass: the same shape, started by its own timer.
   - {src: maildivvy-pass.service.j2}
   - {src: maildivvy-pass.timer.j2, enabled: true}
+  # The requests that wait on a provider: started with every pass, by its Wants=.
+  - {src: maildivvy-requests.service.j2}
+  # The snapshots of IMAP mailboxes: a service started by its own timer.
+  - {src: maildivvy-snapshot.service.j2}
+  - {src: maildivvy-snapshot.timer.j2, enabled: true}

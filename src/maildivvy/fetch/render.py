@@ -28,6 +28,9 @@ that holds for a row written any other way.
 The row arrives as `Mailbox`, unpacked by name: a query that lost a column raises here,
 on the first mailbox of the first run, rather than rendering a word the delivery filter
 refuses one message at a time and a whole process away from the cause.
+
+An IMAP row has no configuration file: the runner is its client. It shares this
+module's delivery arguments, so the filter is told the same things by either protocol.
 """
 
 import os
@@ -36,11 +39,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
+from maildivvy.lib.fetchpaths import state_dir
+from maildivvy.lib.fetchpaths import BINDIR as DEFAULT_BINDIR
+from maildivvy.lib.fetchpaths import STATE_DIR as DEFAULT_STATE_DIR
+
 # Whitespace, the C0 controls and DEL. Everything else a provider may want to be told.
 FIELD = re.compile(r"^[^\s\x00-\x1f\x7f]+\Z")
 
-DEFAULT_STATE_DIR = Path("/var/lib/maildivvy/fetch")
-DEFAULT_BINDIR = Path("/opt/maildivvy/bin")
 DEFAULT_HOLD_BOUND = 3600  # seconds; the hold's bound, and the delivery filter's default
 
 
@@ -48,12 +53,16 @@ class RenderError(Exception):
     """A row that must not become a configuration file. The message names the column."""
 
 
+POP3, IMAP = "pop3", "imap"  # `external_mailbox.protocol`
+
+
 class Mailbox(NamedTuple):
     """One external mailbox as the runner selects it, in the order QUERY names.
 
     A new column is appended, never inserted: `window`, `target`, `threshold`,
-    `held_since`, `keep` and `pin` each arrived that way. Unpacking is by name, so
-    nothing shifts.
+    `held_since`, `keep`, `pin` and the IMAP three each arrived that way.
+    Unpacking is by name, so nothing shifts, and no field has a default, so a row that
+    lost a column fails to unpack instead of shifting the ones after it.
     """
 
     id: int
@@ -68,6 +77,9 @@ class Mailbox(NamedTuple):
     held_since: datetime | None
     keep: bool
     pin: str | None
+    protocol: str
+    imap_uidvalidity: int | None  # the INBOX's mark, both or neither
+    imap_last_uid: int | None
 
 
 # ⛔ Two of these lines are constants and must stay constants. Every other slot is a
@@ -106,10 +118,6 @@ def account_name(mailbox_id):
     return f"em{mailbox_id}"
 
 
-def state_dir(root, mailbox_id):
-    return Path(root) / str(mailbox_id)
-
-
 def login_of(mailbox):
     """The login presented to the provider: the stored one, else the address as typed."""
     return mailbox.pop3_login or mailbox.address
@@ -135,29 +143,40 @@ def keep_of(mailbox):
     return f"{int(mailbox.window)}d"
 
 
-def delivery_command(mailbox, bindir, hold_bound=DEFAULT_HOLD_BOUND):
-    """What mpop pipes each retrieved message into, and the only way the filter is told.
+def delivery_argv(mailbox, bindir, hold_bound=DEFAULT_HOLD_BOUND, retrieval=False):
+    """The delivery filter's command line for one mailbox, and the only way the filter is told.
 
     The domain's threshold is rendered here and nowhere else: the filter
-    holds no database connection, and this is the one invocation of it in the tree.
-    `--held-since` is the other half of the antivirus hold: the runner records
-    when a hold began and renders it back, so that past the bound the filter delivers
-    the message marked *unavailable* instead of holding it for ever.
+    holds no database connection, and this is the one invocation of it in the tree, for
+    mpop's delivery line and for the IMAP run alike. `--held-since` is the other
+    half of the antivirus hold: the runner records when a hold began and renders
+    it back, so that past the bound the filter delivers the message marked *unavailable*
+    instead of holding it for ever.
+
+    `retrieval`: the filter reads a message mpop is still writing, so a pipe that never
+    reached it is said, and recorded. The IMAP run hands it a message it
+    already holds whole, and passes no such flag.
     """
     if mailbox.threshold is None:
         raise RenderError(
             f"domain {mailbox.label} has no spam_threshold; the column is NOT NULL, so "
             "this is a query that lost it")
-    # ⛔ `exec`: mpop runs this line through `sh -c`, and dash forks for it. A shell left
-    # waiting would hold the retrieval pipe's write end and hide from the filter that
-    # mpop abandoned the message it is reading (`lib/retrieval.py`).
-    # `--retrieval`: a pipe that never reached the filter is then said, and recorded
-    argv = ["exec", f"{bindir}/maildivvy-deliver", "--retrieval", "--domain", mailbox.label,
-            "--spam-threshold", f"{float(mailbox.threshold):.2f}"]
+    argv = [f"{bindir}/maildivvy-deliver", *(["--retrieval"] if retrieval else []),
+            "--domain", mailbox.label, "--spam-threshold", f"{float(mailbox.threshold):.2f}"]
     if mailbox.held_since is not None:
         argv += ["--held-since", mailbox.held_since.isoformat(),
                  "--hold-bound-seconds", str(int(hold_bound))]
-    return " ".join(argv)
+    return argv
+
+
+def delivery_command(mailbox, bindir, hold_bound=DEFAULT_HOLD_BOUND):
+    """What mpop pipes each retrieved message into.
+
+    ⛔ `exec`: mpop runs this line through `sh -c`, and dash forks for it. A shell left
+    waiting would hold the retrieval pipe's write end and hide from the filter that
+    mpop abandoned the message it is reading (`lib/retrieval.py`).
+    """
+    return " ".join(["exec", *delivery_argv(mailbox, bindir, hold_bound, retrieval=True)])
 
 
 def pin_of(mailbox):

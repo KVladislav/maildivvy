@@ -21,10 +21,14 @@ def check(name):
 
 
 class Context:
-    def __init__(self, conf=None, now=None, wants=None):
+    def __init__(self, conf=None, now=None, wants=None, given=None, keep=False):
         self.settings = conf or settings_module.Settings()
         self.now = now or datetime.datetime.now(datetime.timezone.utc)
         self.wants = wants or {}   # {helper: [reading, ...]} for the subsystems that run
+        self.given = given or {}   # {helper: {reading: argument}} for a reading that takes one
+        # a run of every subsystem, whose report is kept: it alone keeps what a check
+        # carries to the next run (the ledger's window)
+        self.keep = keep
         self._db = None
         self._helpers = {}
 
@@ -36,7 +40,7 @@ class Context:
                 from maildivvy.lib import db
                 conn = db.connect("health")
                 conn.set_session(readonly=True, autocommit=True)
-            except Exception as err:  # the driver's own errors, and ConfigError
+            except Exception as err:  # noqa: BLE001 - the driver's own errors, and ConfigError
                 self._db = err
             else:
                 self._db = conn
@@ -46,7 +50,7 @@ class Context:
             with self._db.cursor() as cur:
                 cur.execute(sql, params)
                 return cur.fetchall()
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - the driver's errors are not a closed list
             raise Unreadable(f"the database as maildivvy_health: {one_line(err)}") from None
 
     def close(self):
@@ -60,7 +64,7 @@ class Context:
         if name not in self._helpers:
             wanted = sorted(set(self.wants.get(name, ())) | {reading})
             try:
-                self._helpers[name] = helper.ask(name, wanted)
+                self._helpers[name] = helper.ask(name, wanted, given=self._given(name, wanted))
             except Unreadable as err:
                 self._helpers[name] = err
         answer = self._helpers[name]
@@ -69,13 +73,16 @@ class Context:
         if reading not in answer:
             # a reading this run did not ask for at first: asked for on its own
             try:
-                answer.update(helper.ask(name, [reading]))
+                answer.update(helper.ask(name, [reading], given=self._given(name, [reading])))
             except Unreadable as err:
                 raise err from None
         found = answer[reading]
         if isinstance(found, dict) and "error" in found:
             raise Unreadable(f"the {name} helper could not read {reading}: {found['error']}")
         return found
+
+    def _given(self, name, wanted):
+        return {r: v for r, v in self.given.get(name, {}).items() if r in wanted}
 
     # --- files other steps write for health to read --------------------------------------
 
@@ -107,7 +114,7 @@ def run_check(function, ctx):
         found = function(ctx)
     except Unreadable as err:
         return [Check(name, UNKNOWN, "not read", one_line(err))]
-    except Exception as err:  # a check that breaks is a reading not taken, never a pass
+    except Exception as err:  # noqa: BLE001 - a check that breaks is a reading not taken, never a pass
         return [Check(name, UNKNOWN, "not read",
                       f"the check itself failed: {type(err).__name__}: {one_line(err)}")]
     if isinstance(found, Check):

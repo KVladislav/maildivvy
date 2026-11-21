@@ -20,6 +20,25 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
 
+# ⛔ The package's own service loads /etc/nftables.conf, which begins with `flush ruleset`,
+# and its stop is `nft flush ruleset`: enabled or started once, it would empty ufw's
+# tables, fail2ban's and Docker's rules. The firewall here is the product's, so the unit is
+# masked; a machine where it is already enabled or running is refused at step 1.
+# The package's upgrade unmasks only a mask its own helper made, never this one.
+- name: Mask the nftables package's own service, which flushes every rule
+  ansible.builtin.systemd_service:
+    name: nftables.service
+    masked: true
+
+- name: Prove nftables.service masked and not running
+  ansible.builtin.command: systemctl show nftables.service -p UnitFileState -p ActiveState
+  register: maildivvy_ban_nftables
+  changed_when: false
+  failed_when: >-
+    maildivvy_ban_nftables.rc != 0
+    or 'UnitFileState=masked' not in maildivvy_ban_nftables.stdout_lines
+    or 'ActiveState=inactive' not in maildivvy_ban_nftables.stdout_lines
+
 - name: The Dovecot 2.4 filter, extending the stock one
   ansible.builtin.copy:
     src: dovecot.local
@@ -108,7 +127,7 @@
 
     - name: Health reads the ban as PASS
       ansible.builtin.command:
-        argv: [runuser, -u, maildivvy-health, --, /opt/maildivvy/bin/maildivvy-health, --subsystem, ban]
+        argv: [runuser, -u, maildivvy-health, --, "{{ maildivvy_health_program }}", --subsystem, ban]
         chdir: /
       register: maildivvy_ban_health
       changed_when: false

@@ -87,7 +87,7 @@ def test_a_current_report_is_read_with_its_own_time_and_age(files):
     write(files["report"], ALL_PASS)
     said = read(files)
     assert said["condition"] == "current" and said["state"] == "PASS"
-    assert said["taken"] == "2026-09-29 14:00:04 UTC"
+    assert said["taken"] == "2026-09-29 14:00 UTC"
     assert said["age"] == "3 minutes"
     assert said["bound"] == "15 minutes" and said["period"] == "5 minutes"
     assert [s["name"] for s in said["subsystems"]] == ["host", "tls", "database"]
@@ -244,7 +244,7 @@ def test_the_screen_lists_every_subsystem_its_state_and_every_check(client, file
     write(files["report"], MIXED)
     shown = main_of(client.get("/health"))
     assert "<h1>Health</h1>" in shown and shown.count("<h1") == 1
-    assert "2026-09-29 14:00:04 UTC" in shown and "3 minutes" in shown
+    assert "2026-09-29 14:00 UTC" in shown and "3 minutes" in shown
     assert "the health timer's own period (5 minutes)" in shown
     for name in ("host", "antivirus", "tls", "network"):
         assert f"<code>{name}</code>" in shown, name
@@ -376,7 +376,7 @@ def test_with_a_current_report_and_no_fail_nothing_needs_anybody(client, files,
     assert "holds no FAIL" in overview.NOTHING
     # WARN and UNKNOWN are counted in the section's row, not listed as worries
     row = sections_of(response)
-    assert "1 PASS, 1 WARN, 1 UNKNOWN" in row and "2026-09-29 14:00:04 UTC" in row
+    assert "1 PASS, 1 WARN, 1 UNKNOWN" in row and "2026-09-29 14:00 UTC" in row
     assert "3 minutes old" in row
 
 
@@ -387,7 +387,7 @@ def test_a_fail_in_the_report_needs_attention_with_the_reports_time(client, file
     assert "Nothing needs anybody" not in attention
     assert "<code>antivirus</code> is <span class=\"badge bad\">FAIL</span>" in attention
     assert "ClamAV is not answering" in attention
-    assert "2026-09-29 14:00:04 UTC" in attention
+    assert "2026-09-29 14:00 UTC" in attention
     assert "/health" in attention
     assert "<code>tls</code>" not in attention and "<code>network</code>" not in attention
 
@@ -437,7 +437,7 @@ def stand_in_busy_rows(monkeypatch):
                     "result": "no mailbox 4"}
         if sql == overview.LAST_ACT:
             return None
-        return dict(ZEROES, waiting=2, oldest="2026-09-27", failures=1)
+        return dict(ZEROES, waiting=2, oldest=NOW - datetime.timedelta(days=2), failures=1)
     monkeypatch.setattr(common, "one", one)
     monkeypatch.setattr(common, "rows", lambda conn, sql, parameters=():
                         [dict(REFUSED_ROW)] if sql == overview.WORRIES else [])
@@ -475,6 +475,8 @@ def test_the_overview_is_the_attention_box_then_a_plain_box_of_sections(client, 
     for row in rows:
         assert re.match(r'<svg class="icon (bad|attn) ico"><use href="#i-[a-z]+"/></svg><div>',
                         row), row
+    # the oldest withheld message's moment, printed the one way every moment is
+    assert "the oldest from 2026-09-27 14:03 UTC." in items
     assert '<div class="box-head"><h2>Sections</h2></div>' in sections
     assert '<div class="table-wrap"><table>' in sections and sections.count("<table") == 1
     assert sections.count('<td class="acts"><a href="') == 4

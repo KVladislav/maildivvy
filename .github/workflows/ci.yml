@@ -1,5 +1,5 @@
 ---
-# The public checks: the unit tests, ansible-lint and Ansible's syntax check, on every
+# The public checks: ruff and the unit tests, ansible-lint and Ansible's syntax check, on every
 # push and pull request. They run the public Makefile's targets, so `make test-unit` and
 # `make lint` on a checkout run the same commands. Nothing here needs a mail machine.
 name: CI
@@ -28,7 +28,8 @@ jobs:
         run: >-
           python -m pip install
           pytest==9.0.2 pyyaml==6.0.3 flask==3.1.3 jinja2==3.1.6 ansible-core==2.20.1
-      - name: Run the unit tests
+          ruff==0.17.4
+      - name: Run ruff and the unit tests
         run: make test-unit
 
   lint:

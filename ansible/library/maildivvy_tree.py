@@ -2,9 +2,13 @@
 """The programs role: deploy the code tree to /opt/maildivvy from the archive the install packs.
 
 The deployed tree is compared with the archive: every path, its type, owner, mode and
-content. When they match, nothing changes. When they differ, the destination is
-removed first and the tree written again whole, so a copy can never nest into an
-existing directory (`lib/lib`) or leave old code beside the new.
+content. When they match, nothing changes. When they differ, the tree is written again
+whole beside the destination and swapped with it in one step, so a copy can never nest
+into an existing directory (`lib/lib`) or leave old code beside the new,
+and the Sent hook, the milter and the interface never find the destination missing
+while they run. The swap is Linux's `renameat2(RENAME_EXCHANGE)`; the old tree, left
+at the new one's scratch name, is removed after it; one a killed run left there is a
+change, so the next run replaces the tree and removes it.
 
 The modes are the product's, never the archive's: directories and programs (anything
 under `bin/`) `0755`, every other file `0644`, all owned by root. Caches
@@ -13,6 +17,7 @@ time is not a difference. An archive member that is absolute, climbs out with `.
 or is anything but a file or a directory is refused before anything is written.
 """
 
+import ctypes
 import hashlib
 import os
 import shutil
@@ -24,7 +29,7 @@ from ansible.module_utils.basic import AnsibleModule
 
 DOCUMENTATION = r"""
 module: maildivvy_tree
-short_description: Replace a code tree from an archive when it differs, removing the destination first
+short_description: Replace a code tree from an archive when it differs, swapping the whole tree in at once
 options:
   archive: {type: path, required: true, description: the packed tree, on the host}
   dest: {type: path, required: true, description: the directory the tree is deployed to}
@@ -32,6 +37,7 @@ options:
 """
 
 DIR_MODE, FILE_MODE, PROGRAM_MODE = 0o755, 0o644, 0o755
+AT_FDCWD, RENAME_EXCHANGE = -100, 2  # <fcntl.h>, <linux/fs.h>
 
 
 class TreeError(Exception):
@@ -123,11 +129,30 @@ def differences(expected, actual):
     return found
 
 
+def scratch(dest):
+    """Where the new tree is written, and where the old one waits after the swap."""
+    return Path(dest).with_name(Path(dest).name + ".new")
+
+
+def changes(archive, dest, owner=(0, 0), executable_dirs=("bin",)):
+    """The differences, plus a scratch tree a killed run left, which a replacement removes."""
+    found = differences(expected_tree(archive, owner, executable_dirs), actual_tree(dest))
+    return found + ([f"leftover {scratch(dest)}"] if scratch(dest).exists() else [])
+
+
+def exchange(a, b):
+    """Swap two existing paths in one step: neither is ever missing."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renameat2(AT_FDCWD, os.fsencode(a), AT_FDCWD, os.fsencode(b), RENAME_EXCHANGE) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"cannot swap {a} with {b}: {os.strerror(err)}")
+
+
 def replace(archive, dest, owner=(0, 0), executable_dirs=("bin",)):
-    """Write the tree beside `dest`, remove `dest`, move the new tree in, and read it back."""
+    """Write the tree beside `dest`, swap it in, remove the old one, and read the new one back."""
     dest = Path(dest)
     members = _read_archive(archive, executable_dirs)  # refuses before anything is written
-    new = dest.with_name(dest.name + ".new")
+    new = scratch(dest)
     if new.exists():
         shutil.rmtree(new)
     new.mkdir(mode=0o700)
@@ -142,8 +167,10 @@ def replace(archive, dest, owner=(0, 0), executable_dirs=("bin",)):
     os.chown(new, *owner)
     new.chmod(DIR_MODE)
     if dest.exists():
-        shutil.rmtree(dest)
-    new.rename(dest)
+        exchange(new, dest)
+        shutil.rmtree(new)
+    else:
+        new.rename(dest)
     left = differences(expected_tree(archive, owner, executable_dirs), actual_tree(dest))
     if left:
         raise TreeError(f"{dest} differs from the archive after replacing it: {', '.join(left)}")
@@ -158,7 +185,7 @@ def main():
     p = module.params
     dirs = tuple(p["executable_dirs"])
     try:
-        found = differences(expected_tree(p["archive"], executable_dirs=dirs), actual_tree(p["dest"]))
+        found = changes(p["archive"], p["dest"], executable_dirs=dirs)
         if found and not module.check_mode:
             replace(p["archive"], p["dest"], executable_dirs=dirs)
     except (TreeError, OSError, tarfile.TarError) as e:

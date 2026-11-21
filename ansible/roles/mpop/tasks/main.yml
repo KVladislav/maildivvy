@@ -4,6 +4,20 @@
 # compiler included, are purged after it; the binary's libraries are marked manual so
 # no autoremove can take them. The proof is the version of the binary the
 # fetch runner will execute.
+#
+# No build package stays on the machine, and every run proves it. What was
+# installed before the first build is the operator's, or an earlier step's, and is
+# recorded on the machine before the build's packages come in, for good: a retry, and
+# every later build, keeps that first record. A machine an earlier version built mpop
+# on has no record and cannot tell its operator's packages from the build's, so the
+# module records everything but what the build would bring, and the build's packages
+# there are taken for an old build's leftovers. The purge is bounded by what the build
+# would bring, never whatever became auto-removable since the record was written.
+
+- name: Look for a binary an earlier build installed
+  ansible.builtin.stat:
+    path: "{{ maildivvy_mpop }}"
+  register: maildivvy_mpop_binary
 
 - name: Read the installed mpop's version
   ansible.builtin.command: "{{ maildivvy_mpop }} --version"
@@ -14,10 +28,37 @@
 - name: Build and install the pinned mpop
   when: (maildivvy_mpop_installed.stdout_lines | default([''], true))[0] != maildivvy_mpop_expected
   block:
-    - name: List the packages installed before the build
+    - name: Make a build directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -mpop
+      register: maildivvy_mpop_tmp
+
+    # before anything is installed, so an unreachable host leaves no compiler
+    - name: Download the tarball; a sha256 other than the pin is removed, never unpacked
+      ansible.builtin.get_url:
+        url: "{{ maildivvy_mpop_release_url }}/mpop-{{ maildivvy_mpop_version }}.tar.xz"
+        dest: "{{ maildivvy_mpop_tmp.path }}/mpop.tar.xz"
+        checksum: "sha256:{{ maildivvy_mpop_sha256 }}"
+        mode: "0600"
+
+    - name: List the packages installed before the first build
+      when: not maildivvy_mpop_binary.stat.exists
       ansible.builtin.command: dpkg-query -W -f '${db:Status-Status} ${Package}\n'
       register: maildivvy_mpop_before
       changed_when: false
+
+    # only before the first build; one that got the binary in has no record of
+    # what was there before it, and the purge records that machine itself
+    - name: Record them before the first build, unless a failed first build did; its list is the one without the compiler
+      when: not maildivvy_mpop_binary.stat.exists
+      ansible.builtin.copy:
+        content: "{{ maildivvy_mpop_before.stdout_lines | select('match', '^installed ') | map('split', ' ') | map('last') | join('\n') }}\n"
+        dest: "{{ maildivvy_mpop_record }}"
+        force: false
+        owner: root
+        group: root
+        mode: "0600"
 
     - name: Install the build's packages
       ansible.builtin.apt:
@@ -25,19 +66,6 @@
         install_recommends: false
         update_cache: true
         cache_valid_time: 3600
-
-    - name: Make a build directory
-      ansible.builtin.tempfile:
-        state: directory
-        suffix: -mpop
-      register: maildivvy_mpop_tmp
-
-    - name: Download the tarball; a sha256 other than the pin is removed, never unpacked
-      ansible.builtin.get_url:
-        url: "{{ maildivvy_mpop_release_url }}/mpop-{{ maildivvy_mpop_version }}.tar.xz"
-        dest: "{{ maildivvy_mpop_tmp.path }}/mpop.tar.xz"
-        checksum: "sha256:{{ maildivvy_mpop_sha256 }}"
-        mode: "0600"
 
     - name: Unpack the tarball
       ansible.builtin.unarchive:
@@ -66,17 +94,19 @@
         group: root
         mode: "0755"
 
-    - name: Keep the binary's libraries, purge what only the build brought
-      maildivvy_runtime:
-        binary: "{{ maildivvy_mpop }}"
-        build_packages: "{{ maildivvy_mpop_build_packages }}"
-        installed_before: "{{ maildivvy_mpop_before.stdout_lines | select('match', '^installed ') | map('split', ' ') | map('last') | list }}"
   always:
     - name: Remove the build directory
       ansible.builtin.file:
         path: "{{ maildivvy_mpop_tmp.path }}"
         state: absent
       when: maildivvy_mpop_tmp.path is defined
+
+# every run, whether it built or not
+- name: Keep the binary's libraries; purge, and prove gone, what the build brought and the record does not name
+  maildivvy_runtime:
+    binary: "{{ maildivvy_mpop }}"
+    build_packages: "{{ maildivvy_mpop_build_packages }}"
+    record: "{{ maildivvy_mpop_record }}"
 
 - name: Read the version of the binary the fetch will run, as its user
   ansible.builtin.command: runuser -u vmail -- {{ maildivvy_mpop }} --version

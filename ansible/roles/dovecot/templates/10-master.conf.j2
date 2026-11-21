@@ -4,6 +4,11 @@
 # IMAP and nothing else: submission is Postfix's, delivery the pipeline's.
 protocols = imap
 
+# IPv4 only, as Postfix and the interface (0049): the default `*, ::` also binds [::]:993,
+# a family the firewall's limits, the ban and the outside probe never see. `*` is every
+# IPv4 interface.
+listen = *
+
 service imap-login {
   # Cleartext IMAP is closed by port 0, not by `ssl = required`, which still answers on
   # 143 and refuses at the wrong layer.
@@ -39,4 +44,21 @@ service anvil {
     user = vmail
     group = vmail
   }
+}
+
+# A search indexes what it searches (fts_search_add_missing, 20-fts.conf), in this
+# service. Under the default 256 MB it could not even read the uidlist of an archive's
+# INBOX of 500,000 messages, which an import fills (0088): every search of it, and
+# health's search reading, failed. Under 1 GB it was indexed, about 3.3 KB of index a
+# message, and searched in seconds.
+service indexer-worker {
+  vsz_limit = 1G
+}
+
+# Opening a folder whose cur/ changed since its index reads the whole uidlist. Under the
+# default 256 MB the IMAP process died doing that on an imported archive's INBOX of
+# 360,000 messages, and so did every later opening, since the failed one never updated
+# the index (0088). Under 1 GB it opened.
+service imap {
+  vsz_limit = 1G
 }

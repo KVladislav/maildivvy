@@ -2,7 +2,8 @@
 
 import pytest
 
-from maildivvy_preflight import foreign_mail_errors, hostname_errors, installed_packages, setting_errors
+from maildivvy_preflight import (foreign_mail_errors, hostname_errors, installed_packages,
+                                 nftables_service_errors, setting_errors)
 
 GOOD = {
     "hostname": "mail",
@@ -74,6 +75,14 @@ def test_a_break_glass_password_under_15_characters_is_refused():
     # the control: 15 characters, no composition rule, and 64 are accepted
     assert setting_errors({**GOOD, "breakglass_password": "x" * 15}) == []
     assert setting_errors({**GOOD, "breakglass_password": "y" * 64}) == []
+
+
+def test_a_break_glass_password_over_256_bytes_is_refused_because_openssl_hashes_only_its_start():
+    for over in ("x" * 257, "я" * 129):
+        errors = setting_errors({**GOOD, "breakglass_password": over})
+        assert len(errors) == 1 and "at most 256 bytes" in errors[0]
+    assert setting_errors({**GOOD, "breakglass_password": "x" * 256}) == []
+    assert setting_errors({**GOOD, "breakglass_password": "я" * 128}) == []
 
 
 @pytest.mark.parametrize("network, wide", [
@@ -197,3 +206,27 @@ def test_postfix_or_dovecot_this_install_did_not_put_there_is_refused():
 def test_any_other_mail_system_is_refused_even_on_our_machine(package):
     errors = foreign_mail_errors(installed_packages(DPKG + f"ii \t{package}\n"), ours=True)
     assert len(errors) == 1 and errors[0].startswith(f"refused mail system: {package} installed"), errors
+
+
+# --- a ruleset that is not ours ---------------------------------------------
+
+
+@pytest.mark.parametrize("show", [
+    "ActiveState=inactive\nUnitFileState=\n",            # no nftables package yet
+    "ActiveState=inactive\nUnitFileState=disabled\n",    # as the package leaves it
+    "ActiveState=inactive\nUnitFileState=masked\n",      # as step 18 leaves it
+])
+def test_the_nftables_service_neither_enabled_nor_running_passes(show):
+    assert nftables_service_errors(show) == []
+
+
+@pytest.mark.parametrize("show, how", [
+    ("ActiveState=active\nUnitFileState=enabled\n", "enabled and running"),
+    ("ActiveState=inactive\nUnitFileState=enabled\n", "enabled"),
+    ("ActiveState=inactive\nUnitFileState=enabled-runtime\n", "enabled"),
+    ("ActiveState=active\nUnitFileState=disabled\n", "running"),
+])
+def test_an_nftables_service_enabled_or_running_is_refused_since_it_flushes_every_rule(show, how):
+    errors = nftables_service_errors(show)
+    assert len(errors) == 1 and errors[0].startswith(f"refused nftables.service: it is {how}, "), errors
+    assert "flushes every rule" in errors[0]

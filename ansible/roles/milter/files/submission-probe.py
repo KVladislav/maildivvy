@@ -1,7 +1,8 @@
-"""One unauthenticated transaction on 465, printed as JSON: what the server answers.
+"""One unauthenticated transaction, printed as JSON: what the server answers.
 
-Install step 14 reads this three times: with a milter bound to a socket nothing listens
-on (the rollback drill), with nothing bound at all, and with the real binding in place.
+Install step 14 reads this three times: on the rollback drill's loopback copy of
+submission (address and port as arguments) with a milter bound to a socket nothing
+listens on, and with nothing bound at all; then on 465 itself, with the real binding.
 ⛔ A single reading would prove nothing: `milter_default_action = tempfail` means an
 unreachable milter refuses temporarily, and so does half of what can go wrong with a
 submission, so the drill's answer is only meaningful beside the other two.
@@ -46,7 +47,7 @@ def main():
                 sock.sendall(f"MAIL FROM:<{SENDER}>\r\n".encode())
                 out["mail"] = answer(stream)
                 sock.sendall(b"QUIT\r\n")
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - any failure is the probe's answer
         out["error"] = f"{type(err).__name__}: {err}"
     print(json.dumps(out))
 

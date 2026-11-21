@@ -36,6 +36,11 @@ CERTIFICATE = "certificate.json"     # the machine's own published name lives he
 IMAP_PORT = 993                      # implicit TLS
 SUBMISSION_PORT = 465
 
+# Every kind the interface asks for one person, with the login as its target. The lookup
+# names both so `request_kind_target_idx` finds the rows; the payload's id stays the test,
+# because a login can come back on a later person.
+KINDS = ("delete_account",)
+
 # the empty pair is no longer a refusal on these two
 # forms, so the only password refusals left are a mismatch, a line break and the length.
 PEOPLE = """
@@ -47,7 +52,9 @@ SELECT a.id, a.login, a.is_admin, a.state, a.comment, a.created_at,
          AND v.target = a.login ORDER BY v.id DESC LIMIT 1) AS state_by,
        (SELECT v.at FROM audit v WHERE v.action = 'grant_admin'
          AND v.target = a.login ORDER BY v.id DESC LIMIT 1) AS admin_since,
-       """ + common.newest_request("(r.payload ->> 'account_id')::bigint = a.id") + """
+       """ + common.newest_request(
+    "r.kind IN (" + ", ".join(f"'{kind}'" for kind in KINDS) + ") AND r.target = a.login "
+    "AND (r.payload ->> 'account_id')::bigint = a.id") + """
   FROM account a
 """
 
@@ -116,11 +123,12 @@ the way back in.</span>{% endif %}</div></label>
 {%- macro way() -%}<a href="{{ url_for('accounts') }}">People</a>{%- endmacro -%}
 """
 
-LIST_PAGE = """
+LIST_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import pipeline_failed %}
 {%- set heading %}People{% endset %}
 {%- set lede %}A person is active or blocked, and that reaches every mailbox they hold at once.
 Nobody can set their own password: an administrator sets it here.{% endset %}
-{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_account') }}">Add person</a>{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_account') }}">Add person</a>{% endset %}{% block body %}
 <section class="box"><div class="table-wrap"><table>
 <thead><tr><th>Login</th><th>State</th><th class="num">Mailboxes</th><th>Comment</th>\
 <th class="acts">Actions</th></tr></thead>
@@ -133,7 +141,7 @@ Nobody can set their own password: an administrator sets it here.{% endset %}
   {%- if reading[row.id].waiting %}{{ reading[row.id].waiting }}<span class="row-sub">{{ reading[row.id].look_again }}</span>
   {%- else %}
     {%- if row.state == 'blocked' %}<span class="badge attn">blocked</span>
-      {%- if row.state_at %}<span class="row-sub">since {{ row.state_at }} by <code>{{ row.state_by }}</code></span>{% endif %}
+      {%- if row.state_at %}<span class="row-sub">since {{ row.state_at|moment }} by <code>{{ row.state_by }}</code></span>{% endif %}
     {%- else %}<span class="badge ok">active</span>{% endif %}
     {{- pipeline_failed(reading[row.id].failed) }}
   {%- endif %}</td>
@@ -147,17 +155,18 @@ Nobody can set their own password: an administrator sets it here.{% endset %}
 <tr><td colspan="5">Nobody yet. A person with no mailbox opens nothing.</td></tr>
 {%- endfor %}
 </tbody>
-</table></div></section>
-"""
+</table></div></section>{% endblock %}"""
 
-ADD_PAGE = SETTINGS + """
+ADD_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, refused, field %}
+{%- from "accounts.SETTINGS" import administrator, way with context %}
 {%- set heading %}Add person{% endset %}
-{%- set crumbs %}{{ way() }} / Add person{% endset %}
+{%- set crumbs %}{{ way() }} / Add person{% endset %}{% block body %}
 {%- set login_help %}The part before the <code>@</code>, the same in every domain.{% endset %}
 {%- set password_help %}Leave both empty and one is generated and shown once, on the next page, with
 the settings for their mail client. At least {{ minimum }} characters if you type one; nothing else
 is required of it.{% endset %}
-<form class="narrow" method="post" action="{{ url_for('add_account') }}">
+<form class="narrow" method="post" action="{{ url_for('add_account') }}">{{ csrf() }}
 {{ refused(refusal) }}
 <section class="box"><div class="box-body">
 {{ field('Login', 'login', typed.login, class_='mono-input mid', help=login_help,
@@ -170,12 +179,13 @@ is required of it.{% endset %}
 </div></section>
 <div class="form-foot"><button class="btn btn-primary" type="submit">Add person</button>\
 <a class="btn" href="{{ url_for('accounts') }}">Cancel, nothing changes</a></div>
-</form>
-"""
+</form>{% endblock %}"""
 
-SHOWN_ONCE = SETTINGS + """
+SHOWN_ONCE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import flash %}
+{%- from "accounts.SETTINGS" import client_settings, way with context %}
 {%- set heading %}{{ headline }}{% endset %}
-{%- set crumbs %}{{ way() }} / <code>{{ login }}</code>{% endset %}
+{%- set crumbs %}{{ way() }} / <code>{{ login }}</code>{% endset %}{% block body %}
 <div class="stack narrow">
 {%- set once %}This is the only time this password is shown. It is stored as a hash,
 it is in no log and in no journal row, and a reload of this page will not bring it back.
@@ -188,17 +198,19 @@ If it is lost, set a new one on the person's page.{% endset %}
 {{ client_settings(logins) }}
 <div class="form-foot"><a class="btn btn-primary" href="{{ url_for('account', account_id=account_id) }}">\
 Done &mdash; open <code>{{ login }}</code></a></div>
-</div>
-"""
+</div>{% endblock %}"""
 
-PERSON_PAGE = SETTINGS + mailboxes.SHAPE + """
+PERSON_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, flash, refused, pipeline_flash, field, danger_zone, setting %}
+{%- from "accounts.SETTINGS" import client_settings, administrator, way with context %}
+{%- from "mailboxes.SHAPE" import mailbox_head, mailbox_row %}
 {%- set heading %}<code>{{ row.login }}</code>{% endset %}
-{%- set lede %}{% if row.is_admin %}Administrator{% if row.admin_since %} since {{ row.admin_since }}
+{%- set lede %}{% if row.is_admin %}Administrator{% if row.admin_since %} since {{ row.admin_since|moment }}
 {%- endif %}.{% else %}Not an administrator.{% endif %}
 One password opens every mailbox below.{% endset %}
 {%- set actions %}<a class="btn" href="{{ url_for('events', target=row.login, back='accounts') }}">\
 Journal for this person</a>{% endset %}
-{%- set crumbs %}{{ way() }} / <code>{{ row.login }}</code>{% endset %}
+{%- set crumbs %}{{ way() }} / <code>{{ row.login }}</code>{% endset %}{% block body %}
 {%- if reading.waiting or reading.failed %}
 {{ pipeline_flash(reading) }}
 {%- endif %}
@@ -208,12 +220,12 @@ Journal for this person</a>{% endset %}
 <div class="box-body">
 {{ refused(refusal if form == 'state') }}
 <p>{% if row.state == 'blocked' %}<span class="badge attn">blocked</span>{% else %}<span class="badge ok">active</span>{% endif %}
-{%- if row.state_at %} since {{ row.state_at }} by <code>{{ row.state_by }}</code>{% endif %}.
+{%- if row.state_at %} since {{ row.state_at|moment }} by <code>{{ row.state_by }}</code>{% endif %}.
 {% if row.state == 'blocked' %}Every mailbox they hold is closed and the login is refused;
 mail still arrives for them. Unblocking opens them all again.
 {%- else %}Blocking closes every mailbox they hold at once, while mail keeps arriving.
 {%- endif %}</p>
-<form class="form-foot" method="post" action="{{ url_for('account_state', account_id=row.id) }}">
+<form class="form-foot" method="post" action="{{ url_for('account_state', account_id=row.id) }}">{{ csrf() }}
 <input type="hidden" name="state" value="{{ 'active' if row.state == 'blocked' else 'blocked' }}">
 <button class="btn" type="submit">{{ 'Unblock' if row.state == 'blocked' else 'Block' }} <code>{{ row.login }}</code></button>
 {%- if mine %}<span class="muted">This is your own account. Blocking it ends this session at your
@@ -269,34 +281,29 @@ hold, immediately. There is no grace period and no disabled-but-present state.{%
 {%- set control %}<a class="btn btn-danger" href="{{ url_for('delete_account', account_id=row.id) }}">\
 Delete this person, immediately&hellip;</a>{% endset %}
 {{ danger_zone(sentence, none, control) }}
-</div>
-"""
+</div>{% endblock %}"""
 
-DELETE_PAGE = SETTINGS + """
+DELETE_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import cancel, refused, what_goes %}
+{%- from "accounts.SETTINGS" import way with context %}
 {%- set heading %}Delete <code>{{ row.login }}</code>?{% endset %}
 {%- set crumbs %}{{ way() }} / <a href="{{ url_for('account', account_id=row.id) }}">\
-<code>{{ row.login }}</code></a> / Delete{% endset %}
+<code>{{ row.login }}</code></a> / Delete{% endset %}{% block body %}
 <div class="stack narrow">
 {%- if refusal %}
 {{ refused(refusal) }}
 {%- else %}
-<section class="danger-zone">
-<div class="box-head"><h2>What goes</h2></div>
-<div class="box-body">
-<div class="kv"><div><b>{{ numbers.mailboxes }}</b><span>Mailboxes removed</span></div>\
-<div><b>{{ numbers.names }}</b><span>Names removed</span></div></div>
+{%- set button %}Delete <code>{{ row.login }}</code> and
+everything they hold{% endset %}
+{% call what_goes([(numbers.mailboxes, 'Mailboxes removed'), (numbers.names, 'Names removed')],
+                  url_for('delete_account', account_id=row.id), button) -%}
 <p>Messages removed: 0 &mdash; the archives keep everything.</p>
 <p class="muted">It is recoverable by making the person again and topping them up, but the folders
 they arranged and what they had read do not come back.</p>
-<form class="form-foot" method="post" action="{{ url_for('delete_account', account_id=row.id) }}">\
-<button class="btn btn-danger-solid" type="submit">Delete <code>{{ row.login }}</code> and
-everything they hold</button></form>
-</div>
-</section>
+{%- endcall %}
 {%- endif %}
-<p><a href="{{ url_for('account', account_id=row.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
-</div>
-"""
+{{ cancel(url_for('account', account_id=row.id)) }}
+</div>{% endblock %}"""
 
 
 # --- readers -------------------------------------------------------------------------------------
@@ -325,6 +332,17 @@ def needed(conn, account_id):
     return row
 
 
+def locked(conn, account_id):
+    """The person's row, read after the last-administrator lock.
+
+    ⛔ Lock first, then read: a row read before the lock may be one another decision
+    changed while this one waited for it, and the decision would be made on that row.
+    """
+    with conn.cursor() as cursor:
+        adminlock.lock(cursor)
+    return needed(conn, account_id)
+
+
 def logins_of(boxes):
     return [box["address"] for box in boxes]
 
@@ -347,7 +365,7 @@ def person_page(conn, row, status=200, form=None, refusal=None):
     boxes = mailboxes.of_account(conn, row["id"], period)
     key = request.args.get("done")
     in_row = common.done_sentence(key) if key == "password_set" else None
-    return app.render(row["login"], PERSON_PAGE, section="accounts", status=status,
+    return app.render(row["login"], "accounts.PERSON_PAGE", section="accounts", status=status,
                       done=None if in_row else app.TOP, row=row, columns=(), boxes=boxes,
                       logins=logins_of(boxes), machine=machine_name(),
                       certificate=CERTIFICATE, imap=IMAP_PORT,
@@ -360,7 +378,7 @@ def person_page(conn, row, status=200, form=None, refusal=None):
 def shown_once(conn, row, password, headline):
     """The one page in the product that shows a secret, and it is a POST's answer."""
     boxes = mailboxes.of_account(conn, row["id"])
-    response = app.render(row["login"], SHOWN_ONCE, section="accounts",
+    response = app.render(row["login"], "accounts.SHOWN_ONCE", section="accounts",
                           account_id=row["id"], login=row["login"], password=password,
                           headline=headline, logins=logins_of(boxes),
                           machine=machine_name(), certificate=CERTIFICATE,
@@ -390,7 +408,7 @@ def register(app_):
         conn = app.connection()
         period = common.timer_period()
         people = common.rows(conn, PEOPLE + " ORDER BY a.login")
-        return app.render("People", LIST_PAGE, section="accounts", people=people,
+        return app.render("People", "accounts.LIST_PAGE", section="accounts", people=people,
                           reading={row["id"]: common.reading_of(row, period)
                                    for row in people})
 
@@ -461,7 +479,7 @@ def register(app_):
     def account_admin(account_id):
         """one checkbox. An unchanged one writes nothing."""
         conn = app.connection()
-        row = needed(conn, account_id)
+        row = locked(conn, account_id)
         wanted = common.checked(request.form, "is_admin")
         if wanted == row["is_admin"]:
             # ⛔ the predecessor wrote a grant or a revoke row either way, so the journal said
@@ -482,7 +500,7 @@ def register(app_):
     def account_state(account_id):
         """two states, on the person, reaching every mailbox at once."""
         conn = app.connection()
-        row = needed(conn, account_id)
+        row = locked(conn, account_id)
         wanted = request.form.get("state", "")
         if wanted not in ("active", "blocked"):
             return person_page(conn, row, 400, "state", NO_THIRD.format(value=wanted))
@@ -515,18 +533,20 @@ def register(app_):
     def delete_account(account_id):
         """immediate, with its numbers first, and never one's own."""
         conn = app.connection()
-        row = needed(conn, account_id)
+        row = locked(conn, account_id)
         refusal = None
         if g.identity.account_id == account_id:
             refusal = NOT_YOURSELF
         elif row["is_admin"] and would_leave_no_administrator(conn, account_id):
             refusal = LAST_ADMIN.format(login=row["login"], act="Deleting them")
         if request.method == "GET" or refusal:
-            return app.render(f"Delete {row['login']}?", DELETE_PAGE, section="accounts",
+            return app.render(f"Delete {row['login']}?", "accounts.DELETE_PAGE", section="accounts",
                               status=400 if refusal else 200, row=row, refusal=refusal,
                               numbers=common.one(conn, NUMBERS, {"id": account_id}))
-        asked = common.ask(conn, "delete_account", row["login"],
-                           {"account_id": account_id}, g.identity)
+        asked = common.ask_once(conn, "delete_account", row["login"],
+                                {"account_id": account_id}, g.identity)
+        if asked is None:
+            return common.acted("accounts", "already_asked")
         record(conn, "delete_account", row["login"], {"requested": True},
                request_id=asked)
         return common.acted("accounts", "account_deletion_asked")
@@ -534,6 +554,6 @@ def register(app_):
 
 def add_page(typed, refusal=None, fault=None):
     # ⚠️ `fault`, not `field`: a template value of that name would hide the `field()` shape
-    return app.render("Add person", ADD_PAGE, section="accounts",
+    return app.render("Add person", "accounts.ADD_PAGE", section="accounts",
                       status=400 if refusal else 200, typed=typed, refusal=refusal,
                       fault=fault, grants=GRANTS, minimum=validate.PASSWORD_MIN)

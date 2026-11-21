@@ -174,12 +174,16 @@ def test_a_function_body_with_begin_and_end_is_not_a_transaction(tmp_path):
     assert [m.version for m in schema.migrations(d)] == ["0001"]
 
 
+# a narrowing migration says why the previous release is not affected (below)
+SPARED = "-- previous release: reads none of it\n"
+
+
 def test_a_migration_that_drops_a_column_must_hold_its_rollback_in_a_comment(tmp_path):
     drop = "ALTER TABLE a DROP COLUMN old RESTRICT;\n"
     d = write(tmp_path / "m", {"0002_drop.sql": drop})
     with pytest.raises(SchemaError, match="rollback"):
         schema.migrations(d)
-    write(d, {"0002_drop.sql": "-- rollback: ALTER TABLE a ADD COLUMN old text;\n" + drop})
+    write(d, {"0002_drop.sql": "-- rollback: ALTER TABLE a ADD COLUMN old text;\n" + SPARED + drop})
     assert [m.version for m in schema.migrations(d)] == ["0002"]  # the control
 
 
@@ -196,8 +200,73 @@ def test_a_dropped_view_is_granted_again_in_the_same_migration(tmp_path):
     d = write(tmp_path / "m", {"0002_view.sql": text})
     with pytest.raises(SchemaError, match="mailbox_receives"):
         schema.migrations(d)
-    write(d, {"0002_view.sql": text + "GRANT SELECT ON mailbox_receives TO maildivvy_pipeline;\n"})
+    write(d, {"0002_view.sql": SPARED + text + "GRANT SELECT ON mailbox_receives TO maildivvy_pipeline;\n"})
     assert [m.version for m in schema.migrations(d)] == ["0002"]  # the control
+
+
+# An upgrade applies the migrations before any step replaces the programs, so the previous
+# release's daemons, milter, interface and Sent hook run on the new schema until their step:
+# a migration only adds, or says why the previous release is not affected.
+NARROWING = {
+    "a dropped table": "DROP TABLE old_thing;",
+    "a dropped view": "DROP VIEW mailbox_receives;\nCREATE VIEW mailbox_receives AS SELECT 1;\n"
+                      "GRANT SELECT ON mailbox_receives TO maildivvy_pipeline;",
+    "a dropped column": "-- rollback: ALTER TABLE a ADD COLUMN old text;\nALTER TABLE a DROP COLUMN old RESTRICT;",
+    "a dropped function": "DROP FUNCTION end_session(text);",
+    "a renamed column": "ALTER TABLE a RENAME COLUMN old TO new;",
+    "a renamed view": "ALTER VIEW postfix_generic RENAME TO postfix_generic_map;",
+    "a retyped column": "ALTER TABLE a ALTER COLUMN n TYPE bigint;",
+    "a retyped column, short": "ALTER TABLE a ALTER n SET DATA TYPE bigint;",
+    "a column made NOT NULL": "ALTER TABLE a ALTER COLUMN n SET NOT NULL;",
+    "a dropped default": "ALTER TABLE a ALTER COLUMN n DROP DEFAULT;",
+    "an added table CHECK": "ALTER TABLE a ADD CONSTRAINT n_small CHECK (n < 10);",
+    "an added unnamed CHECK": "ALTER TABLE a ADD CHECK (n < 10);",
+    "an added UNIQUE": "ALTER TABLE a ADD UNIQUE (n);",
+    "a unique index": "CREATE UNIQUE INDEX a_n ON a (n);",
+    "a NOT NULL column without a default": "ALTER TABLE a ADD COLUMN n int NOT NULL;",
+    "a second NOT NULL column without a default": "ALTER TABLE a ADD COLUMN m int, ADD n int NOT NULL CHECK (n > 0);",
+    "a grant revoked from a role": "REVOKE SELECT ON postfix_generic FROM maildivvy_postfix;",
+    "row level security": "ALTER TABLE a ENABLE ROW LEVEL SECURITY;",
+}
+WIDENING = {
+    "an added nullable column with its own CHECK":
+        "ALTER TABLE a ADD COLUMN n text CHECK (n ~ '^[a-z]{1,3}$'), ADD COLUMN m int;",
+    "an added NOT NULL column with a default": "ALTER TABLE a ADD COLUMN n boolean NOT NULL DEFAULT false;",
+    "an added view and its grant": "CREATE VIEW v AS SELECT 1 AS one;\nGRANT SELECT ON v TO maildivvy_postfix;",
+    "a replaced view": "CREATE OR REPLACE VIEW postfix_generic AS SELECT 'a' AS mkey, 'b' AS mvalue;",
+    "a replaced function": "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+    "a new function kept from PUBLIC": "CREATE FUNCTION g() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\n"
+                                       "REVOKE ALL ON FUNCTION g() FROM PUBLIC;\n"
+                                       "GRANT EXECUTE ON FUNCTION g() TO maildivvy_admin;",
+    "a loosened column": "ALTER TABLE a ALTER COLUMN n DROP NOT NULL, ALTER COLUMN n SET DEFAULT 0;",
+    "a dropped CHECK": "ALTER TABLE a DROP CONSTRAINT n_small;",
+    "an added index": "CREATE INDEX a_n ON a (n);",
+    "a dropped trigger and a new one": "DROP TRIGGER t ON a;\nCREATE TRIGGER t BEFORE UPDATE ON a "
+                                       "FOR EACH ROW EXECUTE FUNCTION f();",
+}
+
+
+@pytest.mark.parametrize("sql", NARROWING.values(), ids=NARROWING.keys())
+def test_a_migration_the_previous_release_could_not_run_on_says_why_it_is_unaffected(tmp_path, sql):
+    d = write(tmp_path / "m", {"0002_narrow.sql": sql + "\n"})
+    with pytest.raises(SchemaError, match=r"0002_narrow\.sql: .*previous release"):
+        schema.migrations(d)
+    write(d, {"0002_narrow.sql": "-- previous release:\n" + sql + "\n"})   # a reason is required
+    with pytest.raises(SchemaError, match="previous release"):
+        schema.migrations(d)
+    write(d, {"0002_narrow.sql": "-- previous release: 0.2 no longer reads it (0.1 stopped)\n" + sql + "\n"})
+    assert [m.version for m in schema.migrations(d)] == ["0002"]
+
+
+@pytest.mark.parametrize("sql", WIDENING.values(), ids=WIDENING.keys())
+def test_a_migration_that_only_adds_needs_no_reason(tmp_path, sql):
+    d = write(tmp_path / "m", {"0002_widen.sql": sql + "\n"})
+    assert [m.version for m in schema.migrations(d)] == ["0002"]
+
+
+def test_the_initial_schema_has_no_previous_release_to_spare(tmp_path):
+    d = write(tmp_path / "m", {"0001_initial.sql": "CREATE TABLE a (n int);\nREVOKE ALL ON a FROM someone;\n"})
+    assert [m.version for m in schema.migrations(d)] == ["0001"]
 
 
 def test_the_rules_ignore_what_a_comment_says(tmp_path):
@@ -282,3 +351,42 @@ def test_the_cursors_quarantine_name_is_the_stores():
     check = re.search(r"mailbox\s+text NOT NULL DEFAULT 'INBOX'\s+CHECK \(mailbox IN \(([^)]*)\)\)", sql)
     assert check, "pass_cursor.mailbox's CHECK not found"
     assert check.group(1) == f"'INBOX', '{store.QUARANTINE}'"
+
+
+# --- migration 0009: an imported message's two moments -----------------------
+
+
+def test_an_imported_rows_insert_moment_is_its_own_column_null_for_every_other_row(database):
+    domain = database.value("INSERT INTO domain (label, archive_password_hash) "
+                            "VALUES ('imported', %s) RETURNING id",
+                            ("{SHA512-CRYPT}$6$x$" + "x" * 86,))
+    conn = database.connect("pipeline")
+    try:
+        with conn.cursor() as cur:
+            # the pipeline writes both moments of an imported row ...
+            cur.execute("INSERT INTO message (domain_id, archive_uid, received_at, imported_at) "
+                        "VALUES (%s, 1, '2016-03-01T10:00:00Z', clock_timestamp()) RETURNING id",
+                        (domain,))
+            imported = cur.fetchone()[0]
+            # ... and a row written as before keeps the default and no import moment
+            cur.execute("INSERT INTO message (domain_id, archive_uid) VALUES (%s, 2) RETURNING id",
+                        (domain,))
+            live = cur.fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+    rows = dict((row[0], row[1:]) for row in database.sql(
+        "SELECT id, received_at < now() - interval '1 year', imported_at IS NULL, "
+        "imported_at > received_at FROM message ORDER BY id"))
+    assert rows[imported] == (True, False, True)
+    assert rows[live] == (False, True, None)
+    assert database.value("SELECT col_description('message'::regclass, attnum) FROM pg_attribute "
+                          "WHERE attrelid = 'message'::regclass AND attname = 'imported_at'")
+    # the interface reads it too: its SELECT on message is the table's
+    admin = database.connect("admin")
+    try:
+        with admin.cursor() as cur:
+            cur.execute("SELECT imported_at FROM message WHERE id = %s", (imported,))
+            assert cur.fetchone()[0] is not None
+    finally:
+        admin.close()

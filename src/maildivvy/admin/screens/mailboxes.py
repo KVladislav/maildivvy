@@ -32,11 +32,19 @@ from maildivvy.admin.screens import common
 ARCHIVE = common.ARCHIVE
 record = common.record
 
+# Every kind the interface asks for one mailbox, each with the mailbox's address as its
+# target. The lookup names both so `request_kind_target_idx` finds the rows; the payload's
+# id stays the test, because an address can come back on a later mailbox.
+KINDS = ("create_mailbox", "connect", "top_up", "deliver_one", "transfer", "delete_mailbox")
+
 BOXES = """
 SELECT m.id, m.as_of, a.id AS account_id, a.login, a.state AS account_state,
        a.comment, d.id AS domain_id, d.label,
        (SELECT count(*) FROM delivery dl WHERE dl.mailbox_id = m.id) AS total,
-       """ + common.newest_request("(r.payload ->> 'mailbox_id')::bigint = m.id") + """
+       """ + common.newest_request(
+    "r.kind IN (" + ", ".join(f"'{kind}'" for kind in KINDS) + ") "
+    "AND r.target = a.login || '@' || d.label "
+    "AND (r.payload ->> 'mailbox_id')::bigint = m.id") + """
   FROM mailbox m
   JOIN account a ON a.id = m.account_id
   JOIN domain d ON d.id = m.domain_id
@@ -69,11 +77,13 @@ OCCUPIED = ("That person already has a mailbox in this domain. The model allows 
             "one per person per domain.")
 NO_DOMAIN = "That domain is not there."
 NO_PERSON = "That person is not there."
+GONE = ("That domain or that person was removed while this form was sent. Choose "
+        "again.")
 
 
 # --- the one row shape --------------------------------------------------------
 
-SHAPE = """
+SHAPE = """{%- from "common.SHAPES" import pipeline_failed %}
 {%- macro mailbox_head(columns) -%}
 <thead><tr><th>Mailbox</th>
 {%- if 'person' in columns %}<th>Person</th>{% endif %}
@@ -123,13 +133,14 @@ SHAPE = """
 {%- endmacro -%}
 """
 
-LIST_PAGE = SHAPE + """
+LIST_PAGE = """{% extends "app.SHELL" %}
+{%- from "mailboxes.SHAPE" import mailbox_head, mailbox_row %}
 {%- set heading %}Mailboxes{% endset %}
 {%- set lede %}A mailbox is one person in one domain. It has no state, no password and no settings of
 its own: it is open exactly when its person is active, and one password opens every
 mailbox a person holds. Each domain's own archive appears first, as a row of the same
 shape.{% endset %}
-{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_mailbox') }}">Give someone a mailbox</a>{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_mailbox') }}">Give someone a mailbox</a>{% endset %}{% block body %}
 <section class="box"><div class="table-wrap"><table>
 {{ mailbox_head(columns) }}
 <tbody>
@@ -139,14 +150,14 @@ shape.{% endset %}
 <tr><td colspan="6">No domain yet, so there is nothing to give a mailbox in.</td></tr>
 {%- endfor %}
 </tbody>
-</table></div></section>
-"""
+</table></div></section>{% endblock %}"""
 
-ADD_PAGE = """
+ADD_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, refused %}
 {%- set heading %}Give someone a mailbox{% endset %}
 {%- set lede %}It delivers only mail that arrives from now on. Earlier mail is a top-up afterwards.{% endset %}
-{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / Give someone a mailbox{% endset %}
-<form class="narrow" method="post" action="{{ url_for('add_mailbox') }}">
+{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / Give someone a mailbox{% endset %}{% block body %}
+<form class="narrow" method="post" action="{{ url_for('add_mailbox') }}">{{ csrf() }}
 {{ refused(refusal) }}
 <section class="box"><div class="box-body">
 <div class="field"><label for="domain_id">Domain</label>
@@ -172,19 +183,19 @@ ADD_PAGE = """
 </div></section>
 <div class="form-foot"><button class="btn btn-primary" type="submit">Give the mailbox</button>\
 <a class="btn" href="{{ url_for('mailboxes') }}">Cancel, nothing changes</a></div>
-</form>
-"""
+</form>{% endblock %}"""
 
-CARD_PAGE = SHAPE + """
+CARD_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import refused, pipeline_flash, field, danger_zone, setting %}
 {%- set heading %}<code>{{ box.address }}</code>{% endset %}
 {%- set lede %}<a href="{{ url_for('account', account_id=box.account_id) }}"><code>{{ box.login }}</code></a>
 holds it; their password and their state are set on their own page.
 {% if box.account_state == 'blocked' %}Closed &mdash; the person is blocked, mail still
 arrives.{% else %}Open.{% endif %}
-{{ box.total }} message(s) held. Connected at {{ box.as_of }}.{% endset %}
+{{ box.total }} message(s) held. Connected at {{ box.as_of|moment }}.{% endset %}
 {%- set actions %}<a class="btn" href="{{ url_for('top_up', mailbox_id=box.id) }}">Top up</a> \
 <a class="btn" href="{{ url_for('events', target=box.address, back='mailboxes') }}">Journal for this mailbox</a>{% endset %}
-{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / <code>{{ box.address }}</code>{% endset %}
+{%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / <code>{{ box.address }}</code>{% endset %}{% block body %}
 {%- if box.reading.waiting or box.reading.failed %}
 {{ pipeline_flash(box.reading) }}
 {%- endif %}
@@ -237,37 +248,26 @@ every message.{% endset %}
 {%- set control %}<a class="btn btn-danger" href="{{ url_for('delete_mailbox', mailbox_id=box.id) }}">\
 Remove this mailbox&hellip;</a>{% endset %}
 {{ danger_zone(sentence, none, control) }}
-</div>
-"""
+</div>{% endblock %}"""
 
-ARCHIVE_CARD_HINT = """
-<h2>The archive</h2>
-<p>Not a person: it cannot be removed, transferred or topped up.</p>
-"""
-
-DELETE_PAGE = """
+DELETE_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import cancel, what_goes %}
 {%- set heading %}Remove <code>{{ box.address }}</code>?{% endset %}
 {%- set lede %}The archive of <code>{{ box.label }}</code> keeps every message. What goes is this
 person's copy of them.{% endset %}
 {%- set crumbs %}<a href="{{ url_for('mailboxes') }}">Mailboxes</a> / \
-<a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a> / Remove{% endset %}
+<a href="{{ url_for('mailbox', mailbox_id=box.id) }}"><code>{{ box.address }}</code></a> / Remove{% endset %}{% block body %}
 <div class="stack narrow">
-<section class="danger-zone">
-<div class="box-head"><h2>What goes</h2></div>
-<div class="box-body">
-<div class="kv"><div><b>{{ numbers.names }}</b><span>Names removed</span></div>\
-<div><b>1</b><span>Mailboxes removed</span></div>\
-<div><b>1</b><span>People who lose access here</span></div></div>
+{%- set button %}Remove <code>{{ box.address }}</code>{% endset %}
+{% call what_goes([(numbers.names, 'Names removed'), (1, 'Mailboxes removed'),
+                   (1, 'People who lose access here')],
+                  url_for('delete_mailbox', mailbox_id=box.id), button) -%}
 <p>Messages removed: 0 &mdash; the archive keeps everything.</p>
 <p class="muted">It is recoverable by giving the mailbox again and topping up, but the folders this
 person arranged do not come back.</p>
-<form class="form-foot" method="post" action="{{ url_for('delete_mailbox', mailbox_id=box.id) }}">\
-<button class="btn btn-danger-solid" type="submit">Remove <code>{{ box.address }}</code></button></form>
-</div>
-</section>
-<p><a href="{{ url_for('mailbox', mailbox_id=box.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
-</div>
-"""
+{%- endcall %}
+{{ cancel(url_for('mailbox', mailbox_id=box.id)) }}
+</div>{% endblock %}"""
 
 
 # --- readers -------------------------------------------------------------------------------------
@@ -331,7 +331,7 @@ def free_people(conn, domain_id, without=None):
 
 
 def card(conn, box, status=200, form=None, refusal=None, typed=None):
-    return app.render(box["address"], CARD_PAGE, section="mailboxes", status=status,
+    return app.render(box["address"], "mailboxes.CARD_PAGE", section="mailboxes", status=status,
                       box=box, columns=(), form=form, refusal=refusal,
                       typed=typed or {"message_id": ""},
                       free=free_people(conn, box["domain_id"], without=box["account_id"]))
@@ -345,7 +345,7 @@ def register(app_):
         conn = app.connection()
         period = common.timer_period()
         domain_id = common.as_int(request.args.get("domain"))  # a bad filter is no filter
-        return app.render("Mailboxes", LIST_PAGE, section="mailboxes",
+        return app.render("Mailboxes", "mailboxes.LIST_PAGE", section="mailboxes",
                           columns=("person", "domain"),
                           boxes=listing(conn, domain_id, period))
 
@@ -378,15 +378,19 @@ def register(app_):
         if common.one(conn, "SELECT 1 AS yes FROM mailbox WHERE account_id = %s AND "
                             "domain_id = %s", (account_id, domain_id)):
             return add_page(conn, typed, OCCUPIED, "account_id")
+        refusal = common.not_cleared(conn, found["label"], person["login"])
+        if refusal:
+            return add_page(conn, typed, refusal, "account_id")
 
         login = f"{person['login']}@{found['label']}"
         try:
-            with common.unique_violation(conn, OCCUPIED), conn.cursor() as cursor:
+            with common.unique_violation(conn, OCCUPIED, GONE), conn.cursor() as cursor:
                 cursor.execute("INSERT INTO mailbox (account_id, domain_id) "
                                "VALUES (%s, %s) RETURNING id", (account_id, domain_id))
                 mailbox_id = cursor.fetchone()[0]
         except validate.Refused as refused:
-            return add_page(conn, typed, str(refused), "account_id")
+            return add_page(conn, typed, str(refused),
+                            None if str(refused) == GONE else "account_id")
 
         # ⛔ TWO UNITS OF WORK, SO TWO ROWS: the maildir, and then what
         # the archive already holds. A mailbox whose connect was never queued delivers
@@ -423,12 +427,17 @@ def register(app_):
         if common.one(conn, "SELECT 1 AS yes FROM mailbox WHERE account_id = %s AND "
                             "domain_id = %s", (to_account_id, box["domain_id"])):
             return card(conn, box, 400, "transfer", OCCUPIED)
+        refusal = common.not_cleared(conn, box["label"], person["login"])
+        if refusal:
+            return card(conn, box, 400, "transfer", refusal)
 
         # ⛔ the row is not moved here: the store and both index trees move with it, and
         # only the pipeline may touch them
-        asked = common.ask(conn, "transfer", box["address"],
-                           {"mailbox_id": mailbox_id, "to_account_id": to_account_id},
-                           g.identity)
+        asked = common.ask_once(conn, "transfer", box["address"],
+                                {"mailbox_id": mailbox_id, "to_account_id": to_account_id},
+                                g.identity)
+        if asked is None:
+            return common.acted("mailboxes", "already_asked")
         # ⚠️ the recipient's LOGIN beside their row id: a row naming an id alone stops
         # being readable the day that account is deleted (settled)
         record(conn, "transfer", box["address"],
@@ -442,11 +451,13 @@ def register(app_):
         conn = app.connection()
         box = needed(conn, mailbox_id, common.timer_period())
         if request.method == "GET":
-            return app.render(f"Remove {box['address']}?", DELETE_PAGE, section="mailboxes",
+            return app.render(f"Remove {box['address']}?", "mailboxes.DELETE_PAGE", section="mailboxes",
                               box=box,
                               numbers=common.one(conn, REMOVAL, (mailbox_id,)))
-        asked = common.ask(conn, "delete_mailbox", box["address"],
-                           {"mailbox_id": mailbox_id}, g.identity)
+        asked = common.ask_once(conn, "delete_mailbox", box["address"],
+                                {"mailbox_id": mailbox_id}, g.identity)
+        if asked is None:
+            return common.acted("mailboxes", "already_asked")
         record(conn, "delete_mailbox", box["address"], {"requested": True},
                        request_id=asked)
         return common.acted("mailboxes", "mailbox_removal_asked")
@@ -459,7 +470,7 @@ def add_page(conn, typed, refusal=None, fault=None):
         conn, "SELECT 1 AS yes FROM domain WHERE id = %s", (domain_id,))
     people = (common.rows(conn, FREE_PEOPLE, (domain_id,)) if known
               else common.rows(conn, EVERYONE))
-    return app.render("Give someone a mailbox", ADD_PAGE, section="mailboxes",
+    return app.render("Give someone a mailbox", "mailboxes.ADD_PAGE", section="mailboxes",
                       status=400 if refusal else 200, typed=typed,
                       domains=common.rows(conn, ALL_DOMAINS), people=people,
                       narrowed=bool(known), refusal=refusal, fault=fault)

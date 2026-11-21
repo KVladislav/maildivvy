@@ -26,6 +26,8 @@ would leave the domain in a state nobody chose in between; and what
 happens to outgoing mail too large to scan.
 """
 
+from datetime import datetime, time, timedelta, timezone
+
 from flask import abort, g, request
 
 from maildivvy.admin import app, auth, validate
@@ -69,11 +71,37 @@ SELECT (SELECT count(*) FROM message WHERE domain_id = %(id)s)  AS messages,
                             WHERE m.account_id = a.id AND m.domain_id <> %(id)s)) AS people
 """
 
+# ⚠️ A DOMAIN'S ARCHIVE IS READ A PAGE AT A TIME, NEWEST FIRST, AND EVERY MESSAGE IS
+# REACHABLE. It is the one screen that shows a message's id, which "deliver one message
+# by id" asks for, and an import brings up to half a million messages into one domain.
+# A page starts after the last row of the one before (`before`, keyset on
+# `(received_at, id)`, as the withheld list pages), and narrows by the day it arrived by
+# and by a piece of its sender or subject. `message_domain_received_idx` serves it: the
+# start of a page is an index bound, not a count of the rows before it.
+LIMIT = 200
 LISTING = """
 SELECT id, received_at, message_date, sender, subject, state, is_spam, spam_score,
        archive_uid
-  FROM message WHERE domain_id = %s ORDER BY received_at DESC, id DESC LIMIT 500
+  FROM message
+ WHERE domain_id = %(domain)s
+   AND received_at < %(until)s
+   AND received_at <= COALESCE((SELECT o.received_at FROM message o
+                                 WHERE o.id = %(before)s AND o.domain_id = %(domain)s),
+                               'infinity')
+   AND (%(before)s IS NULL
+        OR (received_at, id) < (SELECT o.received_at, o.id FROM message o
+                                 WHERE o.id = %(before)s AND o.domain_id = %(domain)s))
+   AND (%(like)s IS NULL OR sender ILIKE %(like)s OR subject ILIKE %(like)s)
+ ORDER BY received_at DESC, id DESC
+ LIMIT %(limit)s
 """
+CAPPED = ("Only the newest {limit} messages{matching} are shown. Every one is reachable: "
+          "the older ones are on the next page, or narrow by the day or the sender.")
+NO_OLDER = "No older message matches."
+NOTHING = "Nothing in the archive yet."
+NO_MATCH = "No message matches."
+SEARCH_HELP = "A piece of the sender's address or of the subject, in any case."
+UNTIL_HELP = "YYYY-MM-DD, in UTC: that day and every day before it."
 
 
 # --- the bits of markup the screens share (in the design's components) -------------
@@ -109,9 +137,10 @@ IN_FRONT = """
 {%- endmacro -%}
 """
 
-LIST_PAGE = IN_FRONT + """
+LIST_PAGE = """{% extends "app.SHELL" %}
+{%- from "domains.IN_FRONT" import in_front, listing_link, journal_link %}
 {%- set heading %}Domains{% endset %}
-{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_domain') }}">Add domain</a>{% endset %}
+{%- set actions %}<a class="btn btn-primary" href="{{ url_for('add_domain') }}">Add domain</a>{% endset %}{% block body %}
 <section class="box"><div class="table-wrap"><table>
 <thead><tr><th>Label</th><th>External mailbox in front</th><th class="num">Mailboxes</th>\
 <th class="num">In the archive</th><th class="acts">Actions</th></tr></thead>
@@ -130,15 +159,15 @@ LIST_PAGE = IN_FRONT + """
 <tr><td colspan="5">No domain yet. Every domain has an archive, made in the same act.</td></tr>
 {%- endfor %}
 </tbody>
-</table></div></section>
-"""
+</table></div></section>{% endblock %}"""
 
-ADD_PAGE = IN_FRONT + """
+ADD_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, refused, field %}
 {%- set heading %}Add domain{% endset %}
-{%- set crumbs %}<a href="{{ url_for('domains') }}">Domains</a> / Add domain{% endset %}
+{%- set crumbs %}<a href="{{ url_for('domains') }}">Domains</a> / Add domain{% endset %}{% block body %}
 {%- set about %}Every domain has an archive, the canonical copy of its mail, with a read-only
 login of its own (<code>{{ archive }}@&lt;label&gt;</code>). It is made in this same act.{% endset %}
-<form class="narrow" method="post" action="{{ url_for('add_domain') }}">
+<form class="narrow" method="post" action="{{ url_for('add_domain') }}">{{ csrf() }}
 {{ refused(refusal) }}
 <section class="box"><div class="box-body">
 {{ field('Label', 'label', typed.label, class_='mono-input mid',
@@ -150,20 +179,22 @@ login of its own (<code>{{ archive }}@&lt;label&gt;</code>). It is made in this 
 </div></section>
 <div class="form-foot"><button class="btn btn-primary" type="submit">Add domain</button>\
 <a class="btn" href="{{ url_for('domains') }}">Cancel, nothing changes</a></div>
-</form>
-"""
+</form>{% endblock %}"""
 
-DOMAIN_PAGE = IN_FRONT + mailboxes.SHAPE + """
+DOMAIN_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import refused, danger_zone, setting %}
+{%- from "domains.IN_FRONT" import in_front, listing_link, journal_link %}
+{%- from "mailboxes.SHAPE" import mailbox_head, mailbox_row %}
 {%- set heading %}<code>{{ row.label }}</code>{% endset %}
 {%- set lede %}In front of it: {{ in_front(row) }}.
 {%- if not row.external_id and not row.waiting %}
 Free &mdash; no external mailbox in front of it, so nothing arrives and nothing leaves.
 {%- endif %}
 {{ row.mailboxes }} mailbox(es).
-{{ row.messages }} message(s) in the archive{% if row.newest %}, the newest at {{ row.newest }}{% endif %}.{% endset %}
+{{ row.messages }} message(s) in the archive{% if row.newest %}, the newest at {{ row.newest|moment }}{% endif %}.{% endset %}
 {%- set actions %}{{ listing_link(row, 'btn') }} \
 {{ journal_link(row.label, 'Journal for this domain', 'btn') }}{% endset %}
-{%- set crumbs %}<a href="{{ url_for('domains') }}">Domains</a> / <code>{{ row.label }}</code>{% endset %}
+{%- set crumbs %}<a href="{{ url_for('domains') }}">Domains</a> / <code>{{ row.label }}</code>{% endset %}{% block body %}
 <div class="stack">
 <section class="box">
 <div class="box-head"><h2>Mailboxes</h2><a class="btn btn-sm btn-primary" \
@@ -213,13 +244,14 @@ Delete that external mailbox first; its deletion page offers to take the domain 
 Delete this domain&hellip;</a>{% endset %}
 {%- endif %}
 {{ danger_zone(sentence, why, control) }}
-</div>
-"""
+</div>{% endblock %}"""
 
-SPAM_PAGE = IN_FRONT + """
+SPAM_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, refused, field %}
+{%- from "domains.IN_FRONT" import way %}
 {%- set heading %}Spam at <code>{{ row.label }}</code>{% endset %}
-{%- set crumbs %}{{ way(row) }} / Spam{% endset %}
-<form class="narrow" method="post" action="{{ url_for('domain_spam', domain_id=row.id) }}">
+{%- set crumbs %}{{ way(row) }} / Spam{% endset %}{% block body %}
+<form class="narrow" method="post" action="{{ url_for('domain_spam', domain_id=row.id) }}">{{ csrf() }}
 {{ refused(refusal) }}
 <section class="box"><div class="box-body">
 <label class="choice"><input type="checkbox" name="reaches" value="yes"{{ ' checked' if typed.reaches }}>\
@@ -236,16 +268,17 @@ and a stored message is never rewritten.{% endset %}
 </div></section>
 <div class="form-foot"><button class="btn btn-primary" type="submit">Save spam policy</button>\
 <a class="btn" href="{{ url_for('domain', domain_id=row.id) }}">Cancel, nothing changes</a></div>
-</form>
-"""
+</form>{% endblock %}"""
 
-ARCHIVE_PAGE = IN_FRONT + """
+ARCHIVE_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import refused, field, setting %}
+{%- from "domains.IN_FRONT" import listing_link, way %}
 {%- set heading %}<code>{{ archive }}@{{ row.label }}</code>{% endset %}
 {%- set lede %}The archive is this domain's canonical copy: every person's mailbox here is a
 hardlink into it. Its login is read-only and is shared by every administrator who reads this
 domain, so it is what changes when one of them leaves. Nothing reminds anyone to rotate it.{% endset %}
 {%- set actions %}{{ listing_link(row, 'btn') }}{% endset %}
-{%- set crumbs %}{{ way(row) }} / Archive{% endset %}
+{%- set crumbs %}{{ way(row) }} / Archive{% endset %}{% block body %}
 <div class="stack">
 <section class="box"><div class="box-body">
 <p>Status: {% if reading.waiting %}{{ reading.waiting }}. {{ reading.look_again }}
@@ -265,10 +298,11 @@ ACL of look, read and mark-seen.</p>
 {{ setting(url_for('archive_password', domain_id=row.id), 'Archive password', none, fields,
            'Replace the archive password', primary=true) }}
 </div></section>
-</div>
-"""
+</div>{% endblock %}"""
 
-LISTING_PAGE = IN_FRONT + """
+LISTING_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import back, flash, refused, field %}
+{%- from "domains.IN_FRONT" import way %}
 {%- set heading %}Archive listing for <code>{{ row.label }}</code>{% endset %}
 {%- set lede %}Four fields of each row: the date the message carries, when it arrived, who sent
 it and its subject. Never a body: this screen reads those columns of the ledger and this
@@ -276,42 +310,65 @@ process cannot open a mail file at all. The id is what
 <a href="{{ url_for('mailboxes', domain=row.id) }}">deliver one message by id</a> takes.
 A message with no date of its own reads <em>arrived</em> and its arrival time; a date is
 never invented.{% endset %}
-{%- set crumbs %}{{ way(row) }} / Archive listing{% endset %}
+{%- if older %}{% set actions %}<a class="btn" href="{{ url_for('archive_listing', domain_id=row.id, before=older, **narrowed) }}">\
+Older messages</a>{% endset %}{% endif %}
+{%- set crumbs %}{{ way(row) }} / Archive listing
+{%- if before is not none %} / <a href="{{ url_for('archive_listing', domain_id=row.id, **narrowed) }}">{{ back() }} \
+Newest messages</a>{% endif %}{% endset %}{% block body %}
+{{ refused(refusal) }}
+<div class="stack">
+<section class="box"><div class="box-body">
+<form method="get" action="{{ url_for('archive_listing', domain_id=row.id) }}">
+<div class="inline-fields">
+  {{ field('Sender or subject', 'q', typed.q, help=search_help) }}
+  {{ field('Arrived on or before', 'until', typed.until, help=until_help,
+           warn=refusal if fault == 'until', class_='mono-input') }}
+</div>
+<div class="form-foot"><button class="btn" type="submit">Narrow</button> \
+<a href="{{ url_for('archive_listing', domain_id=row.id) }}">Show the newest</a></div>
+</form>
+</div></section>
+{%- if capped %}
+{{ flash('attn', 'alert', capped) }}
+{%- endif %}
 <section class="box"><div class="table-wrap"><table>
 <thead><tr><th>Date</th><th>From</th><th>Subject</th><th class="num">Id</th><th>State</th>\
 <th class="num">Score</th></tr></thead>
 <tbody>
 {%- for message in messages %}
-<tr><td>{% if message.message_date %}{{ message.message_date }}
-    {%- else %}<span class="muted">arrived</span> {{ message.received_at }}
+<tr><td>{% if message.message_date %}{{ message.message_date|moment }}
+    {%- else %}<span class="muted">arrived</span> {{ message.received_at|moment }}
     <span class="row-sub"><span class="badge off">no date in the message</span></span>{% endif %}</td>
     <td><code>{{ message.sender or '' }}</code></td><td class="wrap">{{ message.subject or '' }}</td>
     <td class="num"><code class="message-id">{{ message.id }}</code></td>
     <td>{{ message.state }}{% if message.is_spam %} <span class="badge">spam</span>{% endif %}</td>
     <td class="num">{{ message.spam_score if message.spam_score is not none else '' }}</td></tr>
 {%- else %}
-<tr><td colspan="6">Nothing in the archive yet.</td></tr>
+<tr><td colspan="6">{{ nothing }}</td></tr>
 {%- endfor %}
 </tbody>
 </table></div></section>
-"""
+</div>{% endblock %}"""
 
-NOT_YET_PAGE = IN_FRONT + """
+NOT_YET_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import back, flash %}
+{%- from "domains.IN_FRONT" import way %}
 {%- set heading %}Waiting for the pipeline{% endset %}
-{%- set crumbs %}{{ way(row) }} / Archive listing{% endset %}
+{%- set crumbs %}{{ way(row) }} / Archive listing{% endset %}{% block body %}
 <div class="narrow">
 {%- set not_yet %}The archive of
 <code>{{ row.label }}</code> is not there yet: its creation was asked for at
-{{ row.asked_at.strftime('%H:%M') }} and the pipeline has not performed it. There is nothing
+{{ row.asked_at|moment }} and the pipeline has not performed it. There is nothing
 to list until it has.{% endset %}
 {{ flash('attn', 'clock', not_yet) }}
-<p><a href="{{ url_for('domain', domain_id=row.id) }}">""" + common.BACK + """ Back to the domain</a></p>
-</div>
-"""
+<p><a href="{{ url_for('domain', domain_id=row.id) }}">{{ back() }} Back to the domain</a></p>
+</div>{% endblock %}"""
 
-DELETE_PAGE = IN_FRONT + """
+DELETE_PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import cancel, refused, what_goes %}
+{%- from "domains.IN_FRONT" import way %}
 {%- set heading %}Delete the domain <code>{{ row.label }}</code>?{% endset %}
-{%- set crumbs %}{{ way(row) }} / Delete{% endset %}
+{%- set crumbs %}{{ way(row) }} / Delete{% endset %}{% block body %}
 <div class="stack narrow">
 {%- if row.external_id %}
 {%- set occupied %}<b>Refused: \
@@ -322,23 +379,17 @@ under it would take away the archive its mail is in. Delete that external mailbo
 page</a> offers to take this domain along{% endif %}.{% endset %}
 {{ refused(occupied) }}
 {%- else %}
-<section class="danger-zone">
-<div class="box-head"><h2>What goes</h2></div>
-<div class="box-body">
-<p>This is the largest destructive act in the interface. It removes:</p>
-<div class="kv"><div><b>{{ numbers.messages }}</b><span>Messages removed</span></div>\
-<div><b>{{ numbers.mailboxes }}</b><span>Mailboxes removed</span></div>\
-<div><b>{{ numbers.people }}</b><span>People who lose their only mailbox</span></div></div>
+{%- set before %}<p>This is the largest destructive act in the interface. It removes:</p>{% endset %}
+{%- set button %}Delete <code>{{ row.label }}</code> and everything in it{% endset %}
+{% call what_goes([(numbers.messages, 'Messages removed'), (numbers.mailboxes, 'Mailboxes removed'),
+                   (numbers.people, 'People who lose their only mailbox')],
+                  url_for('delete_domain', domain_id=row.id), button, before) -%}
 <p class="muted">Disk space is not stated: the store is hardlinked, so no per-domain byte
 count would be an honest one.</p>
-<form class="form-foot" method="post" action="{{ url_for('delete_domain', domain_id=row.id) }}">\
-<button class="btn btn-danger-solid" type="submit">Delete <code>{{ row.label }}</code> and everything in it</button></form>
-</div>
-</section>
+{%- endcall %}
 {%- endif %}
-<p><a href="{{ url_for('domain', domain_id=row.id) }}">""" + common.BACK + """ Cancel, nothing changes</a></p>
-</div>
-"""
+{{ cancel(url_for('domain', domain_id=row.id)) }}
+</div>{% endblock %}"""
 
 
 # --- readers ----------------------------------------------------------------------------------
@@ -362,7 +413,7 @@ def register(app_):
     @app_.get("/domains")
     def domains():
         conn = app.connection()
-        return app.render("Domains", LIST_PAGE, section="domains", archive=ARCHIVE,
+        return app.render("Domains", "domains.LIST_PAGE", section="domains", archive=ARCHIVE,
                           domains=common.rows(conn, LIST + " ORDER BY d.label"))
 
     @app_.route("/domains/add", methods=["GET", "POST"])
@@ -370,7 +421,7 @@ def register(app_):
         conn = app.connection()
         typed = {"label": request.form.get("label", "") if request.method == "POST" else ""}
         if request.method == "GET":
-            return app.render("Add domain", ADD_PAGE, section="domains", archive=ARCHIVE,
+            return app.render("Add domain", "domains.ADD_PAGE", section="domains", archive=ARCHIVE,
                               typed=typed, refusal=None, fault=None)
         try:
             # ⛔ the order is the form's: the archive's password first, because a domain
@@ -385,32 +436,22 @@ def register(app_):
         except validate.Refused as refused:
             return refuse_add(typed, str(refused), "label")
 
-        taken = f"There is already a domain called {label}."
-        if common.one(conn, "SELECT 1 AS yes FROM domain WHERE label = %s", (label,)):
-            return refuse_add(typed, taken, "label")
+        if label_taken(conn, label):
+            return refuse_add(typed, taken(label), "label")
+        refusal = common.not_cleared(conn, label)
+        if refusal:
+            return refuse_add(typed, refusal, "label")
         try:
-            with common.unique_violation(conn, taken), conn.cursor() as cursor:
-                cursor.execute("INSERT INTO domain (label, archive_password_hash) "
-                               "VALUES (%s, %s) RETURNING id",
-                               (label, auth_hash(password)))
-                domain_id = cursor.fetchone()[0]
+            create_domain(conn, label, password)
         except validate.Refused as refused:
             return refuse_add(typed, str(refused), "label")
-
-        # the disk work is the pipeline's; the row that asked names the request, so the
-        # journal can answer whether it was performed and why not
-        request_id = common.ask(conn, "create_domain", label, {"domain_id": domain_id},
-                                g.identity)
-        record(conn, "create_domain", label, {"archive": f"{ARCHIVE}@{label}"},
-               request_id=request_id)
-        record(conn, "set_archive_password", label, {"archive_password_set": True})
         return common.acted("domains", "domain_created")
 
     @app_.get("/domains/<int:domain_id>")
     def domain(domain_id):
         conn = app.connection()
         row = needed(conn, domain_id)
-        return app.render(row["label"], DOMAIN_PAGE, section="domains", archive=ARCHIVE,
+        return app.render(row["label"], "domains.DOMAIN_PAGE", section="domains", archive=ARCHIVE,
                           row=row, boxes=mailboxes.listing(conn, domain_id, common.timer_period()),
                           outbound_refusal=None)
 
@@ -421,7 +462,7 @@ def register(app_):
         if request.method == "GET":
             typed = {"reaches": row["spam_reaches_people"],
                      "threshold": f"{row['spam_threshold']:.2f}"}
-            return app.render(f"Spam at {row['label']}", SPAM_PAGE, section="domains",
+            return app.render(f"Spam at {row['label']}", "domains.SPAM_PAGE", section="domains",
                               row=row, typed=typed, refusal=None, fault=None)
 
         # ⚠️ the switch comes back in the position it was LEFT IN, not as the column
@@ -431,7 +472,7 @@ def register(app_):
         try:
             threshold = validate.spam_threshold(typed["threshold"])
         except validate.Refused as refused:
-            return app.render(f"Spam at {row['label']}", SPAM_PAGE, section="domains",
+            return app.render(f"Spam at {row['label']}", "domains.SPAM_PAGE", section="domains",
                               status=400, row=row, typed=typed,
                               refusal=str(refused), fault="threshold")
 
@@ -456,7 +497,7 @@ def register(app_):
         row = needed(conn, domain_id)
         chosen = request.form.get("outbound_unscanned")
         if chosen not in ("send", "refuse"):
-            return app.render(row["label"], DOMAIN_PAGE, section="domains", status=400,
+            return app.render(row["label"], "domains.DOMAIN_PAGE", section="domains", status=400,
                               archive=ARCHIVE, row=row,
                               boxes=mailboxes.listing(conn, domain_id, common.timer_period()),
                               outbound_refusal="Outgoing mail too large to scan is either "
@@ -489,7 +530,7 @@ def register(app_):
             return archive_page(conn, row, status=400, refusal=str(refused))
         with conn.cursor() as cursor:
             cursor.execute("UPDATE domain SET archive_password_hash = %s WHERE id = %s",
-                           (auth_hash(password), domain_id))
+                           (auth.make_hash(password), domain_id))
         record(conn, "set_archive_password", row["label"], {"archive_password_set": True})
         return common.acted("archive_card", "archive_password_set", domain_id=domain_id)
 
@@ -499,11 +540,9 @@ def register(app_):
         conn = app.connection()
         row = needed(conn, domain_id)
         if row["waiting"]:
-            return app.render(f"{row['label']} archive listing", NOT_YET_PAGE,
+            return app.render(f"{row['label']} archive listing", "domains.NOT_YET_PAGE",
                               section="domains", status=400, row=row)
-        return app.render(f"{row['label']} archive listing", LISTING_PAGE,
-                          section="domains", row=row,
-                          messages=common.rows(conn, LISTING, (domain_id,)))
+        return listing_page(conn, row)
 
     @app_.route("/domains/<int:domain_id>/delete", methods=["GET", "POST"])
     def delete_domain(domain_id):
@@ -513,20 +552,100 @@ def register(app_):
         occupied = row["external_id"] is not None
         if request.method == "GET" or occupied:
             numbers = common.one(conn, NUMBERS, {"id": domain_id})
-            return app.render(f"Delete {row['label']}?", DELETE_PAGE, section="domains",
+            return app.render(f"Delete {row['label']}?", "domains.DELETE_PAGE", section="domains",
                               status=400 if occupied else 200,
                               row=row, numbers=numbers)
-        request_id = common.ask(conn, "delete_domain", row["label"],
-                                {"domain_id": domain_id}, g.identity)
+        request_id = common.ask_once(conn, "delete_domain", row["label"],
+                                     {"domain_id": domain_id}, g.identity)
+        if request_id is None:
+            return common.acted("domains", "already_asked")
         record(conn, "delete_domain", row["label"], {"requested": True},
                request_id=request_id)
         return common.acted("domains", "domain_deletion_asked")
 
 
+# --- the archive listing --------------------------------------------------------------------
+
+def like_pattern(typed):
+    """`typed` as an ILIKE pattern that matches it anywhere, its own `%`, `_` and `\\`
+    taken as themselves; None for nothing typed."""
+    if not typed:
+        return None
+    escaped = typed.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def listing_page(conn, row):
+    """One page of the domain's archive, newest first, narrowed as the URL asks."""
+    typed = {"q": (request.args.get("q") or "").strip(),
+             "until": (request.args.get("until") or "").strip()}
+    before = request.args.get("before", type=int)
+    narrowed = {name: value for name, value in typed.items() if value}
+    fault = refusal = None
+    until = "infinity"
+    if typed["until"]:
+        try:
+            day = validate.calendar_date(typed["until"], "day")
+        except validate.Refused as refused:
+            fault, refusal = "until", str(refused)
+        else:
+            # the next day's start in UTC, as every moment on the screens is read
+            until = datetime.combine(day + timedelta(days=1), time(), timezone.utc)
+    found = [] if refusal else common.rows(conn, LISTING, {
+        "domain": row["id"], "until": until, "before": before,
+        "like": like_pattern(typed["q"]), "limit": LIMIT + 1})
+    messages = found[:LIMIT]
+    more = len(found) > LIMIT
+    if before is not None:
+        nothing = NO_OLDER
+    else:
+        nothing = NO_MATCH if narrowed else NOTHING
+    return app.render(f"{row['label']} archive listing", "domains.LISTING_PAGE",
+                      section="domains", status=400 if refusal else 200, row=row,
+                      messages=messages, typed=typed, narrowed=narrowed, before=before,
+                      older=messages[-1]["id"] if more else None,
+                      capped=(CAPPED.format(limit=LIMIT,
+                                            matching=" that match" if narrowed else "")
+                              if more and before is None else None),
+                      nothing=nothing, fault=fault, refusal=refusal,
+                      search_help=SEARCH_HELP, until_help=UNTIL_HELP)
+
+
 # --- writing --------------------------------------------------------------------------------
 
+def taken(label):
+    """The one sentence a label already in use is refused with, on either screen."""
+    return f"There is already a domain called {label}."
+
+
+def label_taken(conn, label):
+    return common.one(conn, "SELECT 1 AS yes FROM domain WHERE label = %s", (label,)) is not None
+
+
+def create_domain(conn, label, password):
+    """Make a domain and its archive: the row, the pipeline's request and both journal
+    rows, in the act's own transaction. The one way a domain is made, from this screen and
+    from the external mailbox's (a new domain created in the same step); returns its id.
+
+    `label` and `password` are already validated, and the caller has checked the label is
+    free. A concurrent submission that took it meanwhile is `Refused` with `taken`.
+    """
+    with common.unique_violation(conn, taken(label)), conn.cursor() as cursor:
+        cursor.execute("INSERT INTO domain (label, archive_password_hash) "
+                       "VALUES (%s, %s) RETURNING id", (label, auth.make_hash(password)))
+        domain_id = cursor.fetchone()[0]
+    # the disk work is the pipeline's; the row that asked names the request, so the
+    # journal can answer whether it was performed and why not
+    request_id = common.ask(conn, "create_domain", label, {"domain_id": domain_id},
+                            g.identity)
+    record(conn, "create_domain", label, {"archive": f"{ARCHIVE}@{label}"},
+           request_id=request_id)
+    record(conn, "set_archive_password", label, {"archive_password_set": True})
+    return domain_id
+
+
 def refuse_add(typed, refusal, fault):
-    return app.render("Add domain", ADD_PAGE, section="domains", status=400,
+    return app.render("Add domain", "domains.ADD_PAGE", section="domains", status=400,
                       archive=ARCHIVE, typed=typed, refusal=refusal, fault=fault)
 
 
@@ -535,10 +654,6 @@ def archive_page(conn, row, status=200, refusal=None):
     archives = mailboxes.listing(conn, row["id"], common.timer_period())
     reading = (archives[0]["reading"] if archives
                else common.queue_reading(None, None, None, None))
-    return app.render(f"{ARCHIVE}@{row['label']}", ARCHIVE_PAGE, section="domains",
+    return app.render(f"{ARCHIVE}@{row['label']}", "domains.ARCHIVE_PAGE", section="domains",
                       status=status, archive=ARCHIVE, row=row, refusal=refusal,
                       reading=reading)
-
-
-def auth_hash(password):
-    return auth.make_hash(password)

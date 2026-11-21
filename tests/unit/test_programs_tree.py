@@ -1,12 +1,13 @@
 """The programs role's code tree: what is deployed to /opt/maildivvy, and how.
 
 The module compares the deployed tree with the archive the install packs, and replaces
-it by removing the destination first when they differ. Owners are the
+it by swapping a whole new tree in when they differ. Owners are the
 test's own ids here; the role passes root's.
 """
 
 import io
 import os
+import shutil
 import stat
 import tarfile
 from pathlib import Path
@@ -15,7 +16,7 @@ import pytest
 import yaml
 
 from maildivvy.lib import config
-from maildivvy_tree import TreeError, actual_tree, differences, expected_tree, replace
+from maildivvy_tree import TreeError, actual_tree, changes, differences, expected_tree, replace
 
 OWNER = (os.getuid(), os.getgid())
 ROLE_VARS = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "programs" / "vars" / "main.yml"
@@ -89,6 +90,38 @@ def test_stale_files_and_a_nested_copy_are_differences_and_the_replacement_remov
     replace(archive, dest, owner=OWNER)
     assert not (dest / "lib/lib").exists() and not (dest / "lib/maildivvy/old.py").exists()
     assert (dest / "lib/maildivvy/lib/store.py").is_file()  # the control: the tree is back
+
+
+def test_a_replacement_keeps_a_whole_tree_at_the_destination_throughout(tmp_path, archive, monkeypatch):
+    dest = tmp_path / "opt"
+    replace(archive, dest, owner=OWNER)
+    (dest / "lib/maildivvy/old.py").write_text("stale")
+    seen = []
+
+    def watched(real):
+        def call(*args, **kwargs):
+            seen.append((dest / "lib/maildivvy/__init__.py").is_file())
+            real(*args, **kwargs)
+            seen.append((dest / "lib/maildivvy/__init__.py").is_file())
+        return call
+
+    monkeypatch.setattr(shutil, "rmtree", watched(shutil.rmtree))
+    monkeypatch.setattr(os, "rename", watched(os.rename))
+    replace(archive, dest, owner=OWNER)
+    assert seen and all(seen), seen
+    assert not (dest / "lib/maildivvy/old.py").exists()  # the control: the tree was replaced
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["code.tar", "opt"]  # the old tree is gone
+
+
+def test_an_old_tree_a_killed_run_left_beside_a_whole_one_is_a_change_the_replacement_removes(tmp_path):
+    archive = pack(tmp_path / "code.tar", {"lib/x.py": b""})
+    dest = tmp_path / "opt"
+    replace(archive, dest, owner=OWNER)
+    assert changes(archive, dest, owner=OWNER) == []  # the control
+    (tmp_path / "opt.new/lib").mkdir(parents=True)
+    assert changes(archive, dest, owner=OWNER) == [f"leftover {tmp_path / 'opt.new'}"]
+    replace(archive, dest, owner=OWNER)
+    assert changes(archive, dest, owner=OWNER) == [] and not (tmp_path / "opt.new").exists()
 
 
 def test_changed_content_a_missing_file_and_a_wrong_mode_are_differences(tmp_path, archive):

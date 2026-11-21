@@ -24,6 +24,7 @@ import socketserver
 import ssl
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,6 +80,20 @@ def read_log(path):
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def settled_length(path, bound=5.0):
+    """The log's length once every session it records has closed. A stub writes `closed`
+    from its own thread after the client has left, so a length read at once may miss it
+    under load, and the late line then reads as a new one."""
+    ended = time.monotonic() + bound
+    while time.monotonic() < ended:
+        records = read_log(path)
+        opened = sum(r.get("event") == "connect" for r in records)
+        if opened == sum(r.get("event") == "closed" for r in records):
+            return len(records)
+        time.sleep(0.05)
+    return len(read_log(path))
 
 
 def text(line):

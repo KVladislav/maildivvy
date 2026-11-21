@@ -75,3 +75,103 @@ def test_the_program_binds_a_unix_socket_and_names_no_port_anywhere():
     assert "AF_INET" not in text and "SO_REUSEADDR" not in text
     assert run.SOCKET == "/run/maildivvy/admin/admin.sock"
     assert run.MODE == 0o660
+
+
+def test_the_server_handles_no_more_requests_at_once_than_its_threads(monkeypatch):
+    # a request past the bound waits for a thread rather than starting one, so a burst
+    # of sign-ins never holds more database connections than there are threads
+    import os
+    import socket
+    import threading
+    import time
+
+    monkeypatch.setattr(run, "THREADS", 2)
+    lock = threading.Lock()
+    active, most = [0], [0]
+
+    def application(_environ, start_response):
+        with lock:
+            active[0] += 1
+            most[0] = max(most[0], active[0])
+        time.sleep(0.1)
+        with lock:
+            active[0] -= 1
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    address = f"\0maildivvy-test-{os.getpid()}"       # an abstract socket: no file to clean
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(address)
+    sock.listen(16)
+    server = run.UnixServer(sock, application)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    answers = []
+
+    def request():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(address)
+            client.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            answers.append(b"".join(iter(lambda: client.recv(4096), b"")))
+
+    try:
+        clients = [threading.Thread(target=request) for _ in range(8)]
+        for client in clients:
+            client.start()
+        for client in clients:
+            client.join(timeout=10)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert len(answers) == 8 and all(a.startswith(b"HTTP/1.0 200") for a in answers)
+    assert most[0] == 2
+
+
+# The service as systemd stops it: one slow request in flight, then SIGTERM.
+SERVED = """
+import sys, time
+from maildivvy.admin import run
+
+def application(_environ, start_response):
+    print("inside", flush=True)
+    time.sleep(1)
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"finished"]
+
+path = sys.argv[1]
+run.serve(run.UnixServer(run.listen(path), application), path)
+print("returned", flush=True)
+"""
+
+
+def test_sigterm_lets_the_request_in_flight_finish_then_removes_the_socket(tmp_path):
+    import os
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    path = tmp_path / "admin.sock"
+    source = str(Path(run.__file__).resolve().parents[2])
+    served = subprocess.Popen([sys.executable, "-c", SERVED, str(path)],
+                              env={**os.environ, "PYTHONPATH": source},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for _ in range(100):
+            if path.is_socket():
+                break
+            time.sleep(0.05)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(path))
+            client.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            assert served.stdout.readline() == "inside\n"   # the request is being answered
+            served.send_signal(signal.SIGTERM)
+            answer = b"".join(iter(lambda: client.recv(4096), b""))
+        rest, err = served.communicate(timeout=10)
+    finally:
+        served.kill()
+    assert answer.startswith(b"HTTP/1.0 200") and answer.endswith(b"finished"), answer
+    assert served.returncode == 0 and "returned" in rest, (served.returncode, err)
+    assert not path.exists()

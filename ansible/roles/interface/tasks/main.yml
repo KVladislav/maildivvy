@@ -12,7 +12,7 @@
 # networks since step 3; and the certificate's deploy hook reloading the proxy, which is
 # how nginx re-reads a renewed pair.
 
-# --- the proxy's package and its access to the key ----------------------------------------
+# --- the proxy's package --------------------------------------------------------------------
 
 - name: Install the reverse proxy, the distribution's
   ansible.builtin.apt:
@@ -22,30 +22,33 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
 
-# ⛔ the proxy holds the certificate, so the proxy's user is the one in ssl-cert; the
-# interface's user joins nothing at all (read in the direction of).
-- name: The account the proxy runs as joins ssl-cert
-  ansible.builtin.user:
-    name: "{{ maildivvy_interface_proxy_user }}"
-    groups: "{{ maildivvy_interface_proxy_groups }}"
-    append: true
-
-# The hook republishes the pair and reloads every consumer that is installed; the proxy
-# is now one of them. It is lego's, so there is nothing to re-run on a self-signed machine.
-- name: Run the certificate's deploy hook again, now that the proxy reads the key
+# ⛔ NO GROUP FOR THE KEY: nginx's master reads the pair as root when it loads
+# the configuration, and its workers, which run as the proxy's user, never open it. So
+# the proxy's user is not put in `ssl-cert`, and the interface's user joins nothing at all
+# (read in the direction of). A machine an earlier version installed
+# has the proxy's user there; it leaves, and the proxy is restarted below while any of its
+# workers still holds the group, which a running one keeps from its start - read
+# from the processes, not from this run, so a run stopped between the two is finished by
+# the next.
+- name: Read who is in ssl-cert
   ansible.builtin.command:
-    argv: ["{{ maildivvy_interface_cert_program }}", deploy]
-  when: maildivvy_cert_mode != 'self-signed'
+    argv: [getent, group, ssl-cert]
+  register: maildivvy_interface_ssl_cert
+  changed_when: false
+
+- name: The account the proxy runs as leaves ssl-cert, which an earlier version gave it
+  ansible.builtin.command:
+    argv: [gpasswd, -d, "{{ maildivvy_interface_proxy_user }}", ssl-cert]
+  when: maildivvy_interface_proxy_user in maildivvy_interface_ssl_cert.stdout.split(':')[3].split(',')
   changed_when: true
 
-- name: The published pair is readable by the account the proxy runs as
+# `ps` exits 1 when the account runs nothing
+- name: Read the groups the proxy's workers hold
   ansible.builtin.command:
-    # ⚠️ the shell's own `test`, never /usr/bin/test: Ubuntu 26.04's coreutils are
-    # uutils', whose `test -r` answers from the owner and group alone and ignores the
-    # supplementary group that is the whole point here.
-    argv: [runuser, -u, "{{ maildivvy_interface_proxy_user }}", --, sh, -c, 'test -r "$1"', -, "{{ item }}"]
-  loop: ["{{ maildivvy_interface_cert }}", "{{ maildivvy_interface_key }}"]
+    argv: [ps, -u, "{{ maildivvy_interface_proxy_user }}", -o, supgrp=]
+  register: maildivvy_interface_proxy_running_groups
   changed_when: false
+  failed_when: maildivvy_interface_proxy_running_groups.rc not in [0, 1]
 
 # --- the interface's socket directory, at every boot --------------------------
 
@@ -83,28 +86,29 @@
     mode: "0644"
   register: maildivvy_interface_unit_written
 
-- name: Tell systemd the unit changed
-  ansible.builtin.systemd_service:
-    daemon_reload: true
-  when: maildivvy_interface_unit_written is changed
+# a run stopped between the unit and the restart leaves it written and not loaded
+- name: Read whether systemd has loaded the interface's unit as written
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, NeedDaemonReload, --value, "{{ maildivvy_interface_unit }}"]
+  register: maildivvy_interface_unit_stale
+  changed_when: false
 
 # ⚠️ a long-running program of ours, like the milter: the timers' programs pick up new
-# code at their next run, this one holds what it imported at start.
-- name: Is any of the code newer than the running interface?
-  ansible.builtin.command:
-    argv: [sh, -c,
-           'started=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$1")" +%s 2>/dev/null || echo 0);
-            find "$2" "$3" -newermt "@${started:-0}" -print -quit', -,
-           "{{ maildivvy_interface_unit }}", "{{ maildivvy_interface_program }}",
-           "{{ maildivvy_interface_opt }}/lib/maildivvy"]
+# code at their next run, this one holds what it imported at start, and its unit as
+# systemd last loaded it.
+- name: Is the unit or any of the code newer than the running interface?
+  maildivvy_stale:
+    unit: "{{ maildivvy_interface_unit }}"
+    paths: ["/etc/systemd/system/{{ maildivvy_interface_unit }}", "{{ maildivvy_interface_program }}",
+            "{{ maildivvy_opt }}/lib/maildivvy"]
   register: maildivvy_interface_stale
-  changed_when: false
 
 - name: Restart the interface for a unit or code that changed
   ansible.builtin.systemd_service:
     name: "{{ maildivvy_interface_unit }}"
     state: restarted
-  when: maildivvy_interface_unit_written is changed or maildivvy_interface_stale.stdout != ''
+    daemon_reload: "{{ maildivvy_interface_unit_written.changed or maildivvy_interface_unit_stale.stdout == 'yes' }}"
+  when: maildivvy_interface_stale.stale or maildivvy_interface_unit_stale.stdout == 'yes'
 
 - name: The interface runs and starts at boot
   ansible.builtin.systemd_service:
@@ -187,19 +191,32 @@
     enabled: true
     state: started
 
-# nginx re-reads its configuration and its certificate on a reload, which is why the
-# deploy hook's verb for it is `reload` and not `restart`.
-- name: Reload the proxy onto the new site
+# Not "this run wrote it": a run stopped between the write and the reload leaves the
+# site as this step writes it and the proxy on the old one, for ever. The proxy's start is
+# what the site is compared with, enabling and the default's removal included (they
+# change the directory), and so the step RESTARTS it: a reload leaves no time behind it
+# to compare with (maildivvy_stale). The deploy hook still reloads it, for a renewed
+# certificate, which is not configuration.
+- name: Is the proxy's site newer than the running proxy?
+  maildivvy_stale:
+    unit: "{{ maildivvy_interface_proxy_unit }}"
+    paths:
+      - "{{ maildivvy_interface_sites_available }}/{{ maildivvy_interface_site }}"
+      - "{{ maildivvy_interface_sites_enabled }}"
+  register: maildivvy_interface_proxy_stale
+
+- name: Restart the proxy onto the new site
   ansible.builtin.systemd_service:
     name: "{{ maildivvy_interface_proxy_unit }}"
-    state: reloaded
-  when: maildivvy_interface_site_written is changed
-    or maildivvy_interface_site_enabled is changed
-    or maildivvy_interface_default_removed is changed
+    state: restarted
+  when: maildivvy_interface_proxy_stale.stale
+    or 'ssl-cert' in maildivvy_interface_proxy_running_groups.stdout | regex_findall('[^,\\s]+')
 
 # --- the step's own proofs ------------------------------------------------------------------
 
-- name: Read the configuration back out of the proxy itself
+# `nginx -T` reads the files, never the running proxy; what makes them the proxy's is the
+# restart above, whenever they are newer than its start.
+- name: Read the configuration back as the proxy parses it
   ansible.builtin.command:
     argv: [nginx, -T]
   register: maildivvy_interface_effective
@@ -209,9 +226,11 @@
   ansible.builtin.assert:
     that:
       - "'ssl_protocols ' ~ maildivvy_interface_tls_protocols ~ ';' in maildivvy_interface_effective.stdout"
-      - "'ssl_certificate ' ~ maildivvy_interface_cert ~ ';' in maildivvy_interface_effective.stdout"
-      - "'ssl_certificate_key ' ~ maildivvy_interface_key ~ ';' in maildivvy_interface_effective.stdout"
-      - maildivvy_interface_effective.stdout is not search('(?m)^\\s*listen\\s+80\\b')
+      - "'ssl_certificate ' ~ maildivvy_published_cert ~ ';' in maildivvy_interface_effective.stdout"
+      - "'ssl_certificate_key ' ~ maildivvy_published_key ~ ';' in maildivvy_interface_effective.stdout"
+      # every `listen` there is, on any address, is the site's own: nothing on 80
+      - maildivvy_interface_effective.stdout | regex_findall('^\\s*listen\\s+([^;]*);', multiline=True)
+        | map('trim') | unique | list == [maildivvy_interface_port ~ ' ssl']
     fail_msg: "the proxy is not serving what this step wrote"
     quiet: true
 

@@ -138,7 +138,6 @@
   loop: "{{ maildivvy_rspamd_files }}"
   loop_control:
     label: "{{ item.dest }}"
-  register: maildivvy_rspamd_written
 
 - name: Read what else the override tree holds
   ansible.builtin.find:
@@ -157,7 +156,6 @@
     {{ maildivvy_rspamd_tree.files | map(attribute='path') | reject('in',
        maildivvy_rspamd_files | map(attribute='dest')
        | map('regex_replace', '^', maildivvy_rspamd_dir ~ '/')) | list }}
-  register: maildivvy_rspamd_removed
 
 - name: Record the pin where health reads whether a newer release is due
   ansible.builtin.template:
@@ -202,11 +200,21 @@
 
 # --- start, or recreate for a changed pin or a changed tree --------------------------------------
 
+# Not "this run wrote it": a run stopped between the write and the recreate leaves the
+# tree as this step writes it and the scanner on the old one, for ever. The container's
+# own start is what the whole directory is compared with, a removed file included
+# (maildivvy_stale). A changed pin is compose's to see: `up` recreates for it.
+- name: Is any of the project or the override tree newer than the running scanner?
+  maildivvy_stale:
+    container: "{{ maildivvy_rspamd_container }}"
+    paths: ["{{ maildivvy_rspamd_dir }}"]
+  register: maildivvy_rspamd_stale
+
 - name: Start the scanner, recreating it for a changed pin or a changed override tree
   ansible.builtin.command:
     argv: [docker, compose, up, --detach, --remove-orphans, --force-recreate]
     chdir: "{{ maildivvy_rspamd_dir }}"
-  when: maildivvy_rspamd_written is changed or maildivvy_rspamd_removed is changed
+  when: maildivvy_rspamd_stale.stale
 
 - name: Start the scanner if it is not running
   ansible.builtin.command:
@@ -226,6 +234,10 @@
   delay: 2
 
 # --- read back what the running daemon was started with --------------------
+# `rspamadm configdump` parses the files the container mounts, not the running workers'
+# memory; what makes them the running configuration is the recreate above, whenever they
+# are newer than the container's start. The controller that could answer for the workers
+# is off, so the files and the start are what there is.
 
 - name: Read the container back
   ansible.builtin.command:
@@ -271,6 +283,7 @@
     dump: "{{ maildivvy_rspamd_configdump.stdout }}"
     bind: 'bind_socket = "/run/rspamd/rspamd.sock mode=0660 owner={{ maildivvy_rspamd_user }} group={{ maildivvy_rspamd_user }}";'
     disabled: "{{ maildivvy_rspamd_configdump.stdout_lines | select('search', 'Modules disabled .explicitly.') | first | default('') }}"
+    disabled_names: "{{ (disabled.split(':', 1) | last).split(',') | map('trim') | list }}"
   ansible.builtin.assert:
     that:
       # the override tree was read at all: the image's own `bind_socket = "*:11333"` is gone
@@ -279,6 +292,8 @@
       # a superseded module is off BY NAME, read back as disabled and never as an absence
       - "'external_relay' in disabled"
       - maildivvy_rspamd_rbls | bool or 'rbl' in disabled
+      # nothing about a message leaves for a third party, and no verdict arrives from one
+      - maildivvy_rspamd_call_outs_off | reject('in', disabled_names) | list == []
       - maildivvy_rspamd_configdump.stdout_lines | last | trim == maildivvy_rspamd_user
     fail_msg: "{{ maildivvy_rspamd_configdump.stdout }}"
     quiet: true
@@ -287,7 +302,7 @@
 # repin: a message scored through the product's own client, as the mail owner.
 - name: Score a probe message as the mail owner
   ansible.builtin.command:
-    argv: [runuser, -u, vmail, --, env, PYTHONPATH=/opt/maildivvy/lib, PYTHONDONTWRITEBYTECODE=1,
+    argv: [runuser, -u, vmail, --, env, "PYTHONPATH={{ maildivvy_opt }}/lib", PYTHONDONTWRITEBYTECODE=1,
            python3, -c, "{{ maildivvy_rspamd_probe }}"]
   register: maildivvy_rspamd_probe_read
   changed_when: false

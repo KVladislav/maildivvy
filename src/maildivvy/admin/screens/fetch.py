@@ -25,10 +25,10 @@ from datetime import date, datetime, timedelta, timezone
 from flask import g
 
 from maildivvy.admin import app
-from maildivvy.admin.screens import common, domains, external
+from maildivvy.admin.screens import common, external
 from maildivvy.admin.screens.common import (EVERY_MINUTES, EVERY_SECONDS, FETCH_TIMER,
-                                            spell, timer_period)
-from maildivvy.fetch.runner import DEFAULT_STUCK_AFTER
+                                            moment, spell, timer_period)
+from maildivvy.fetch.runner import DEFAULT_STUCK_AFTER, IMAP_STUCK_RUNS
 
 # ⚠️ The timer reading lives in `common.py` now, because every screen with a waiting row
 # needs it; the names are kept here so this screen still reads as one.
@@ -39,7 +39,13 @@ __all__ = ["EVERY_MINUTES", "EVERY_SECONDS", "FETCH_TIMER", "spell", "timer_peri
 CAUSES = {
     "unrecorded": "the fetcher could not record what it decided",
     "timeout": "killed at the runner's timeout",
+    # an IMAP mailbox waits on a person, who enables it again to set a new mark
+    "mark": ("stopped — no starting point that matches the provider's INBOX, so nothing is "
+             "collected until the mailbox is disabled and enabled again"),
     "stuck_message": "stuck on one message",
+    # a hold, not a failure of the message - nothing is skipped while it lasts
+    "store": ("held — the archive's store could not take mail, so the mail is waiting "
+              "at the provider"),
     "unreachable": "cannot reach the provider",
     "transient": "stopped by something transient",
 }
@@ -56,11 +62,12 @@ ROWS = external.ROW + " ORDER BY e.address"
 # ⚠️ The design's voices: a row's status is a word beside its icon - red for a
 # refused credential, amber for what waits on the pipeline or on a person, green for a
 # fetch that ran - or muted where nothing is fetched. The retry state beneath is amber.
-PAGE = """
+PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import csrf, refused %}
 {%- set heading %}Fetch{% endset %}
-{%- set lede %}Last run {{ last_run or 'never' }}.
-{%- if next_by %} Next by {{ next_by }}, the fetch timer's own period ({{ period }}).
-{%- else %} The fetch timer's period could not be read from the machine.{% endif %}{% endset %}
+{%- set lede %}Last run {{ last_run|moment or 'never' }}.
+{%- if next_by %} Next by {{ next_by|moment }}, the fetch timer's own period ({{ period }}).
+{%- else %} The fetch timer's period could not be read from the machine.{% endif %}{% endset %}{% block body %}
 {{ refused(refusal) }}
 <div class="stack">
 <section class="box"><div class="table-wrap"><table>
@@ -73,7 +80,7 @@ PAGE = """
   <td><a href="{{ url_for('external_mailbox', external_id=row.id) }}"><code>{{ row.address }}</code></a>
       {%- if row.comment %}<span class="row-sub">{{ row.comment }}</span>{% endif %}</td>
   <td>{% if row.domain_id %}<a href="{{ url_for('domain', domain_id=row.domain_id) }}"><code>{{ row.label }}</code></a>{% else %}&mdash;{% endif %}</td>
-  <td>{% if row.last_fetch_at %}{{ row.last_fetch_at }}{% else %}<span class="muted">never</span>{% endif %}</td>
+  <td>{% if row.last_fetch_at %}{{ row.last_fetch_at|moment }}{% else %}<span class="muted">never</span>{% endif %}</td>
   <td class="wrap">
     {%- if said.tone == 'off' %}<span class="muted">{{ said.status }}</span>
     {%- else %}<span class="state-{{ said.tone }}"><svg class="icon {{ said.tone }}"><use href="#i-{{ said.icon }}"/></svg> {{ said.status }}</span>{% endif %}
@@ -87,10 +94,10 @@ PAGE = """
     {%- if row.state != 'active' %}<span class="muted">&mdash;</span>
     {%- else %}
       {%- if row.frozen_since %}
-      <form method="post" action="{{ url_for('resume_fetch', external_id=row.id) }}">\
+      <form method="post" action="{{ url_for('resume_fetch', external_id=row.id) }}">{{ csrf() }}\
 <button class="btn btn-sm" type="submit">Resume&hellip;</button></form>
       {%- endif %}
-      <form method="post" action="{{ url_for('refetch', external_id=row.id) }}">\
+      <form method="post" action="{{ url_for('refetch', external_id=row.id) }}">{{ csrf() }}\
 <button class="btn btn-sm" type="submit">Refetch now</button></form>
     {%- endif -%}
   </td>
@@ -104,8 +111,7 @@ PAGE = """
 <code>no new mail</code>, <code>has not run yet</code>, <code>disabled &mdash; not
 fetched</code>, <code>asked to enable</code>, or an error described from what the
 fetcher recorded: {{ causes }}.</p>
-</div>
-"""
+</div>{% endblock %}"""
 
 
 # --- what one row reads ---------------------------------------------------
@@ -126,7 +132,7 @@ def status_of(row):
         return reads(DISABLED, None, "off", None)
     if row["held_since"]:
         # the antivirus could not be reached, so the mail waits at the provider
-        return reads(f"held since {row['held_since']} — the antivirus could not be "
+        return reads(f"held since {moment(row['held_since'])} — the antivirus could not be "
                      "reached, so the mail is waiting at the provider",
                      row["last_fetch_detail"], "attn", "alert")
     status = row["last_fetch_status"]
@@ -150,9 +156,9 @@ def check_of(row):
         return "asked to check the password"
     status = row["last_test_status"]
     if status == "ok":
-        return f"the password was accepted when it was checked, {row['last_test_at']}"
+        return f"the password was accepted when it was checked, {moment(row['last_test_at'])}"
     if status == "auth_failed":
-        return f"the password was refused when it was checked, {row['last_test_at']}"
+        return f"the password was refused when it was checked, {moment(row['last_test_at'])}"
     if status == "error":
         return f"the check did not get an answer ({row['last_test_detail'] or 'no detail'})"
     return "the password has not been checked yet"
@@ -162,17 +168,21 @@ def retry_of(row, now=None):
     """The retry state, in precedence order: frozen, then stuck, then nothing.
 
     The minutes left are counted against the runner's own `--stuck-after`, imported so
-    that the screen and the fetcher cannot disagree about when a skip becomes due.
+    that the screen and the fetcher cannot disagree about when a skip becomes due. An IMAP
+    mailbox also skips nothing under the runner's floor of runs stopped on the message,
+    so past the hour its reading names the runs still to come.
     """
     if row["frozen_since"]:
-        return (f"frozen since {row['frozen_since']}, after an automatic skip. Resume "
+        return (f"frozen since {moment(row['frozen_since'])}, after an automatic skip. Resume "
                 "permits the next automatic skip.")
     if row["stuck_since"]:
         now = now or datetime.now(timezone.utc)
         left = DEFAULT_STUCK_AFTER - (now - row["stuck_since"]).total_seconds()
-        due = (f"{int(left // 60)} minute(s) before the automatic skip"
-               if left > 0 else "the automatic skip is due")
-        return (f"stopped on one message since {row['stuck_since']}, {row['stuck_runs']} "
+        runs_left = (IMAP_STUCK_RUNS - row["stuck_runs"]) if row["protocol"] == "imap" else 0
+        due = (f"{int(left // 60)} minute(s) before the automatic skip" if left > 0 else
+               f"{runs_left} more run(s) stopped on it before the automatic skip"
+               if runs_left > 0 else "the automatic skip is due")
+        return (f"stopped on one message since {moment(row['stuck_since'])}, {row['stuck_runs']} "
                 f"run(s); {due}.")
     return None
 
@@ -183,12 +193,12 @@ def skip_of(row, today=None):
         return None
     if row["keep_at_provider"]:
         # nothing deletes it, so the skip stays worth saying until the next one
-        return (f"skipped message {row['last_skip_uidl']} at {row['last_skip_at']}; it is "
+        return (f"skipped message {row['last_skip_uidl']} at {moment(row['last_skip_at'])}; it is "
                 "kept at the provider, which nothing here deletes.")
     deletes_at = row["last_skip_at"].date() + timedelta(days=row["delete_window_days"])
     if deletes_at < (today or date.today()):
         return None
-    return (f"skipped message {row['last_skip_uidl']} at {row['last_skip_at']}; the "
+    return (f"skipped message {row['last_skip_uidl']} at {moment(row['last_skip_at'])}; the "
             f"provider deletes it on {deletes_at}. Nothing will remind anyone before "
             "that date.")
 
@@ -218,8 +228,8 @@ def register(app_):
             # on its next run, which is what "resume permits the next skip" means
             cursor.execute("UPDATE external_mailbox SET frozen_since = NULL, "
                            "skip_streak = 0 WHERE id = %s", (external_id,))
-        domains.record(conn, "resume_fetch", row["address_canonical"],
-                       {"frozen_since": row["frozen_since"]})
+        common.record(conn, "resume_fetch", row["address_canonical"],
+                      {"frozen_since": row["frozen_since"]})
         return common.acted("fetch", "fetch_resumed")
 
     @app_.post("/fetch/<int:external_id>/refetch")
@@ -231,8 +241,9 @@ def register(app_):
             return page(conn, status=400, refusal=(
                 f"{row['address']} is disabled, so a fetch of it would collect nothing. "
                 "Enable it first."))
-        common.ask(conn, "refetch", row["address_canonical"],
-                   {"external_mailbox_id": external_id}, g.identity)
+        if common.ask_once(conn, "refetch", row["address_canonical"],
+                           {"external_mailbox_id": external_id}, g.identity) is None:
+            return common.acted("fetch", "already_asked")
         return common.acted("fetch", "refetch_asked")
 
 
@@ -241,7 +252,7 @@ def page(conn, status=200, refusal=None):
     last_run = max((row["last_fetch_at"] for row in mailboxes
                     if row["last_fetch_at"]), default=None)
     period = timer_period()
-    return app.render("Fetch", PAGE, section="fetch", status=status,
+    return app.render("Fetch", "fetch.PAGE", section="fetch", status=status,
                       mailboxes=mailboxes,
                       reading={row["id"]: reading_of(row) for row in mailboxes},
                       last_run=last_run, period=spell(period),

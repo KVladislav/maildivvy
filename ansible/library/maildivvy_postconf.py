@@ -33,6 +33,7 @@ options:
   # `keep` names overrides ANOTHER step owns: they are neither written nor removed here,
   # and a definition this module has to rewrite is followed by putting them back.
   services: {type: dict, default: {}}
+  # main.cf parameters (`name`) and master.cf services (`<service>/<type>`) to take away
   absent: {type: list, elements: str, default: []}
   postconf: {type: path, default: /usr/sbin/postconf}
 """
@@ -111,8 +112,11 @@ def actions(main, services, absent, have_main, have_services, have_overrides):
         wanted = value_of(main[name])
         if have_main.get(name) != wanted:
             todo.append(("main", f"{name}={wanted}"))
+    # a name with no `/` is a main.cf parameter, a `<service>/<type>` a master.cf service
     for key in absent or []:
-        if key in have_services:
+        if "/" not in key and key in have_main:
+            todo.append(("remove-main", key))
+        elif key in have_services:
             todo.append(("remove-service", key))
     for key in sorted(services or {}):
         entry = services[key] or {}
@@ -140,7 +144,7 @@ def actions(main, services, absent, have_main, have_services, have_overrides):
     return todo
 
 
-ARGUMENTS = {"main": ["-e"], "service": ["-M"], "override": ["-P"],
+ARGUMENTS = {"main": ["-e"], "remove-main": ["-X"], "service": ["-M"], "override": ["-P"],
              "remove-service": ["-M", "-X"], "remove-override": ["-P", "-X"]}
 
 

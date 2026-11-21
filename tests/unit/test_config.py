@@ -73,7 +73,7 @@ def test_a_db_conf_containing_password_is_refused_wherever_it_is(tmp_path, line)
 
 @pytest.mark.parametrize("missing", ["dbname", "user", "passfile"])
 def test_a_db_conf_naming_no_passfile_database_or_user_is_refused(tmp_path, missing):
-    text = "".join(l + "\n" for l in GOOD.splitlines() if not l.startswith(missing + "="))
+    text = "".join(line + "\n" for line in GOOD.splitlines() if not line.startswith(missing + "="))
     with pytest.raises(ConfigError, match=missing):
         config.read_db_conf(write(tmp_path / "db.conf", text))
 

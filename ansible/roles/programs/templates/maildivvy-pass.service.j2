@@ -7,24 +7,29 @@
 Description=Maildivvy: record the archive's new mail and fan it out
 Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/fanout/pass_.py
 After=network-online.target postgresql.service dovecot.service
-Wants=network-online.target
+# The requests that wait on a provider are drained by their own unit, started with
+# every run of this one and never waited for.
+Wants=network-online.target maildivvy-requests.service
+# A pause holds this unit, whatever starts it: while a record of one is there a
+# start is skipped, not failed, so a timer that fires inside a pause, after a reboot too,
+# starts nothing; the program never runs on a schema or a fetch state it may not pair with.
+ConditionPathExists=!{{ maildivvy_upgrade_pause_record }}
+ConditionPathExists=!{{ maildivvy_backup_pause_record }}
 
 [Service]
 Type=oneshot
 User=vmail
 Group=vmail
 ExecStart={{ maildivvy_opt }}/bin/maildivvy-pass
-# A run that overruns the timer's period is not killed here: the next run takes each
-# cursor row with FOR UPDATE, so two passes queue per (domain, mailbox) instead of
-# reading one range twice.
+# A run that overruns the timer's period is not killed here, and no second run starts
+# beside it: the pass is a oneshot, so a tick that comes while it runs joins that run.
 TimeoutStartSec={{ maildivvy_pass_run_timeout }}
 
 # Install step 13's hardening, one set on every program of ours.
 ProtectSystem=strict
-# It makes names in the store, moves index trees on a transfer, and drains the request
-# queue: a refetch runs the fetch runner as a CHILD OF THIS UNIT, which writes the
-# fetcher's state, and deleting an external mailbox removes it.
-ReadWritePaths={{ maildivvy_store }} {{ maildivvy_index }} {{ maildivvy_var }}/fetch
+# It makes names in the store and moves index trees on a transfer. The fetcher's state
+# is not its own: the requests that write it run in maildivvy-requests.service.
+ReadWritePaths={{ maildivvy_store }} {{ maildivvy_index }}
 PrivateTmp=true
 ProtectHome=true
 NoNewPrivileges=true

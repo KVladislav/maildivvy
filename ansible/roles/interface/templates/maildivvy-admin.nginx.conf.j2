@@ -11,13 +11,17 @@ server {
 
     # The product's certificate, named explicitly: this endpoint verifies by the
     # client-facing name against the system trust store.
-    ssl_certificate {{ maildivvy_interface_cert }};
-    ssl_certificate_key {{ maildivvy_interface_key }};
+    ssl_certificate {{ maildivvy_published_cert }};
+    ssl_certificate_key {{ maildivvy_published_key }};
     # ⛔ the floor is stated here, once. The interface's TLS moved to this configuration,
     # so this line is the whole of the interface's TLS floor.
     ssl_protocols {{ maildivvy_interface_tls_protocols }};
     ssl_prefer_server_ciphers off;
     ssl_session_timeout 10m;
+    # A browser that once reached this name over valid TLS never tries it in the clear
+    # again. Nothing listens on 80, so this only stops a first plain request going out at
+    # all; a browser ignores it over a certificate it does not trust (a self-signed one).
+    add_header Strict-Transport-Security "max-age=31536000" always;
 
     server_tokens off;
     client_max_body_size 1m;
@@ -30,7 +34,13 @@ server {
         proxy_pass http://unix:{{ maildivvy_interface_socket }}:;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
-        proxy_set_header Host $host;
+        # ⛔ `$http_host`, never `$host`: the second drops the port, and the application
+        # compares `Origin` with https://<this Host>, so on any port but 443 (a tunnel,
+        # NAT) every POST, the sign-in included, would be refused as cross-origin. The
+        # value is the client's own text (nginx refuses a malformed one), which is safe:
+        # a cross-site page can set neither header, and a client that forges both only
+        # agrees with itself, with the session token still in its way.
+        proxy_set_header Host $http_host;
         # ⛔ `$remote_addr`, never `$proxy_add_x_forwarded_for`: the second APPENDS to
         # the header the browser sent, so anybody could put an address of their choosing
         # in front of their own. This overwrites it, and the application trusts the

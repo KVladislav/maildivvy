@@ -11,6 +11,7 @@ import json
 import socket
 import struct
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -139,24 +140,123 @@ def test_error_is_unscanned_never_clean(daemon):
     assert "size limit exceeded" in verdict.detail
 
 
+def read_command(conn):
+    """The NUL-terminated command clamd reads first."""
+    buf = b""
+    while not buf.endswith(b"\0"):
+        chunk = conn.recv(1)
+        if not chunk:
+            return None
+        buf += chunk
+    return buf[:-1].decode()
+
+
+def skip_stream(conn):
+    """Read the chunks after zINSTREAM up to the zero-length one, and drop them."""
+    while length := struct.unpack("!I", recv_exactly(conn, 4))[0]:
+        recv_exactly(conn, length)
+
+
+def failing(answer, pong=True):
+    """A clamd that fails on every message with `answer` (None: closes without one), and
+    answers PING when `pong`; when not, it is gone once it has failed."""
+
+    def serve(daemon, conn):
+        command = read_command(conn)
+        daemon.seen.append(command)
+        if command == "zPING":
+            if pong:
+                conn.sendall(b"PONG\0")
+            return
+        skip_stream(conn)
+        if answer is not None:
+            conn.sendall(answer.encode() + b"\0")
+        if not pong:
+            daemon.sock.close()  # gone: the PING's connect is refused
+
+    return serve
+
+
 # Read on the test VM on 2026-09-22 (clamd 1.5.4): the first is the daemon's own answer
 # with its temporary directory full; the other two are the binary's reply formats
 # (`<text>. ERROR`, `<name>: <libclamav error> ERROR`) filled with texts it and libclamav
 # carry. `INSTREAM size limit exceeded. ERROR` is the only one that is about the message.
-@pytest.mark.parametrize("answer", [
-    "Error writing to temporary file ERROR",
-    "Error processing command. ERROR",
-    "stream: Can't allocate memory ERROR",
-])
-def test_an_error_other_than_the_size_limit_is_unavailable_never_unscanned(daemon, answer):
-    """Every clamd ERROR read as *unscanned*, so a daemon failing on a message - its
+FAILURES = ["Error writing to temporary file ERROR", "Error processing command. ERROR",
+             "stream: Can't allocate memory ERROR"]
+
+
+@pytest.mark.parametrize("answer", FAILURES)
+def test_a_scan_the_daemon_fails_while_it_answers_ping_is_unscanned_and_failed(daemon, answer):
+    """Every clamd ERROR read as *unscanned* once, so a daemon failing on a message - its
     temporary directory full, measured on the VM - had that message sent unscanned under
-    `outbound_unscanned = send`. Only the size-limit error is a verdict about the message;
-    any other is the antivirus unavailable: 451 outbound, the hold inbound."""
-    verdict = scan.scan_virus(b"x" * 10, path=daemon(answering(answer)).path)
-    assert verdict.verdict == scan.UNAVAILABLE, verdict
-    assert not verdict.withheld
+    `outbound_unscanned = send`; then every one read as *unavailable*, and one
+    message the daemon failed on held the mailbox and read as an outage. A PING on a
+    fresh connection tells the two apart: answered, the message is *unscanned* and
+    `failed`, which no domain setting sends."""
+    one = daemon(failing(answer))
+    verdict = scan.scan_virus(b"x" * 10, path=one.path)
+    assert verdict.verdict == scan.UNSCANNED, verdict
+    assert verdict.failed and verdict.withheld
     assert answer in verdict.detail
+    assert "answers PING" in verdict.detail
+    assert one.seen == ["zINSTREAM", "zPING"]  # asked on a connection of its own
+
+
+@pytest.mark.parametrize("answer", FAILURES)
+def test_a_scan_that_fails_and_then_gets_no_ping_answer_is_unavailable(daemon, answer):
+    """No answer to the PING is the daemon down, not this message: *unavailable*, the
+    hold of inbound and a 451 outbound, as before."""
+    verdict = scan.scan_virus(b"x" * 10, path=daemon(failing(answer, pong=False)).path)
+    assert verdict.verdict == scan.UNAVAILABLE, verdict
+    assert not verdict.failed and not verdict.withheld
+    assert "does not answer PING" in verdict.detail
+
+
+def test_a_scan_that_overruns_the_clients_timeout_is_followed_by_a_ping(daemon):
+    """A scan that runs past the time the client gives it (past `MaxScanTime` and the
+    margin) is a timeout. The daemon still answers PING, so it is this message."""
+
+    def overruns(daemon_, conn):
+        command = read_command(conn)
+        daemon_.seen.append(command)
+        if command == "zPING":
+            conn.sendall(b"PONG\0")
+            return
+        skip_stream(conn)
+        conn.recv(1)  # no answer: back when the client gives up and closes
+
+    one = daemon(overruns)
+    verdict = scan.scan_virus(b"x" * 10, path=one.path, timeout=0.5)
+    assert verdict.verdict == scan.UNSCANNED and verdict.failed, verdict
+    assert "no answer in 0.5 s" in verdict.detail
+    assert one.seen == ["zINSTREAM", "zPING"]
+
+
+@pytest.mark.parametrize("answer", [None, "stream: what?"])
+def test_a_connection_that_ends_with_no_verdict_is_unavailable_with_no_ping(daemon, answer):
+    """Measured on the VM: a daemon restarted in the middle of a scan closes the
+    connection with no answer, and the socket unit has the restarted daemon answer a PING
+    within seconds. Asked, it read a restart as a failure on this message and withheld
+    it. Nothing but an ERROR or a timeout is asked about."""
+    one = daemon(failing(answer))
+    verdict = scan.scan_virus(b"x" * 10, path=one.path)
+    assert verdict.verdict == scan.UNAVAILABLE and not verdict.failed, verdict
+    assert one.seen == ["zINSTREAM"]
+    assert "PING" not in verdict.detail
+
+
+def test_a_verdict_is_never_followed_by_a_ping_and_nor_is_a_socket_nobody_answers(daemon, tmp_path):
+    """Only a failed scan asks. A connect that fails has nobody to ask, and is
+    *unavailable* with no PING."""
+    for n, answer in enumerate(["stream: OK", "stream: Eicar FOUND",
+                                "INSTREAM size limit exceeded. ERROR",
+                                "stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND"]):
+        one = daemon(failing(answer), f"{n}.sock")
+        verdict = scan.scan_virus(b"x" * 10, path=one.path)
+        assert not verdict.failed, verdict
+        assert one.seen == ["zINSTREAM"], (answer, one.seen)
+    absent = scan.scan_virus(b"x", path=tmp_path / "absent.sock")
+    assert absent.verdict == scan.UNAVAILABLE and "PING" not in absent.detail
 
 
 @pytest.mark.parametrize("limit", ["MaxRecursion", "MaxScanSize", "MaxFileSize", "MaxScanTime"])
@@ -168,6 +268,23 @@ def test_a_scan_the_daemon_cut_short_at_its_limits_is_unscanned_never_infected(d
     verdict = scan.scan_virus(b"x" * 10, path=daemon(answering(answer)).path)
     assert verdict.verdict == scan.UNSCANNED, verdict
     assert f"Heuristics.Limits.Exceeded.{limit}" in verdict.detail
+
+
+def test_the_client_waits_past_the_daemons_scan_time_with_a_margin():
+    """A message that takes the daemon its whole `MaxScanTime` is answered
+    `Heuristics.Limits.Exceeded.MaxScanTime FOUND`, which is *unscanned*. A client that
+    gives up at the same moment reads a socket timeout instead, which is *unavailable*:
+    the delivery filter holds the mailbox and health reads an antivirus outage. So the
+    client outwaits the daemon by a margin for the answer and the daemon's own overrun."""
+    template = Path(__file__).resolve().parents[2] / "ansible" / "roles" / "clamav" / \
+        "templates" / "clamd.conf.j2"
+    line = next(line for line in template.read_text().splitlines()
+                if line.startswith("MaxScanTime "))
+    max_scan_seconds = int(line.split()[1]) / 1000
+    assert scan.CLAMD_TIMEOUT >= max_scan_seconds + 30, (scan.CLAMD_TIMEOUT, max_scan_seconds)
+    # the scan and the PING after it inside the 300 s Postfix gives a milter
+    # (`milter_content_timeout`, which the install leaves at Postfix's default)
+    assert scan.CLAMD_BOUND == scan.CLAMD_TIMEOUT + scan.CLAMD_PING_TIMEOUT < 300
 
 
 def test_a_daemon_that_answers_error_and_closes_mid_stream_is_still_unscanned(daemon):
@@ -183,17 +300,6 @@ def test_a_daemon_that_answers_error_and_closes_mid_stream_is_still_unscanned(da
                               max_bytes=scan.CHUNK * 8)
     assert verdict.verdict == scan.UNSCANNED
     assert "size limit exceeded" in verdict.detail
-
-
-def test_an_empty_or_unrecognised_answer_is_unavailable(daemon):
-    def closes(daemon_, conn):
-        read_stream(conn)
-
-    assert scan.scan_virus(b"x", path=daemon(closes, "a.sock").path).verdict == scan.UNAVAILABLE
-    other = daemon(answering("stream: what?"), "b.sock")
-    verdict = scan.scan_virus(b"x", path=other.path)
-    assert verdict.verdict == scan.UNAVAILABLE
-    assert "what?" in verdict.detail
 
 
 def test_a_socket_that_is_not_there_is_unavailable_and_never_raises(tmp_path):
@@ -388,3 +494,9 @@ def test_upstreams_current_release_is_read_from_the_record_freshclam_reads():
     assert scan.older("1.5.3", "1.5.10") and not scan.older("1.5.3", "1.5.3")
     assert scan.parse_current_cvd("") is None
     assert scan.parse_current_cvd('"nonsense"') is None
+
+
+def test_a_limit_set_apart_from_its_name_by_a_tab_is_read(tmp_path):
+    conf = tmp_path / "clamd.conf"
+    conf.write_text("StreamMaxLength\t10M\nMaxFileSize  \t 2M\n")
+    assert scan.size_limit(conf) == 2 * 1024 * 1024

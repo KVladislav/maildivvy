@@ -1,13 +1,16 @@
-"""The stub provider itself: a POP3 server over implicit TLS and an SMTP relay sink
-behind STARTTLS, each recording every command it received.
+"""The stub providers themselves: a POP3 server and an IMAP server over implicit TLS and
+an SMTP relay sink behind STARTTLS, each recording every command it received.
 
 These tests prove the test infrastructure, not the product, so they prove no
-requirement. They drive the stubs with the standard library's own clients, in-process, and
-once each as a separate process under the distribution's python3 with no site
-packages, the way the test VM runs them for mpop and Postfix.
+requirement, but for the IMAP stub's refusal of every command outside the read-only set:
+the decision on collection over IMAP rests its proof that nothing reached a
+provider on it. They drive the stubs with the standard library's own clients,
+in-process, and once each as a separate process under the distribution's python3 with no
+site packages, the way the test VM runs them for mpop, Postfix and our IMAP client.
 """
 
 import base64
+import imaplib
 import os
 import poplib
 import signal
@@ -20,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import imap
 import pop3
 import smtp
 from stubserver import make_certificate, read_log, write_control
@@ -311,6 +315,249 @@ def test_pop3_serves_an_identifier_with_a_space(provider, certificate):
     client.quit()
 
 
+# --------------------------------------------------------------------------- IMAP
+
+
+@pytest.fixture
+def mailstore(tmp_path, certificate):
+    """A running IMAP stub: three messages in the INBOX, one in `Archive/2025`, and a
+    Gmail-like `[Gmail]` that cannot be opened above an `All Mail` marked as all mail."""
+    account = tmp_path / "account"
+    for folder, uids in (("INBOX", (1, 2, 3)), ("Archive/2025", (7,)), ("[Gmail]/All Mail", (9,))):
+        (account / folder).mkdir(parents=True)
+        for uid in uids:
+            (account / folder / str(uid)).write_bytes(f"Subject: {uid}\n\nbody {uid}\n".encode())
+    control = tmp_path / "imap.json"
+    stub = imap.IMAPStub(account, cert=certificate.cert, key=certificate.key,
+                         log=tmp_path / "imap.log", control=control)
+    stub.account = account
+    stub.control_file = control
+    reimap(stub)
+    with stub:
+        yield stub
+
+
+GMAIL = {"[Gmail]": ["\\Noselect", "\\HasChildren"], "[Gmail]/All Mail": ["\\All"]}
+
+
+def reimap(stub, **settings):
+    write_control(stub.control_file, **{"user": USER, "password": PASSWORD, "attributes": GMAIL,
+                                        **settings})
+
+
+def imap_client(stub, certificate, timeout=5):
+    return imaplib.IMAP4_SSL("127.0.0.1", stub.port, ssl_context=client_context(certificate),
+                             timeout=timeout)
+
+
+def examined(stub, certificate, folder="INBOX", timeout=5):
+    client = imap_client(stub, certificate, timeout)
+    client.login(USER, PASSWORD)
+    client.select(f'"{folder}"', readonly=True)
+    return client
+
+
+def imap_events(stub, kind):
+    return [r for r in read_log(stub.log_path) if r.get("event") == kind]
+
+
+def test_imap_reads_by_uid_and_records_uid_commands_with_their_sub_command(mailstore,
+                                                                         certificate):
+    client = imap_client(mailstore, certificate)
+    assert "AUTH=PLAIN" in client.capabilities
+    client.login(USER, PASSWORD)
+    typ, [count] = client.select('"INBOX"', readonly=True)
+    assert (typ, count) == ("OK", b"3")
+    assert client.response("UIDVALIDITY")[1] == [b"1"]
+    assert client.response("UIDNEXT")[1] == [b"4"]
+    assert client.uid("SEARCH", "UID", "2:*") == ("OK", [b"2 3"])
+    typ, data = client.uid("FETCH", "2", "(BODY.PEEK[] FLAGS INTERNALDATE)")
+    head, body = data[0]
+    assert body == b"Subject: 2\r\n\r\nbody 2\r\n"
+    assert head.startswith(b"2 (UID 2 FLAGS () INTERNALDATE ")
+    assert head.endswith(b" BODY[] {%d}" % len(body))
+    client.noop()
+    client.logout()
+
+    assert commands(mailstore) == [
+        ("CAPABILITY", ""), ("LOGIN", f'{USER} "{PASSWORD}"'), ("EXAMINE", '"INBOX"'),
+        ("UID SEARCH", "UID 2:*"), ("UID FETCH", "2 (BODY.PEEK[] FLAGS INTERNALDATE)"),
+        ("NOOP", ""), ("LOGOUT", "")]
+    assert imap_events(mailstore, "refused") == []
+
+
+def test_imap_refuses_every_command_outside_the_read_only_set_and_logs_it(mailstore,
+                                                                        certificate):
+    client = examined(mailstore, certificate)
+    attempts = {
+        "STORE": lambda: client.store("1", "+FLAGS", "(\\Deleted)"),
+        "UID STORE": lambda: client.uid("STORE", "1", "+FLAGS", "(\\Seen)"),
+        "UID FETCH": lambda: client.uid("FETCH", "1", "(BODY[])"),
+        "UID FETCH ": lambda: client.uid("FETCH", "1", "(RFC822.HEADER)"),  # not one it serves
+        "EXPUNGE": lambda: client.expunge(),
+        "CREATE": lambda: client.create("New"),
+        "SELECT": lambda: client.select('"INBOX"'),
+    }
+    for attempt in attempts.values():
+        with pytest.raises(imaplib.IMAP4.error, match="BAD"):
+            attempt()
+    with pytest.raises(imaplib.IMAP4.error, match="BAD"):
+        imap_client(mailstore, certificate).login_cram_md5(USER, PASSWORD)
+
+    refused = [r["command"] for r in imap_events(mailstore, "refused")]
+    assert refused == [*(name.strip() for name in attempts), "AUTHENTICATE"]
+    assert sorted(p.name for p in (mailstore.account / "INBOX").iterdir()) == ["1", "2", "3"]
+
+
+def test_imap_auth_plain_carries_utf8_and_login_stands_alone_when_plain_is_not_offered(
+        mailstore, certificate):
+    reimap(mailstore, password="пароль")
+    client = imap_client(mailstore, certificate)
+    client.authenticate("PLAIN", lambda _: f"\0{USER}\0пароль")
+    client.logout()
+
+    reimap(mailstore, plain=False)
+    client = imap_client(mailstore, certificate)
+    assert "AUTH=PLAIN" not in client.capabilities
+    client.login(USER, PASSWORD)
+    client.logout()
+    assert [(e["mechanism"], e["password"], e["accepted"]) for e in imap_events(mailstore, "auth")] \
+        == [("PLAIN", "пароль", True), ("LOGIN", PASSWORD, True)]
+
+
+def test_imap_refuses_a_wrong_password_and_a_scripted_refusal(mailstore, certificate):
+    with pytest.raises(imaplib.IMAP4.error, match="AUTHENTICATIONFAILED"):
+        imap_client(mailstore, certificate).login(USER, "wrong")
+
+    reimap(mailstore, faults=[{"command": "LOGIN", "action": "no"}])
+    with pytest.raises(imaplib.IMAP4.error, match="AUTHENTICATIONFAILED"):
+        imap_client(mailstore, certificate).login(USER, PASSWORD)
+
+    reimap(mailstore, faults=[{"command": "AUTHENTICATE", "action": "no", "text": "go away"}])
+    with pytest.raises(imaplib.IMAP4.error, match="go away"):
+        imap_client(mailstore, certificate).authenticate("PLAIN", lambda _: f"\0{USER}\0{PASSWORD}")
+
+    reimap(mailstore)  # the control: the same login is accepted again
+    imap_client(mailstore, certificate).login(USER, PASSWORD)
+
+
+def test_imap_lists_every_folder_with_its_attributes_and_will_not_examine_a_noselect_one(
+        mailstore, certificate):
+    """It lists what the client asks, `"" "*"`, and answers any other listing BAD."""
+    client = imap_client(mailstore, certificate)
+    client.login(USER, PASSWORD)
+    typ, listed = client.list('""', '"*"')
+    assert listed == [b'() "/" "Archive"', b'() "/" "Archive/2025"', b'() "/" "INBOX"',
+                      b'(\\Noselect \\HasChildren) "/" "[Gmail]"', b'(\\All) "/" "[Gmail]/All Mail"']
+    with pytest.raises(imaplib.IMAP4.error, match="BAD"):
+        client.list('""', '"%"')
+    assert client.select('"[Gmail]"', readonly=True)[0] == "NO"
+    assert client.select('"[Gmail]/All Mail"', readonly=True) == ("OK", [b"1"])
+    assert client.uid("SEARCH", "UID", "1:9") == ("OK", [b"9"])
+    assert imap_events(mailstore, "refused") == []
+
+
+def test_imap_searches_one_uid_range_and_above_the_largest_answers_the_largest(mailstore,
+                                                                              certificate):
+    """RFC 9051: `*` is the largest UID in use and a range is read in either order. A set of
+    several ranges, or a search by anything but UID, is not what the client sends: BAD."""
+    client = examined(mailstore, certificate)
+    assert client.uid("SEARCH", "UID", "4:*") == ("OK", [b"3"])
+    assert client.uid("SEARCH", "UID", "2:3") == ("OK", [b"2 3"])
+    assert client.uid("SEARCH", "UID", "*") == ("OK", [b"3"])
+    for unserved in (("UID", "1,3"), ("ALL",)):
+        with pytest.raises(imaplib.IMAP4.error, match="BAD"):
+            client.uid("SEARCH", *unserved)
+    assert imap_events(mailstore, "refused") == []
+
+
+def test_imap_says_no_uidvalidity_for_a_folder_scripted_to_have_none(mailstore, certificate):
+    reimap(mailstore, uidvalidity={"INBOX": None})
+    client = examined(mailstore, certificate)
+    assert client.response("UIDVALIDITY")[1] == [None]
+    assert client.response("UIDNEXT")[1] == [b"4"]
+
+
+def test_imap_uidvalidity_changes_between_sessions_when_rescripted(mailstore, certificate):
+    examined(mailstore, certificate).logout()
+    reimap(mailstore, uidvalidity={"INBOX": 99})
+    client = examined(mailstore, certificate)
+    assert client.response("UIDVALIDITY")[1] == [b"99"]
+
+
+def test_imap_answers_no_on_one_uid_and_serves_the_others(mailstore, certificate):
+    reimap(mailstore, faults=[{"command": "UID FETCH", "uid": 2, "action": "no"}])
+    client = examined(mailstore, certificate)
+    assert client.uid("FETCH", "2", "(BODY.PEEK[])")[0] == "NO"
+    assert client.uid("FETCH", "3", "(BODY.PEEK[])")[1][0][1] == b"Subject: 3\r\n\r\nbody 3\r\n"
+
+
+def test_imap_expunged_answers_ok_with_nothing_as_does_a_message_removed(mailstore,
+                                                                       certificate):
+    reimap(mailstore, faults=[{"command": "UID FETCH", "uid": 2, "action": "expunged"}])
+    client = examined(mailstore, certificate)
+    assert client.uid("FETCH", "2", "(BODY.PEEK[])") == ("OK", [None])
+    (mailstore.account / "INBOX" / "3").unlink()
+    assert client.uid("FETCH", "3", "(BODY.PEEK[])") == ("OK", [None])
+    assert [r["uid"] for r in imap_events(mailstore, "fault")] == [2]
+    # gone for that session, as an expunge is: no search lists either any more
+    assert client.uid("SEARCH", "UID", "1:3") == ("OK", [b"1"])
+
+
+def test_imap_answers_bad_on_one_uid_and_serves_the_others(mailstore, certificate):
+    reimap(mailstore, faults=[{"command": "UID FETCH", "uid": 2, "action": "bad",
+                               "text": "Command Argument Error. 11"}])
+    client = examined(mailstore, certificate)
+    with pytest.raises(imaplib.IMAP4.error, match="Command Argument Error"):
+        client.uid("FETCH", "2", "(BODY.PEEK[])")
+    assert client.uid("FETCH", "3", "(BODY.PEEK[])")[1][0][1] == b"Subject: 3\r\n\r\nbody 3\r\n"
+
+
+@pytest.mark.parametrize("action, answer", [
+    ("flags-first", [b"2 (UID 2 FLAGS (\\Seen))",
+                     (b"2 (UID 2 FLAGS (\\Seen) BODY[] {22}", b"Subject: 2\r\n\r\nbody 2\r\n"),
+                     b")"]),
+    ("nobody", [b"2 (UID 2 FLAGS (\\Seen))"]),
+    ("no-uid", [(b"2 (FLAGS (\\Seen) BODY[] {22}", b"Subject: 2\r\n\r\nbody 2\r\n"), b")"]),
+])
+def test_imap_answers_a_fetch_the_ways_a_server_may_and_a_careless_one_does(
+        mailstore, certificate, action, answer):
+    """Its flags in a response of their own before the message, its flags with no body, or
+    the message in a response that leaves its UID out."""
+    reimap(mailstore, flags={"INBOX": {"2": ["\\Seen"]}},
+           faults=[{"command": "UID FETCH", "uid": 2, "action": action}])
+    client = examined(mailstore, certificate)
+    assert client.uid("FETCH", "2", "(BODY.PEEK[] FLAGS)") == ("OK", answer)
+
+
+def test_imap_truncates_a_literal_and_closes(mailstore, certificate):
+    reimap(mailstore, faults=[{"command": "UID FETCH", "uid": 1, "action": "truncate"}])
+    client = examined(mailstore, certificate)
+    with pytest.raises(imaplib.IMAP4.abort):
+        client.uid("FETCH", "1", "(BODY.PEEK[])")
+
+
+def test_imap_drops_and_hangs_when_scripted(mailstore, certificate):
+    reimap(mailstore, faults=[{"command": "UID FETCH", "uid": 1, "action": "drop"}])
+    client = examined(mailstore, certificate)
+    with pytest.raises(imaplib.IMAP4.abort):
+        client.uid("FETCH", "1", "(BODY.PEEK[])")
+
+    reimap(mailstore, faults=[{"command": "EXAMINE", "action": "hang"}])
+    with pytest.raises(TimeoutError):
+        examined(mailstore, certificate, timeout=1)
+
+
+def test_imap_trickles_a_literal_a_byte_at_a_time(mailstore, certificate):
+    reimap(mailstore, faults=[{"command": "UID FETCH", "uid": 1, "action": "trickle",
+                               "delay": 0.02}])
+    client = examined(mailstore, certificate)
+    body = b"Subject: 1\r\n\r\nbody 1\r\n"
+    started = time.monotonic()
+    assert client.uid("FETCH", "1", "(BODY.PEEK[])")[1][0][1] == body
+    assert time.monotonic() - started >= 0.02 * (len(body) - 1)
+
+
 # --------------------------------------------------------------------------- SMTP
 
 ACCOUNTS = {"alice@example.test": "alice-secret", "bob@example.test": "bob-secret"}
@@ -437,6 +684,22 @@ def test_smtp_refuses_a_wrong_password_and_a_scripted_refusal(relay, certificate
     assert {accepted for _, accepted in verdicts[:-1]} == {False}
 
 
+def test_smtp_refuses_a_scripted_recipient_at_rcpt_and_another_after_data(relay, certificate):
+    write_control(relay.control_file, accounts=ACCOUNTS, refuse_rcpt=["gone@elsewhere.test"],
+                  refuse_data=["small@elsewhere.test"])
+    client = secured(relay, certificate)
+    client.login("alice@example.test", "alice-secret")
+    with pytest.raises(smtplib.SMTPRecipientsRefused) as refused:
+        client.sendmail("alice@example.test", ["gone@elsewhere.test"], MESSAGE)
+    assert refused.value.recipients["gone@elsewhere.test"][0] == 550
+    with pytest.raises(smtplib.SMTPDataError) as refused:
+        client.sendmail("alice@example.test", ["small@elsewhere.test"], MESSAGE)
+    assert refused.value.smtp_code == 552
+    client.sendmail("alice@example.test", ["r@elsewhere.test"], MESSAGE)  # the control
+    client.quit()
+    assert [m["rcpt_to"] for m in events(relay, "message")] == [["r@elsewhere.test"]]
+
+
 # --------------------------------------------------------------------------- as a process
 
 
@@ -490,3 +753,23 @@ def test_smtp_runs_as_a_process_on_the_standard_library_alone(tmp_path, certific
         stop_process(process)
     [message] = [r for r in read_log(tmp_path / "smtp.py.log") if r.get("event") == "message"]
     assert message["rcpt_to"] == ["r@elsewhere.test"]
+
+
+def test_imap_runs_as_a_process_on_the_standard_library_alone(tmp_path, certificate):
+    inbox = tmp_path / "account" / "INBOX"
+    inbox.mkdir(parents=True)
+    (inbox / "1").write_bytes(b"Subject: one\n\nfirst\n")
+    write_control(tmp_path / "imap.py.json", user=USER, password=PASSWORD)
+    process, port = start_process("imap.py", tmp_path, certificate,
+                                  "--mailbox", str(tmp_path / "account"))
+    try:
+        client = imaplib.IMAP4_SSL("127.0.0.1", port, ssl_context=client_context(certificate),
+                                   timeout=5)
+        client.login(USER, PASSWORD)
+        client.select('"INBOX"', readonly=True)
+        assert client.uid("SEARCH", "UID", "1:*") == ("OK", [b"1"])
+        client.logout()
+    finally:
+        stop_process(process)
+    assert ("UID SEARCH", "UID 1:*") in [(r["command"], r["argument"])
+                                     for r in read_log(tmp_path / "imap.py.log") if "command" in r]

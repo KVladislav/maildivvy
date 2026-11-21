@@ -1,0 +1,44 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# A slice of each IMAP mailbox's snapshot under way or asked for:
+# every folder at the provider copied, read-only, into a Maildir++ tree under the store's
+# _snapshots, for the import to read. It runs as the mail owner, who owns the store, and
+# writes nothing else: no message goes through the delivery filter or the fan-out.
+[Unit]
+Description=Maildivvy: take a slice of each snapshot of an IMAP mailbox
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/fetch/snapshot.py
+After=network-online.target postgresql.service
+Wants=network-online.target
+# A pause holds this unit, whatever starts it: while a record of one is there a
+# start is skipped, not failed, so a timer that fires inside a pause, after a reboot too,
+# starts nothing; the program never runs on a schema or a fetch state it may not pair with.
+ConditionPathExists=!{{ maildivvy_upgrade_pause_record }}
+ConditionPathExists=!{{ maildivvy_backup_pause_record }}
+
+[Service]
+Type=oneshot
+User=vmail
+Group=vmail
+ExecStart={{ maildivvy_opt }}/bin/maildivvy-fetch --snapshot
+# Each snapshot's slice bounds itself, ten minutes by default and the message in hand
+# after it; a run gives each snapshot under way one slice in turn, the least recently
+# advanced first, and starts none that could end past its own bound (the runner's
+# SNAPSHOT_RUN_SECONDS, 3300 s), so a run ends inside this and the snapshots it had no
+# time for are the next run's first.
+TimeoutStartSec={{ maildivvy_snapshot_run_timeout }}
+
+# Install step 13's hardening, one set on every program of ours.
+ProtectSystem=strict
+# The snapshots' root and nothing else: no child of it writes the store's domains, the
+# index or the fetch state. It exists before the unit first starts.
+ReadWritePaths={{ maildivvy_snapshots }}
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+UMask=0077
+# It binds nothing and opens no privileged port.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

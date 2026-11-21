@@ -116,5 +116,11 @@ def test_the_break_glass_hash_is_bare_sha512_crypt_of_106_characters(value, ok):
     assert bool(pg.BREAK_GLASS_HASH.fullmatch(value)) is ok
 
 
+def test_a_break_glass_password_over_256_bytes_is_never_hashed_as_its_start():
+    with pytest.raises(pg.PgError, match="256 bytes"):
+        pg.openssl_sha512_crypt("я" * 129)
+    assert pg.BREAK_GLASS_HASH.fullmatch(pg.openssl_sha512_crypt("x" * 256))
+
+
 def test_the_salt_is_read_from_a_stored_hash():
     assert pg.salt_of("$6$" + "Ab./" * 4 + "$" + "b" * 86) == "Ab./" * 4

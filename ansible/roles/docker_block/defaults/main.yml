@@ -3,11 +3,19 @@ maildivvy_after_rules: /etc/ufw/after.rules
 maildivvy_after_rules_copy: /etc/ufw/after.rules.maildivvy-predocker
 maildivvy_docker_block: maildivvy DOCKER-USER
 
+# How the block in after.rules reaches the running firewall: its chains replaced in one
+# `iptables-restore --noflush` transaction, as ufw itself loads the file, and never by
+# `ufw reload`, which accepts everything for a moment. The declaration of ufw's own
+# forward chain is left out: ufw fills that chain after after.rules at boot, while here it
+# would empty it of the `ufw route` rules in force. A file without the block loads no rule.
+maildivvy_docker_block_load: >-
+  sed -n '/^# BEGIN {{ maildivvy_docker_block }}$/,/^# END {{ maildivvy_docker_block }}$/{/^:ufw-user-forward /!p}'
+  {{ maildivvy_after_rules }} | iptables-restore -w --noflush
+
 # How long an edit of after.rules may stand before the timer restores the copy.
 maildivvy_docker_block_revert_seconds: 300
 maildivvy_docker_block_revert_unit: maildivvy-docker-block-revert
 
-# How the edit is confirmed before the timer is cancelled, as step 3's (the
-# firewall role's defaults say what each means). A unit test holds the two roles equal.
-maildivvy_firewall_confirmation: new-session
-maildivvy_admin_ssh_source: ""
+# The edit is confirmed before the timer is cancelled as step 3's is:
+# `maildivvy_firewall_confirmation` and `maildivvy_admin_ssh_source` are the firewall
+# role's defaults, which `import_role` exposes to this step.

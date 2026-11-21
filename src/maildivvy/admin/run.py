@@ -16,16 +16,20 @@ has returned means the next request is answered rather than refused.
 The socket is `0660`, owned by this user and the proxy's group, and it is the only
 thing this program listens on: there is no TCP port anywhere in it. The server
 is threaded rather than forked - ten threads means ten concurrent requests, which is
-the whole load a handful of administrators make.
+the whole load a handful of administrators make. ⛔ The ten is a bound:
+a request past it waits in the socket's backlog for a thread to come free, so a burst
+never holds more than ten database connections or `openssl` children.
 """
 
 import argparse
 import ipaddress
 import os
 import shutil
+import signal
 import socket
 import socketserver
 import sys
+import threading
 from pathlib import Path
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
 
@@ -35,6 +39,7 @@ SOCKET = "/run/maildivvy/admin/admin.sock"
 MODE = 0o660
 BACKLOG = 64
 REQUEST_TIMEOUT = 60
+THREADS = 10
 
 # The header the proxy writes the person's own address into. ⛔ It is trusted because of
 # the TRANSPORT, not because of its name: this program listens on one `0660` unix socket
@@ -89,7 +94,9 @@ class UnixServer(socketserver.ThreadingMixIn, WSGIServer):
     """A threaded WSGI server on a socket that is already bound and listening."""
 
     address_family = socket.AF_UNIX
-    daemon_threads = True
+    # ⚠️ not daemon threads: `server_close()` waits only for the threads it tracks, and it
+    # tracks no daemon thread, so a stop would cut the requests in flight off mid-answer
+    daemon_threads = False
     allow_reuse_address = False
 
     def __init__(self, sock, application):
@@ -99,6 +106,21 @@ class UnixServer(socketserver.ThreadingMixIn, WSGIServer):
         self.server_port = 0
         self.setup_environ()
         self.set_app(application)
+        self.slots = threading.BoundedSemaphore(THREADS)
+
+    def process_request(self, request, client_address):
+        self.slots.acquire()                   # the accept loop waits for a free thread
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
     def get_environ(self):
         return self.base_environ
@@ -120,6 +142,24 @@ def listen(path, group=None, mode=MODE, backlog=BACKLOG):
         shutil.chown(path, group=group)
     sock.listen(backlog)
     return sock
+
+
+def serve(server, path):
+    """Serve until SIGTERM or ^C, let the requests in flight finish, then remove the socket.
+
+    ⚠️ systemd stops the unit with SIGTERM. `shutdown()` waits for the serving loop, which
+    runs in this very thread, so the handler asks for it from a thread of its own;
+    `server_close()` then waits for the requests in flight (within the unit's stop
+    timeout, past which systemd kills what is left).
+    """
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        Path(path).unlink(missing_ok=True)
 
 
 def notify(state="READY=1"):
@@ -176,11 +216,5 @@ def main(argv=None):
     server = UnixServer(sock, application)
     notify()                                   # ready, and not one moment before the bind
     print(f"maildivvy-admin: serving on {arguments.socket}", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        Path(arguments.socket).unlink(missing_ok=True)
+    serve(server, arguments.socket)
     return 0

@@ -1,0 +1,17 @@
+# Managed by Ansible (roles/programs). Install step 13.
+# Every ten minutes, a slice of each snapshot of an IMAP mailbox. A
+# snapshot nobody asked for costs one query; a slice that takes its whole ten minutes
+# ends as the next slot comes, and the timer starts the next slice when it has ended.
+[Unit]
+Description=Maildivvy: a slice of each snapshot every 10 min
+
+[Timer]
+OnCalendar=*:0/10
+# ⚠️ NO CATCH-UP: a slot missed while the machine was down only delays a snapshot, which
+# the next slot goes on with.
+Persistent=false
+AccuracySec=10s
+Unit=maildivvy-snapshot.service
+
+[Install]
+WantedBy=timers.target

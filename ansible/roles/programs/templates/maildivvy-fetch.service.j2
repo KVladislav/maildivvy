@@ -7,15 +7,25 @@ Description=Maildivvy: collect mail from every external mailbox
 Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/fetch/runner.py
 After=network-online.target postgresql.service dovecot.service
 Wants=network-online.target
+# A pause holds this unit, whatever starts it: while a record of one is there a
+# start is skipped, not failed, so a timer that fires inside a pause, after a reboot too,
+# starts nothing; the program never runs on a schema or a fetch state it may not pair with.
+ConditionPathExists=!{{ maildivvy_upgrade_pause_record }}
+ConditionPathExists=!{{ maildivvy_backup_pause_record }}
 
 [Service]
 Type=oneshot
 User=vmail
 Group=vmail
 ExecStart={{ maildivvy_opt }}/bin/maildivvy-fetch
-# A run that overruns the timer's period is not killed here: the next run takes the
-# try-lock, finds it held and skips that mailbox. mpop itself is bounded by
-# the runner's own wall-clock timeout, which is what this allows for.
+# A run that overruns the timer's period is not killed here, and the timer never starts
+# a second one beside it: it is not armed while this unit is active, and counts its next
+# slot from this run's start (systemd 259, no DeferReactivation=), so every slot that
+# passed collapses into one run that starts as soon as this one ends. Mailboxes are
+# collected one after another, so one slow provider delays every mailbox after it. When
+# a run by hand overlaps this one, whichever reaches a mailbox second finds its try-lock
+# held and skips it. mpop itself is bounded by the runner's own wall-clock
+# timeout, which is what this allows for.
 TimeoutStartSec={{ maildivvy_fetch_run_timeout }}
 
 # Install step 13's hardening, one set on every program of ours.

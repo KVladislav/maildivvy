@@ -10,6 +10,9 @@ Control file (JSON, read again at every session):
 - `refuse_auth`: refuse every AUTH with 535, a correct one included.
 - `implicit_tls`: TLS from the first byte, as a provider's port 465 speaks it (RFC 8314):
   the handshake comes before the greeting, AUTH is offered at once and STARTTLS never.
+- `refuse_rcpt`: recipients refused at RCPT with 550, as a provider refuses an address.
+- `refuse_data`: recipients whose message is refused after DATA with 552, as a provider
+  refuses a message larger than its own limit.
 
 The log has every command line received (the AUTH continuation lines as `(auth)`),
 an `auth` event with the user, the password and whether it was accepted, and one
@@ -142,6 +145,8 @@ class SMTPStub(Stub):
                     reply("503 5.5.1 Need MAIL first")
                 elif recipient is None:
                     reply("501 5.5.4 Syntax: RCPT TO:<address>")
+                elif recipient in control.get("refuse_rcpt", []):
+                    reply("550 5.1.1 Recipient address rejected: User unknown")
                 else:
                     state["to"].append(recipient)
                     reply("250 2.1.5 Ok")
@@ -158,6 +163,10 @@ class SMTPStub(Stub):
                     if line in (b".\r\n", b".\n"):
                         break
                     data += line[1:] if line.startswith(b".") else line
+                if set(state["to"]) & set(control.get("refuse_data", [])):
+                    reply("552 5.3.4 Message size exceeds fixed limit")
+                    reset()
+                    continue
                 state["queued"] += 1
                 self.log.write(stub=self.name, session=number, event="message",
                                auth_user=state["user"], mail_from=state["from"],

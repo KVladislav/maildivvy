@@ -14,12 +14,14 @@ about one message.
 import datetime
 import email.utils
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from maildivvy.fanout import pass_
-from maildivvy.lib import config, doveadm, store
+from maildivvy.fanout import ledger, pass_
+from maildivvy.lib import config, doveadm, messageid, store
 from maildivvy.senthook import hook
 
 
@@ -249,6 +251,19 @@ def test_a_message_no_lookup_finds_is_refused_rather_than_guessed(monkeypatch, w
         hook.source_of("ivan@acme", "acme", "ivan", world.raw, None, root=world.root)
 
 
+@pytest.mark.parametrize("flags", [":2,FS", ":2,Sa", ":2,R"])
+def test_a_copy_appended_with_flags_other_than_seen_is_still_found(monkeypatch, world, flags):
+    """`APPEND Sent (\\Seen \\Flagged)` or a keyword names the file `:2,FS` or `:2,Sa`."""
+    flagged = world.sent.parent / "cur" / f"{world.base}{flags}"
+    flagged.parent.mkdir()
+    (world.sent / world.base).rename(flagged)
+    monkeypatch.setattr(hook.doveadm, "fetch",
+                        lambda *a, **k: [record(7, world.base, size=len(world.raw))])
+    for message_id in ("<sent-1@example.org>", None):
+        assert hook.source_of("ivan@acme", "acme", "ivan", world.raw, message_id,
+                              root=world.root) == flagged
+
+
 def test_a_storage_id_with_no_file_under_it_is_refused(monkeypatch, world):
     monkeypatch.setattr(hook.doveadm, "fetch",
                         lambda *a, **k: [record(7, "1789000000.M9P9.host,S=1,W=1")])
@@ -311,6 +326,27 @@ def test_its_row_has_no_archive_number_and_the_senders_own_copy_gets_the_deliver
                          "ivan@example.org", "a sent message")]
     linked = [p for s, p in connection.cursor_.statements if "INSERT INTO delivery" in s]
     assert linked == [(42, 11)]  # exactly one, the sender's own mailbox
+
+
+def test_a_message_id_past_the_bound_is_stored_and_looked_up_in_the_passs_own_form(
+        monkeypatch, world):
+    """The pass and this hook write one column under one index: both store the bounded
+    form, and the hook looks its own rows up by it, while Dovecot is asked for the header
+    as it is."""
+    huge = "<" + "x" * 4096 + "@example.org>"
+    raw = message(message_id=huge)
+    (world.sent / world.base).write_bytes(raw.replace(b"\r\n", b"\n"))
+    asked = []
+    monkeypatch.setattr(hook.doveadm, "fetch",
+                        lambda *a, **k: asked.append(a[-1]) or [record(7, world.base, size=len(raw))])
+    monkeypatch.setattr(hook.doveadm, "create_folder", lambda login, folder: None)
+    connection = Connection([(3,), (11,), None, (42,), None, None])
+    monkeypatch.setattr(hook.db, "connect", lambda *a, **k: connection)
+    assert hook.main(["Sent"], raw=raw, environ={"USER": "ivan@acme"}) == 0
+    assert asked == [huge]
+    by_value = [p[1] for s, p in connection.cursor_.statements
+                if "message_id_header = " in s or "INSERT INTO message" in s]
+    assert by_value == [messageid.stored(huge)] * 2 and messageid.stored(huge) != huge
 
 
 def test_a_row_the_feed_already_recorded_does_not_stop_the_hook(monkeypatch, world):
@@ -398,7 +434,7 @@ def test_a_domain_or_a_mailbox_the_ledger_does_not_know_is_refused(monkeypatch, 
     monkeypatch.setattr(hook.doveadm, "create_folder", lambda login, folder: None)
     for answers in ([None], [(3,), None]):
         connection = Connection(answers)
-        monkeypatch.setattr(hook.db, "connect", lambda *a, **k: connection)
+        monkeypatch.setattr(hook.db, "connect", lambda *a, **k: connection)  # noqa: B023 - hook.main calls it in this iteration
         assert hook.main(["Sent"], raw=world.raw, environ={"USER": "ivan@acme"}) == 0
         assert connection.committed == 0 and connection.closed == 1
         assert capsys.readouterr().err.startswith(hook.FAILURE)
@@ -440,11 +476,36 @@ def test_the_hook_reads_its_own_least_privileged_configuration():
     assert hook.CONSUMER == "senthook" and hook.CONSUMER in config.CONSUMERS
 
 
-def test_the_ledgers_rules_are_the_passs_own_functions_never_a_second_spelling():
-    text = Path(hook.__file__).read_text()
-    assert "parseaddr" not in text and "parsedate" not in text
-    assert hook.read_message.__module__ == "maildivvy.senthook.hook"
-    assert pass_.sender_of("Someone <one@example.org>") == "one@example.org"
+@pytest.mark.parametrize("sender, subject, date", [
+    ("acme@gmail.com <impostor@example.net>", "a subject that goes\r\n  on to a second line",
+     "Tue, 15 Sep 2026 10:00:00 +0000"),
+    ('"Ivan P." <IVAN@Example.ORG>', "plain", "Mon, 1 Jan 99999999999 00:00:00 +0000"),
+    ("Someone", "", "not a date"),
+])
+def test_the_hook_and_the_pass_read_one_message_into_the_same_row(sender, subject, date):
+    # The hook reads the bytes it is handed; the pass reads the same headers as doveadm
+    # hands them back, folded lines and all. The two programs write `message` rows.
+    raw = message(sender=sender, subject=subject, date=date)
+    sent = hook.read_message(raw)
+    fields = {"uid": "1", "hdr.from": sender, "hdr.subject": subject.replace("\r\n", "\n"),
+              "hdr.date": date, "hdr.message-id": "<sent-1@example.org>"}
+    received = pass_.read(fields)
+    assert (sent.sender, sent.subject, sent.date, sent.message_id) == \
+        (received.sender, received.subject, received.date, received.message_id)
+
+
+def test_the_hook_loads_nothing_of_the_pass_the_filter_or_the_fetcher():
+    # Every IMAP process runs the hook, and an import that fails does so before `main` can
+    # turn it into exit 0: the less it loads, the less can fail the client's APPEND.
+    src = Path(hook.__file__).resolve().parents[2]
+    loaded = subprocess.run(
+        [sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+         "import maildivvy.senthook.hook; print(*sorted(sys.modules), sep='\\n')", str(src)],
+        capture_output=True, text=True, check=True).stdout.split()
+    assert "maildivvy.senthook.hook" in loaded and "maildivvy.fanout.ledger" in loaded
+    refused = ("maildivvy.deliver", "maildivvy.fetch", "maildivvy.fanout.pass_",
+               "maildivvy.fanout.requests", "maildivvy.lib.scan", "maildivvy.backup")
+    assert [name for name in loaded if name.startswith(refused)] == []
 
 
 def test_the_entry_point_names_the_hooks_main():
@@ -461,5 +522,5 @@ def test_the_recent_window_is_bounded_and_the_candidates_are_counted():
 
 
 def test_the_date_and_the_delivery_state_are_the_ledgers_own_words():
-    assert "'delivered'" in hook.RECORD and "'linked'" in hook.LINK
+    assert "'delivered'" in hook.RECORD and "'linked'" in ledger.LINK
     assert isinstance(hook.read_message(message()).date, datetime.datetime)

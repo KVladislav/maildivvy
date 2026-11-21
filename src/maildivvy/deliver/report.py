@@ -2,8 +2,8 @@
 
 ⛔ THE REPORT MAY NOT CLAIM MALWARE FOR A MESSAGE NOBODY EXAMINED.
 `infected` and `unscanned` are different facts and get different words: one says
-something was found, the other says the message was too large to look at and that
-nothing is known about it either way. An unrecognised reason raises, because the
+something was found, the other says the message was too large to look at, or that the
+scanner failed on it, and that nothing is known about it either way. An unrecognised reason raises, because the
 default a programmer reaches for is the first branch, and the first branch is the
 malware wording.
 
@@ -31,14 +31,8 @@ import email.utils
 import html as html_lib
 
 from maildivvy.lib import scan, store
-
-WITHHELD_HEADER = "X-Maildivvy-Withheld-Id"
-REASON_HEADER = "X-Maildivvy-Report-Reason"
-# ⛔ What the filter's own block says in both fields when the message is not a report,
-# or not withheld. A field the pass reads is trusted in its
-# first occurrence, which is ours only if we wrote one; left out, the first occurrence
-# was the sender's, and a sender's reason made clean mail a report.
-NONE = "none"
+# The report's two fields, which the pass reads back, are named once in `lib/headers.py`.
+from maildivvy.lib.headers import NONE, REASON_HEADER, WITHHELD_HEADER  # noqa: F401 - read as report.NONE too
 
 # ⛔ The trailing space is part of it: the prefix is spliced into the Subject line by
 # textual surgery, so what is written is exactly these characters.
@@ -112,15 +106,26 @@ WORDS = {
          "domain's archive and was not delivered to anybody."],
     ),
 }
+# An *unscanned* the scanner failed on while it still answered: not too large,
+# and still nothing known about it.
+FAILED_WORDS = (
+    "A message addressed to this domain was withheld: the scanner failed on it.",
+    ["The antivirus scanner is running but could not scan this message, so nobody",
+     "looked at it. NOTHING IS KNOWN ABOUT IT either way - it is not known to be",
+     "harmful and it is not known to be safe. It was filed into the "
+     f"{store.QUARANTINE} folder",
+     "of this domain's archive and was not delivered to anybody."],
+)
 
 
-def compose(reason, original, withheld_id, domain):
-    """The report's bytes. `original` is the withheld message, parsed."""
+def compose(reason, original, withheld_id, domain, failed=False):
+    """The report's bytes. `original` is the withheld message, parsed; `failed` is the
+    verdict's own, the scanner failing on an *unscanned* message."""
     if reason not in WORDS:
         raise UnknownReason(
             f"no report wording for reason {reason!r} - refusing rather than defaulting, "
             "because the default would claim malware for a message nobody examined")
-    headline, body = WORDS[reason]
+    headline, body = FAILED_WORDS if failed and reason == scan.UNSCANNED else WORDS[reason]
 
     domain = one_line(domain)  # every value this block joins is collapsed first
     sender = quoted(original, "From", "(no From header)")

@@ -7,7 +7,6 @@ What real doveadm answers is measured on the VM.
 
 import json
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -215,6 +214,32 @@ def test_an_archive_folder_that_exists_is_still_given_its_acl(fake):
     fake.answer({"rc": 65, "err": "Can't create mailbox Sent: Mailbox already exists\n"}, {})
     assert doveadm.create_folder("archive@example", "Sent") is False
     assert fake.calls[1][2:4] == ["acl", "set"]
+
+
+def test_a_persons_folder_is_created_subscribed(fake):
+    assert doveadm.subscribed_folder("ivan@example", "Archives/2019") is True
+    assert fake.calls == [["-f", "json", "mailbox", "create", "-s", "-u", "ivan@example",
+                           "Archives/2019"]]
+
+
+def test_a_persons_folder_that_exists_is_subscribed_again(fake):
+    fake.answer({"rc": 65, "err": "Can't create mailbox Archives: Mailbox already exists\n"}, {})
+    assert doveadm.subscribed_folder("ivan@example", "Archives") is False
+    assert fake.calls[1] == ["-f", "json", "mailbox", "subscribe", "-u", "ivan@example", "Archives"]
+
+
+def test_a_refused_subscribed_create_raises_and_subscribes_nothing(fake):
+    fake.answer({"rc": 68, "err": "Error: User doesn't exist\n"})
+    with pytest.raises(DoveadmError):
+        doveadm.subscribed_folder("blocked@example", "Archives")
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize(("login", "folder"), [("ivan@example", "INBOX"), ("archive@example", "Archives")])
+def test_neither_inbox_nor_an_archives_folder_is_subscribed_this_way(fake, login, folder):
+    with pytest.raises(ValueError):
+        doveadm.subscribed_folder(login, folder)
+    assert fake.calls == []
 
 
 def test_only_the_archive_login_is_an_archive():

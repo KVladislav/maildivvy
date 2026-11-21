@@ -201,3 +201,21 @@ def test_the_scan_sees_a_spelled_connection_string(tmp_path):
     planted.write_text('import psycopg2\nc = psycopg2.connect("dbname=x user=y password=z")\n')
     assert {what for _, what in connection_builders(planted)} == {
         "psycopg2.connect", "dbname=", "password="}
+
+
+def test_settings_are_sent_at_connection_start_and_only_when_asked_for(etc, driver):
+    db.connect("pipeline", etc=etc, settings={"statement_timeout": "10s",
+                                              "lock_timeout": "3s"})
+    db.connect("pipeline", etc=etc)
+    [(_, asked), (_, plain)] = driver
+    assert asked["options"] == "-c statement_timeout=10s -c lock_timeout=3s"
+    assert "options" not in plain
+
+
+@pytest.mark.parametrize("name, value", [("statement_timeout", "10s -c role=x"),
+                                         ("lock timeout", "3s"), ("search_path", "a,b")])
+def test_a_setting_that_would_need_quoting_is_refused_before_connecting(etc, driver, name,
+                                                                         value):
+    with pytest.raises(ValueError):
+        db.connect("pipeline", etc=etc, settings={name: value})
+    assert driver == []

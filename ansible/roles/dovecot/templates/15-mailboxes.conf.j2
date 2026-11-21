@@ -12,6 +12,12 @@ namespace inbox {
   mailbox Trash {
     special_use = \Trash
   }
+  # Imported history reaches a person in `Archives/<YYYY>`, made and
+  # subscribed by the top-up through doveadm; never created here, so a person with no
+  # history has no Archives. Marked so a client files its own archived mail beside it.
+  mailbox Archives {
+    special_use = \Archive
+  }
   # Created and subscribed at the first login: an APPEND to a folder that does not
   # exist is refused, so the Sent hook could never fire for a new account.
   mailbox Sent {

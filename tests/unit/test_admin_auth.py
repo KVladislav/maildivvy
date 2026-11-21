@@ -80,6 +80,24 @@ def test_a_password_this_openssl_cannot_be_handed_whole_is_refused_rather_than_t
     assert auth.verify_password(PASSWORD, stored)                        # the control
 
 
+def test_openssl_hashes_256_bytes_whole_and_a_longer_password_is_refused_not_hashed_short():
+    whole = "a" * auth.PASSWORD_MAX
+    # openssl reads all 256 bytes, so the last one counts; past it, it drops the rest
+    assert sha512_crypt(whole) != sha512_crypt(whole[:-1])
+    assert sha512_crypt(whole) == sha512_crypt(whole + "b")
+    stored = auth.make_hash(whole)
+    assert auth.verify_password(whole, stored)
+    cyrillic = "я" * (auth.PASSWORD_MAX // 2)              # two bytes a letter
+    assert auth.verify_password(cyrillic, auth.make_hash(cyrillic))
+    for over in (whole + "b", cyrillic + "я"):
+        with pytest.raises(ValueError, match="256 bytes"):
+            auth.make_hash(over)
+        # what Dovecot refuses, the interface refuses too, though openssl would match it
+        assert not auth.verify_password(over, stored)
+    # a generated password is far inside the limit
+    assert len(auth.generate_password().encode()) < auth.PASSWORD_MAX
+
+
 def test_a_password_of_the_decisions_length_and_of_sixty_four_both_verify():
     for length in (15, 64):
         password = "p" * length
@@ -90,8 +108,9 @@ def test_a_password_of_the_decisions_length_and_of_sixty_four_both_verify():
 
 @pytest.mark.parametrize("typed,login", [("ivan", "ivan"), ("ivan@example.org", "ivan"),
                                          ("ivan@a@b", "ivan"), ("  ivan  ", "ivan"),
-                                         ("IVAN", "IVAN"), ("@example.org", ""), ("", "")])
-def test_the_account_is_the_text_before_the_first_at_and_the_login_is_never_lowercased(typed, login):
+                                         ("IVAN", "ivan"), ("Ivan@Example.org", "ivan"),
+                                         ("@example.org", ""), ("", "")])
+def test_the_account_is_the_text_before_the_first_at_folded_to_lowercase(typed, login):
     assert auth.account_login(typed) == login
 
 
@@ -140,6 +159,31 @@ def test_the_csrf_token_is_bound_to_the_session_and_the_secret_and_forgeable_by_
     assert auth.csrf_token(b"a-secret", "session-one") == token          # deterministic
     assert auth.csrf_token(b"a-secret", "session-two") != token          # another session
     assert auth.csrf_token(b"another-secret", "session-one") != token    # another machine
+
+
+def test_a_pages_csrf_token_is_never_a_valid_cookie_signature():
+    # one key, two uses: each MACs under its own prefix, so a token a page carries signs
+    # no cookie, whatever value the cookie names
+    token = auth.new_token()
+    csrf = auth.csrf_token(b"a-secret", token)
+    for named in (token, token + ":csrf", "csrf:" + token):
+        assert auth.unsign(b"a-secret", f"{named}.{csrf}") is None, named
+    # the control: the cookie this machine signs for the token still reads
+    assert auth.unsign(b"a-secret", auth.sign(b"a-secret", token)) == token
+
+
+def test_an_openssl_that_hangs_is_a_refusal_and_a_failed_hash_never_a_hang(
+        tmp_path, monkeypatch):
+    # `exec`, so the timeout's kill reaches the process that holds the pipes
+    hanging = tmp_path / "openssl"
+    hanging.write_text("#!/bin/sh\nexec sleep 30\n")
+    hanging.chmod(0o755)
+    stored = "{SHA512-CRYPT}" + sha512_crypt(PASSWORD)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setattr(auth, "OPENSSL_TIMEOUT", 0.5)
+    assert not auth.verify_password(PASSWORD, stored)
+    with pytest.raises(ValueError):
+        auth.make_hash(PASSWORD)
 
 
 # --- the two numbers that bound a session ------------------------

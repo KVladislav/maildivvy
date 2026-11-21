@@ -24,7 +24,6 @@ from another program. Jinja escapes both; nothing here marks either safe.
 from flask import request
 
 from maildivvy.admin import app, journal, validate
-from maildivvy.admin.screens import common
 
 HELP = "Exact match — the address, the label or the login as the journal writes it."
 NOTHING = "No journal row matches this filter."
@@ -40,14 +39,15 @@ ANY = "any"
 # and a `help warn` under the field. Kinds and targets are `code` (the Identifier Is Mono
 # Rule); the detail stays escaped JSON text in `code`. The crumb is the way back to the
 # section the link came from, and nothing at all when `back` named no declared section.
-PAGE = """
+PAGE = """{% extends "app.SHELL" %}
+{%- from "common.SHAPES" import back, flash, refused, field %}
 {%- set heading %}Journal{% endset %}
 {%- set lede %}Who did what, when, and to whom. Views and refused attempts are not written here, and
 a provider password never appears in it in any form. An act the pipeline performs carries
 the outcome of the request that was asked for.{% endset %}
 {%- set crumbs %}{%- if crumb -%}
-<a href="{{ crumb.url }}">""" + common.BACK + """ Back to {{ crumb.title }}</a>
-{%- endif -%}{% endset %}
+<a href="{{ crumb.url }}">{{ back() }} Back to {{ crumb.title }}</a>
+{%- endif -%}{% endset %}{% block body %}
 {{ refused(refusal) }}
 <div class="stack">
 <section class="box"><div class="box-body">
@@ -82,7 +82,7 @@ the outcome of the request that was asked for.{% endset %}
 <tbody>
 {%- for row in rows %}
 <tr>
-  <td>{{ row.at }}</td>
+  <td>{{ row.at|moment }}</td>
   <td><code>{{ row.actor }}</code></td>
   <td><code>{{ row.action }}</code></td><td><code>{{ row.target or '' }}</code></td>
   <td class="wrap"><code>{{ detail[row.id] }}</code>
@@ -100,8 +100,7 @@ the outcome of the request that was asked for.{% endset %}
 {%- if typed.target %}
 <p class="muted">{{ outlives }}</p>
 {%- endif %}
-</div>
-"""
+</div>{% endblock %}"""
 
 
 def acts_for(chosen):
@@ -151,7 +150,7 @@ def register(app_):
         rows = ([] if refusal else
                 journal.rows(conn, who=typed["who"], action=typed["action"],
                              target=typed["target"], since=since, until=until))
-        return app.render("Journal", PAGE, section="events",
+        return app.render("Journal", "events.PAGE", section="events",
                           status=400 if refusal else 200, typed=typed,
                           acts=acts_for(typed["action"]), any_act=ANY, help=HELP,
                           rows=rows, nothing=NOTHING, outlives=OUTLIVES,

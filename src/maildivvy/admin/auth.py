@@ -10,8 +10,9 @@ table, because the case it exists for is that table being unusable.
 ⚠️ **Python 3.14 has no `crypt` module**, so a hash is checked the way the machine
 makes one: `openssl passwd -6` with the stored salt, the password on stdin, and a
 constant-time comparison, as for the break-glass hash. `-stdin`
-reads one line, so a password carrying a newline could only be checked truncated - and
-a check that cannot be made whole is a refusal, never an acceptance.
+reads one line of at most 256 bytes, so a password carrying a newline or longer than
+that could only be checked truncated - and a check that cannot be made whole is a
+refusal, never an acceptance.
 
 **The session is a row, not a stamped cookie**. The source's
 signed, server-stateless cookie could not be revoked, so signing out only deleted the
@@ -31,6 +32,7 @@ import hmac
 import re
 import secrets
 import stat
+import string
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +48,14 @@ PREFIX = "{SHA512-CRYPT}"
 # `$6$<salt>$<86>`: what `openssl passwd -6` and `doveadm pw -s SHA512-CRYPT` both make.
 # A `rounds=` hash is deliberately not matched: openssl cannot reproduce one.
 CRYPT = re.compile(r"\$6\$([./A-Za-z0-9]{1,16})\$[./A-Za-z0-9]{86}")
-PASSWORD_MAX = 1024
+# ⛔ `openssl passwd -stdin` hashes the first 256 bytes of a line and drops the rest
+# without a word, while Dovecot hashes all of it: a longer password would be accepted
+# here and refused to every mail client. The limit is bytes of UTF-8, not characters:
+# 128 Cyrillic letters reach it. Every maker of the hash refuses past it.
+PASSWORD_MAX = 256
+# ⛔ A bound on one `openssl passwd`: a hung child must not hold one of the server's ten
+# threads. Past it the check is a refusal and the hash a failure, never a wait.
+OPENSSL_TIMEOUT = 5
 # A hash no password matches, so an unknown login costs the same check as a known one.
 NOBODY = "$6$" + "n" * 16 + "$" + "." * 86
 
@@ -71,18 +80,33 @@ class Identity:
 
 # --- passwords ---------------------------------------------------------------------------
 
-def account_login(typed):
-    """The account a typed login names: the text before the first `@`.
+# ⛔ ASCII ONLY: str.lower() folds the Kelvin sign to `k` and others into the login's
+# alphabet, which no mail client's spelling reaches; Dovecot's own folding is ASCII's.
+LOGIN_CASE = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
-    `ivan` and `ivan@example.org` open the same account. The account's own login is what
+
+def account_login(typed):
+    """The account a typed login names: the text before the first `@`, lowercased.
+
+    `ivan`, `Ivan` and `ivan@example.org` open the same account, as they do in a mail
+    client: Dovecot lowercases a login before it looks one up. The account's own login is what
     is kept and journaled, so one person is one actor.
     """
-    return str(typed or "").strip().split("@", 1)[0]
+    return str(typed or "").strip().split("@", 1)[0].translate(LOGIN_CASE)
+
+
+def too_long(password):
+    """True for a password `openssl passwd` would hash only the start of."""
+    return len(password.encode()) > PASSWORD_MAX
 
 
 def sha512_crypt(password, salt):
-    result = subprocess.run(["openssl", "passwd", "-6", "-stdin", "-salt", salt],
-                            input=password + "\n", capture_output=True, text=True)
+    try:
+        result = subprocess.run(["openssl", "passwd", "-6", "-stdin", "-salt", salt],
+                                input=password + "\n", capture_output=True, text=True,
+                                timeout=OPENSSL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -99,8 +123,8 @@ def make_hash(password):
     """
     if not isinstance(password, str) or not password or "\n" in password:
         raise ValueError("a password to hash is one non-empty line")
-    if len(password) > PASSWORD_MAX:
-        raise ValueError(f"a password is at most {PASSWORD_MAX} characters")
+    if too_long(password):
+        raise ValueError(f"a password is at most {PASSWORD_MAX} bytes")
     salt = "".join(secrets.choice(SALT_ALPHABET) for _ in range(SALT_LENGTH))
     made = sha512_crypt(password, salt)
     if not CRYPT.fullmatch(made):
@@ -129,7 +153,7 @@ def verify_password(typed, stored):
     """True when `typed` is the password behind `stored`, for a hash we can check whole."""
     if not isinstance(typed, str) or not isinstance(stored, str):
         return False
-    if not typed or "\n" in typed or len(typed) > PASSWORD_MAX:
+    if not typed or "\n" in typed or too_long(typed):
         return False
     bare = stored[len(PREFIX):] if stored.startswith(PREFIX) else stored
     match = CRYPT.fullmatch(bare)
@@ -149,6 +173,16 @@ def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+# ⛔ One key, two uses, each MACing under its own prefix: a token a page carries is never
+# the signature of any cookie, whatever value that cookie names.
+CSRF_USE = "csrf:"
+COOKIE_USE = "cookie:"
+
+
+def mac(secret, use, text):
+    return hmac.new(secret, (use + text).encode(), hashlib.sha256).hexdigest()
+
+
 def csrf_token(secret, session_token):
     """A per-session form token, bound to the session's own token by the machine's secret.
 
@@ -157,12 +191,11 @@ def csrf_token(secret, session_token):
     secret, and it dies with the session, so a stolen or guessed one from another session
     does not work. It is a second lock beside the Origin check, not a replacement for it.
     """
-    return hmac.new(secret, (session_token + ":csrf").encode(), hashlib.sha256).hexdigest()
+    return mac(secret, CSRF_USE, session_token)
 
 
 def sign(secret, token):
-    mac = hmac.new(secret, token.encode(), hashlib.sha256).hexdigest()
-    return f"{token}.{mac}"
+    return f"{token}.{mac(secret, COOKIE_USE, token)}"
 
 
 def unsign(secret, value):
@@ -184,6 +217,17 @@ def break_glass_hash(conn):
     return row[0] if row else None
 
 
+def is_administrators_login(conn, login):
+    """True for a login an administrator signs in with: the break-glass one, or an
+    account's that carries the flag. What the throttle keeps a count for past an
+    address's cap of logins (`throttle.MAX_LOGINS`)."""
+    if login == BREAK_GLASS_LOGIN:
+        return True
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM account WHERE login = %s AND is_admin", (login,))
+        return cursor.fetchone() is not None
+
+
 def authenticate(conn, typed, password):
     """The identity behind a typed login and password, or None. One refusal for every no.
 
@@ -197,9 +241,12 @@ def authenticate(conn, typed, password):
         if stored and verify_password(password, stored):
             return Identity(BREAK_GLASS_LOGIN, None, True)
         return None
+    # ⛔ FOR SHARE: a password change not yet committed holds the row, so this sign-in
+    # waits for it and reads the new hash, rather than opening a session with the old
+    # password that the change, committing after it, would not end
     with conn.cursor() as cursor:
         cursor.execute("SELECT id, login, password_hash, is_admin, state FROM account "
-                       "WHERE login = %s", (login,))
+                       "WHERE login = %s FOR SHARE", (login,))
         row = cursor.fetchone()
     if row is None:
         verify_password(password, NOBODY)     # the same work for a login that is not there

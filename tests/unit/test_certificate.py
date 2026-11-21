@@ -802,13 +802,43 @@ def test_the_rendered_configuration_has_what_the_program_reads_and_no_secret(tmp
     expected, _ = config(tmp_path, mode=mode)
     assert set(rendered) == set(expected)
     assert rendered["mode"] == mode
-    assert rendered["published_cert"] == f"/etc/ssl/certs/{NAME}.crt"
+    assert rendered["published_cert"] == f"/etc/maildivvy/tls/{NAME}.crt"
     assert rendered["published_key"] == f"/etc/ssl/private/{NAME}.key"
     assert (rendered["cert_owner"], rendered["cert_group"], rendered["key_group"]) == ("root", "root", "ssl-cert")
     assert rendered["deploy_hook"] == "/usr/local/sbin/maildivvy-cert deploy"
     assert rendered["credentials_dir"] == "/etc/lego/credentials"
     assert rendered["credentials_env"] == "/etc/maildivvy/certificate.env"
     assert (rendered["provided_cert"], rendered["provided_chain"], rendered["provided_key"]) == (None, None, None)
+
+
+def test_an_earlier_certificate_is_carried_over_before_publishing_and_removed_after_every_step():
+    """The old file is copied, never overwriting, before any task that publishes; the steps
+    after 5 still name it until they restart their daemon, so it goes only in the play's
+    untagged closing tasks, which run once every step passed."""
+    import yaml
+    tasks = role_yaml("tasks", "main.yml")
+    names = [t["name"] for t in tasks]
+    carry = tasks[names.index("Carry an earlier version's certificate over to its new path")]
+    copy = carry["ansible.builtin.copy"]
+    assert (copy["src"], copy["dest"], copy["force"]) == ("{{ maildivvy_retired_cert }}",
+                                                          "{{ maildivvy_published_cert }}", False)
+    publishing = [i for i, t in enumerate(tasks) if "maildivvy_cert_program" in json.dumps(t)
+                  and "ansible.builtin.copy" not in t]
+    assert publishing and names.index(carry["name"]) < min(publishing)
+    assert role_values("self-signed")["maildivvy_published_cert"].startswith("/etc/maildivvy/tls/")
+    retired = _jinja().from_string(role_yaml("vars", "main.yml")["maildivvy_retired_cert"]).render(
+        maildivvy_cert_name=NAME)
+    assert retired == f"/etc/ssl/certs/{NAME}.crt"
+
+    (play,) = yaml.safe_load((ROOT / "ansible" / "site.yml").read_text())
+    closing = [t for t in play["post_tasks"] if "maildivvy_retired_cert" in json.dumps(t)]
+    assert [t["name"] for t in closing] == [
+        "No consumer's configuration names the certificate's earlier path",
+        "Remove the earlier certificate and every hash link to it", "Read the CA directory back"]
+    assert not any("tags" in t for t in closing)
+    assert "-delete" in closing[1]["ansible.builtin.command"]["argv"]
+    assert "-delete" not in closing[2]["ansible.builtin.command"]["argv"]
+    assert not any("maildivvy_retired_cert" in json.dumps(t) for t in play["tasks"])
 
 
 def test_the_provided_paths_are_recorded_for_a_later_replacement():
@@ -902,6 +932,27 @@ def test_the_first_issuance_reads_back_the_deploy_hooks_own_lines_not_only_legos
     lines = []
     cert.deploy(values, Systemctl(enabled={"dovecot"}), out=lines.append)
     assert lines[0] == f"published {values['published_cert']} and {values['published_key']}"
+
+
+@pytest.mark.parametrize("role", ["postfix", "interface"])
+def test_a_consumers_role_puts_no_account_in_ssl_cert_and_runs_no_deploy_hook(role):
+    # smtpd and nginx's master read the key as root, so neither account joins `ssl-cert`
+    # and no role re-runs the hook for a reload a membership would have needed. Each
+    # takes an earlier version's membership away instead, only when it is there.
+    import yaml
+    tasks = yaml.safe_load((ROOT / "ansible" / "roles" / role / "tasks" / "main.yml").read_text())
+    assert not [t for t in tasks if "ansible.builtin.user" in t]
+    assert not [t for t in tasks if t.get("ansible.builtin.command", {}).get("argv", [None])[1:] == ["deploy"]]
+    [read] = [t for t in tasks if t.get("ansible.builtin.command", {}).get("argv") == ["getent", "group", "ssl-cert"]]
+    [leave] = [t for t in tasks if t.get("ansible.builtin.command", {}).get("argv", [None])[0] == "gpasswd"]
+    argv = leave["ansible.builtin.command"]["argv"]
+    assert argv[:2] == ["gpasswd", "-d"] and argv[3] == "ssl-cert"
+    assert read["register"] in leave["when"] and tasks.index(read) < tasks.index(leave)
+    # the daemon is restarted while a running process still holds the group, never on
+    # this run's own change alone
+    [held] = [t for t in tasks if t.get("ansible.builtin.command", {}).get("argv", [None])[0] == "ps"]
+    [restart] = [t for t in tasks if f"'ssl-cert' in {held['register']}.stdout" in str(t.get("when", ""))]
+    assert " is changed" not in restart["when"] and tasks.index(leave) < tasks.index(held) < tasks.index(restart)
 
 
 def _strings(node):

@@ -85,6 +85,36 @@
       ansible.builtin.import_role: {name: publish}
       tags: [publish]
   post_tasks:
+    # An earlier version served the certificate from /etc/ssl/certs, where any
+    # update-ca-certificates run gave a self-signed one a hash link, a root of the
+    # machine's default trust store. Step 5 carried it to its new path; it goes
+    # here, once steps 8, 9 and 15 have restarted Dovecot, Postfix and the proxy onto that
+    # path. Untagged: a run with --tags leaves it.
+    - name: No consumer's configuration names the certificate's earlier path
+      ansible.builtin.command:
+        argv: [grep, -rlF, --, "{{ maildivvy_retired_cert }}", /etc/postfix, /etc/dovecot, /etc/nginx]
+      register: maildivvy_retired_named
+      changed_when: false
+      failed_when: maildivvy_retired_named.rc != 1
+    - name: Remove the earlier certificate and every hash link to it
+      ansible.builtin.command:
+        argv: [find, /etc/ssl/certs, -maxdepth, 1, "(", -path, "{{ maildivvy_retired_cert }}", -o, -type, l, "(",
+               -lname, "{{ maildivvy_retired_cert | basename }}", -o, -lname, "{{ maildivvy_retired_cert }}", ")", ")",
+               -print, -delete]
+      register: maildivvy_retired_removed
+      changed_when: maildivvy_retired_removed.stdout != ''
+    - name: Read the CA directory back
+      ansible.builtin.command:
+        argv: [find, /etc/ssl/certs, -maxdepth, 1, "(", -path, "{{ maildivvy_retired_cert }}", -o, -type, l, "(",
+               -lname, "{{ maildivvy_retired_cert | basename }}", -o, -lname, "{{ maildivvy_retired_cert }}", ")", ")",
+               -print]
+      register: maildivvy_retired_left
+      changed_when: false
+    - name: Neither the earlier certificate nor a hash link to it is left
+      ansible.builtin.assert:
+        that: maildivvy_retired_left.stdout == ''
+        fail_msg: "left in /etc/ssl/certs: {{ maildivvy_retired_left.stdout_lines }}"
+        quiet: true
     # maildivvy-install records the version itself, once every step passed; a run
     # from a control machine records it here. Untagged: a run with --tags records nothing.
     - name: Record the version this run installed

@@ -16,7 +16,8 @@ from maildivvy.fetch import render
 
 ROW = dict(id=7, pop3_login="recent:ivan.p@example.org", address="Ivan.P@example.org",
            pop3_host="pop.example.org", pop3_port=995, label="alpha", window=14,
-           target="ivan.p@example.org", threshold=8.00, held_since=None, keep=False, pin=None)
+           target="ivan.p@example.org", threshold=8.00, held_since=None, keep=False, pin=None,
+           protocol=render.POP3, imap_uidvalidity=None, imap_last_uid=None)
 PIN = ":".join(["AB", "01"] * 16)
 
 BINDIR = "/opt/maildivvy/bin"
@@ -208,6 +209,22 @@ def test_the_shell_mpop_starts_is_replaced_by_the_filter_and_holds_no_pipe_of_it
     assert command.split()[2] == "--retrieval"
 
 
+def test_the_imap_run_tells_the_filter_what_the_delivery_line_does_but_the_retrieval():
+    """One function builds both: the domain and its threshold reach the filter alike by
+    either protocol. An IMAP run holds the message whole before the filter starts, so
+    the filter is not told it reads a retrieval."""
+    began = datetime(2026, 9, 20, 6, 24, tzinfo=timezone.utc)
+    held = mailbox(held_since=began, threshold=12.5, protocol=render.IMAP)
+    argv = render.delivery_argv(held, BINDIR, 1800)
+    assert argv == [f"{BINDIR}/maildivvy-deliver", "--domain", "alpha", "--spam-threshold",
+                    "12.50", "--held-since", "2026-09-20T06:24:00+00:00",
+                    "--hold-bound-seconds", "1800"]
+    assert render.delivery_command(held, BINDIR, 1800) == " ".join(
+        ["exec", argv[0], "--retrieval", *argv[1:]])
+    with pytest.raises(render.RenderError):
+        render.delivery_argv(mailbox(threshold=None), BINDIR)
+
+
 def test_a_threshold_the_query_lost_raises_on_the_first_mailbox():
     with pytest.raises(render.RenderError) as raised:
         rendered(threshold=None)
@@ -266,6 +283,10 @@ def test_every_template_slot_is_filled():
 def test_the_row_is_unpacked_by_name_so_a_lost_column_never_shifts_another():
     assert render.Mailbox._fields == (
         "id", "pop3_login", "address", "pop3_host", "pop3_port", "label", "window",
-        "target", "threshold", "held_since", "keep", "pin")
+        "target", "threshold", "held_since", "keep", "pin", "protocol", "imap_uidvalidity",
+        "imap_last_uid")
+    # no field has a default, the IMAP three included: a row short of one column
+    # fails to unpack, rather than the column after it taking its place
+    assert render.Mailbox(*range(15)).imap_last_uid == 14
     with pytest.raises(TypeError):
-        render.Mailbox(*range(len(render.Mailbox._fields) - 1))
+        render.Mailbox(*range(14))

@@ -11,6 +11,9 @@ fails with an error that names nothing. Every diagnostic goes to stderr.
 ⛔ A MAILBOX WITH NO CREDENTIAL EXITS 1 WITH AN EMPTY STDOUT, AND THAT IS NOT A PROGRAM
 ERROR: an external mailbox is legitimately added before its credential is
 known. A usage error exits 64 and a configuration error 78, so each case is told apart.
+
+An IMAP row's session is the runner's own, not mpop's: collection and the snapshot read
+the credential on the runner's connection (`secret_of`) and hand it to the session.
 """
 
 import sys
@@ -21,6 +24,15 @@ CONSUMER = "pipeline"
 
 EX_USAGE = 64
 EX_CONFIG = 78
+
+NO_SECRET = "no password is stored for this mailbox; nothing was sent to the provider"
+
+
+def secret_of(cursor, mailbox_id):
+    """The provider credential, read on the runner's own connection, or None."""
+    cursor.execute("SELECT credential FROM external_mailbox WHERE id = %s", (mailbox_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 
 def main(argv=None):

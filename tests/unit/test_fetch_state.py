@@ -205,7 +205,7 @@ def test_the_copy_is_removed_even_when_the_listing_raises(tmp_path):
     uidls(tmp_path, HEADER, "abc 1")
     with pytest.raises(ZeroDivisionError):
         with state.listing_copy(tmp_path) as copy:
-            1 / 0
+            1 / 0  # noqa: B018 - the failure inside the block
     assert not copy.exists()
 
 

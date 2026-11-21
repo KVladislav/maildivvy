@@ -401,6 +401,22 @@ def test_a_charset_no_codec_on_this_machine_knows_declines():
     assert "x-no-such-charset" in detail
 
 
+@pytest.mark.parametrize("declared, said", [
+    (b"charset=utf-8", f"{marks.UNKNOWN_CHARSET}: charset too long"),
+    (b"Content-Type", f"{marks.UNKNOWN_TRANSFER_ENCODING}: transfer encoding too long"),
+])
+def test_a_senders_name_too_long_to_be_one_is_not_copied_into_the_detail(declared, said):
+    """The detail goes into a header line of ours; a charset name is at most 40
+    characters (the IANA registry), and a 5 KB one is the sender's text, not a name."""
+    if declared == b"Content-Type":
+        raw = PLAIN.replace(b"Content-Type", b"Content-Transfer-Encoding: " + b"x" * 5000
+                            + b"\r\nContent-Type")
+    else:
+        raw = PLAIN.replace(declared, b"charset=" + b"x" * 5000)
+    out, detail = marked_body(raw)
+    assert out == raw and detail == said
+
+
 def test_a_notice_the_leafs_charset_cannot_hold_declines():
     raw = PLAIN.replace(b"charset=utf-8", b"charset=us-ascii")
     out, detail = marked_body(raw, notice="— gemarkeerd als spam\n")

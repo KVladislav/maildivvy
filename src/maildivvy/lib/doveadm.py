@@ -37,6 +37,7 @@ from maildivvy.lib import store
 DOVEADM = "/usr/bin/doveadm"
 TIMEOUT = 300  # seconds
 EX_DATAERR = 65
+EX_NOUSER = 68  # its exit for a mailbox that does not exist (measured)
 ALREADY_EXISTS = "Mailbox already exists"
 ACL_OFF = ("-o", "mail_plugins/acl=no")
 ARCHIVE_ACL = ("owner", "lookup", "read", "write-seen")
@@ -75,6 +76,16 @@ def sessions(login):
     return _json([DOVEADM, "-f", "json", "who", "-1", login], f"who -1 {login}")
 
 
+def kick(mask):
+    """End every session whose login matches `mask` (`*@<domain>` for a whole domain).
+
+    It only asks: each IMAP process ends on its own a moment later, writing on its way
+    out, so a caller that removes the login's directories waits until `sessions` reads
+    none. It answers `[{"count": "<n>"}]`, n being how many it asked to end.
+    """
+    return _json([DOVEADM, "-f", "json", "kick", mask], f"kick {mask}")
+
+
 def _json(argv, command, input=None, timeout=TIMEOUT):
     """Run one doveadm command and read its answer as a JSON list."""
     try:
@@ -91,6 +102,26 @@ def _json(argv, command, input=None, timeout=TIMEOUT):
     if not isinstance(answer, list):
         raise DoveadmError(f"doveadm {command} printed JSON that is not a list")
     return answer
+
+
+def subscribed_folder(login, folder):
+    """Create a folder of a PERSON's mailbox through Dovecot and subscribe it; True if made.
+
+    A folder that exists is subscribed all the same, so one the person made, or
+    unsubscribed, is shown by every client that lists subscriptions alone. Never
+    an archive's: its folders carry the archive's ACL, which `create_folder` gives them.
+    """
+    store.mailbox_name(*folder.split(store.SEPARATOR))
+    if folder.upper() == "INBOX" or is_archive(login):
+        raise ValueError(f"{folder} of {login} is not a person's folder to subscribe")
+    try:
+        run(("mailbox", "create", "-s"), login, folder)
+        return True
+    except DoveadmError as err:
+        if err.returncode != EX_DATAERR or ALREADY_EXISTS not in str(err):
+            raise
+    run(("mailbox", "subscribe"), login, folder)
+    return False
 
 
 def mailbox_status(login, mailbox, *fields):

@@ -1,2 +1,4 @@
 # Derived from the settings; not settings themselves.
 maildivvy_mpop_expected: mpop version {{ maildivvy_mpop_version }}
+# The packages installed before the first build: the operator's, kept for good.
+maildivvy_mpop_record: /var/lib/maildivvy/mpop-build-before

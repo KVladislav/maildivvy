@@ -20,7 +20,17 @@ Every file is held to the migration rules before anything is applied:
   reader not replaced first fails the file instead of being dropped;
 - a file that drops a column holds its rollback in a `-- rollback:` comment;
 - a view that is dropped is granted again in the same file, since the drop takes its
-  grants with it.
+  grants with it;
+- past the initial schema, a file only adds, or says in a `-- previous release:` comment
+  why the previous release is not affected. An upgrade applies the migrations before any
+  step replaces the programs, so the previous release's daemons, milter, interface and
+  Sent hook run on the new schema until their step, or for good if an earlier step fails.
+  What does not only add: a dropped table, view, column, function, type or
+  default, a rename, a retyped column, `SET NOT NULL`, an added table constraint or
+  unique index, a NOT NULL column without a default, a grant revoked from a role, row
+  level security switched on. A
+  replaced view keeps its columns (PostgreSQL refuses otherwise); what it returns is
+  the author's to keep readable.
 """
 
 import argparse
@@ -49,6 +59,20 @@ _TRANSACTION = re.compile(
 _DROP_COLUMN = re.compile(r"\bDROP\s+COLUMN\b([^;]*)", re.IGNORECASE)
 _DROP_VIEW = re.compile(r"\bDROP\s+VIEW\s+(?:IF\s+EXISTS\s+)?([a-z_][a-z0-9_]*)", re.IGNORECASE)
 _ROLLBACK_COMMENT = re.compile(r"^\s*--\s*rollback:", re.IGNORECASE | re.MULTILINE)
+INITIAL = "0001"
+_NARROWS = re.compile(
+    r"\bDROP\s+(?:TABLE|VIEW|MATERIALIZED\s+VIEW|COLUMN|FUNCTION|PROCEDURE|TYPE|DOMAIN|SEQUENCE|SCHEMA|DEFAULT|ROLE|OWNED)\b"
+    r"|\bRENAME\b|\b(?:ENABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b"
+    r"|\bALTER\s+(?:COLUMN\s+)?[a-z_][a-z0-9_]*\s+(?:SET\s+DATA\s+)?TYPE\b"
+    r"|\bSET\s+NOT\s+NULL\b"
+    r"|\bADD\s+(?:CONSTRAINT|CHECK|UNIQUE|PRIMARY\s+KEY|FOREIGN\s+KEY|EXCLUDE)\b"
+    r"|\bCREATE\s+UNIQUE\s+INDEX\b"
+    r"|\bREVOKE\b[^;]*?\bFROM\b(?!\s*PUBLIC\s*(?:CASCADE|RESTRICT)?\s*(?:;|\Z))",
+    re.IGNORECASE)
+# an added column, up to the next clause of its ALTER TABLE or the statement's end
+_ADD_COLUMN = re.compile(r"\bADD\s+(?!(?:CONSTRAINT|CHECK|UNIQUE|PRIMARY|FOREIGN|EXCLUDE|VALUE)\b)(?:COLUMN\s+)?"
+                         r"(.*?)(?=,\s*(?:ADD|ALTER|DROP|RENAME|SET|VALIDATE)\b|;|\Z)", re.IGNORECASE | re.DOTALL)
+_SPARED_COMMENT = re.compile(r"^\s*--\s*previous release:[ \t]*\S", re.IGNORECASE | re.MULTILINE)
 
 
 class SchemaError(Exception):
@@ -88,6 +112,19 @@ def check_migration(name, text):
         view = match.group(1)
         if not re.search(rf"\bGRANT\b[^;]*\bON\s+(?:TABLE\s+)?{view}\b", top, re.IGNORECASE):
             raise SchemaError(f"{name} drops view {view} and does not grant it again")
+    if name.startswith(f"{INITIAL}_") or _SPARED_COMMENT.search(text):
+        return
+    narrows = _NARROWS.search(top)
+    what = narrows and " ".join(narrows.group(0).split())[:60]
+    for match in _ADD_COLUMN.finditer(top):
+        added = match.group(1)
+        if re.search(r"\bNOT\s+NULL\b", added, re.IGNORECASE) \
+                and not re.search(r"\b(DEFAULT|GENERATED)\b", added, re.IGNORECASE):
+            what = what or f"ADD {' '.join(added.split()[:1])} NOT NULL with no default"
+    if what:
+        raise SchemaError(f"{name}: {what} may break the previous release's programs, which run on the new "
+                          "schema until the upgrade's steps replace them: a migration only adds, or says why the "
+                          "previous release is not affected in a '-- previous release:' comment")
 
 
 def migrations(directory=DEFAULT_DIR):
@@ -156,7 +193,7 @@ def main(argv=None):
             done = apply(conn, args.dir)
         finally:
             conn.close()
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 - one line for the operator, and exit 1
         print(f"maildivvy-schema: {err}", file=sys.stderr)
         return 1
     names = {m.version: m.name for m in pending}

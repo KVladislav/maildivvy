@@ -218,7 +218,7 @@ def imap_failures(marker, address):
     """A failed LOGIN ended by LOGOUT, then one ended by closing: Dovecot 2.4.2 writes them as
     `Logged out (auth failed, …)` and `Connection closed (auth failed, …)`. Then a session that logs out without a login: the control."""
     for suffix, close in (("a", "logout"), ("b", "shutdown")):
-        for attempt in (1, 2):
+        for _attempt in (1, 2):
             client = imaplib.IMAP4_SSL(address, 993, ssl_context=loose_tls(), timeout=60)
             try:
                 client.login(f"{marker}-{suffix}@{MARKER_DOMAIN}", secrets.token_hex(8))
@@ -236,7 +236,7 @@ def imap_failures(marker, address):
 def smtp_failures(marker, address):
     """A refused AUTH PLAIN, then, as the control, the refusal at RCPT TO that the outside
     probe itself meets: the jail must not count the probe."""
-    for attempt in (1, 2):
+    for _attempt in (1, 2):
         client = smtplib.SMTP_SSL(address, 465, context=loose_tls(), timeout=60)
         client.ehlo(MARKER_DOMAIN)
         try:
@@ -471,7 +471,7 @@ def prove(wanted_ignores, maxretry, rng=None):
         source = jail.source()
         if jail.guesser:
             # a clean source first: a penalty left by an earlier run would lose this failure
-            until(lambda: doveadm_penalty(source) == 0, seconds=CLEAN)
+            until(lambda: doveadm_penalty(source) == 0, seconds=CLEAN)  # noqa: B023 - until() calls it before the loop moves on
         entry["filter"], found = prove_filter(jail, marker, source, since)
         problems += found
 

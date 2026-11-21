@@ -295,8 +295,8 @@ def test_a_connect_failure_and_a_query_failure_are_both_the_temporary_refusal():
 
 # --- the scan at submission -----------------------------------------------------
 
-def verdict(kind, detail="detail"):
-    return scan.Verdict(kind, detail)
+def verdict(kind, detail="detail", failed=False):
+    return scan.Verdict(kind, detail, failed)
 
 
 def test_a_clean_message_goes_on_to_the_queue():
@@ -336,3 +336,16 @@ def test_infected_and_unavailable_are_unchanged_by_the_setting():
     for value in ["send", "refuse"]:
         assert decide_scan(verdict(scan.INFECTED), value).code == "550"
         assert decide_scan(verdict(scan.UNAVAILABLE), value).code == "451"
+
+
+def test_a_message_the_scanner_failed_on_is_refused_for_good_whatever_the_domain_says():
+    """The domain's setting is about size. A message the daemon failed on while it still
+    answers PING is refused permanently under both settings, so it never leaves
+    unscanned, and the client is not told to retry what fails the same way again."""
+    failed = verdict(scan.UNSCANNED, "clamd: Error writing to temporary file ERROR; the "
+                     "daemon answers PING, so it failed on this message", failed=True)
+    for value in ["send", "refuse", None]:
+        refusal = decide_scan(failed, value)
+        assert (refusal.action, refusal.code, refusal.dsn) == (REJECT, "554", "5.7.0"), value
+        assert "could not be scanned" in refusal.text
+        assert "Error writing to temporary file" in refusal.text

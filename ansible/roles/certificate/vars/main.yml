@@ -1,6 +1,11 @@
 # Derived from the settings; not settings themselves.
-maildivvy_published_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
+# The certificate is served from a directory no trust store reads: in /etc/ssl/certs,
+# update-ca-certificates' rehash made a self-signed one a root of the machine's default
+# store. The key stays in the distribution's /etc/ssl/private.
+maildivvy_published_cert: /etc/maildivvy/tls/{{ maildivvy_cert_name }}.crt
 maildivvy_published_key: /etc/ssl/private/{{ maildivvy_cert_name }}.key
+# where an earlier version served it; an upgrade carries it over and removes it
+maildivvy_retired_cert: /etc/ssl/certs/{{ maildivvy_cert_name }}.crt
 # staging never shares production's storage path
 maildivvy_lego_path: "{{ maildivvy_lego_dir }}{{ '/staging' if maildivvy_cert_mode == 'acme-staging' else '' }}"
 maildivvy_acme_server: "{{ 'letsencrypt-staging' if maildivvy_cert_mode == 'acme-staging' else 'letsencrypt' }}"

@@ -11,12 +11,14 @@ import hashlib
 import io
 import json
 import os
+import signal
 import stat
 import tarfile
 
 import pytest
 
 from maildivvy.backup import archive, pause, run, status
+from maildivvy.lib import schema
 
 UTC = datetime.timezone.utc
 
@@ -97,6 +99,15 @@ def test_the_run_an_upgrade_holds_is_neither_counted_nor_named_for_removal():
     names = [f"202609{day:02d}T000000Z" for day in range(1, 5)]
     assert archive.beyond_keep(names, 1, held="20260901T000000Z") == ["20260902T000000Z", "20260903T000000Z"]
     assert archive.beyond_keep(names, 1, held=None) == names[:-1]
+
+
+def test_the_newest_run_marked_store_copied_is_the_pair(tmp_path):
+    for name in ["20260901T000000Z", "20260902T000000Z", "20260903T000000Z", ".x.partial"]:
+        (tmp_path / name).mkdir()
+    assert archive.newest_paired(tmp_path) is None
+    for name in ["20260901T000000Z", "20260902T000000Z", ".x.partial"]:
+        (tmp_path / name / archive.PAIRED).touch()
+    assert archive.newest_paired(tmp_path) == "20260902T000000Z"
 
 
 @pytest.mark.parametrize("keep", [0, -1])
@@ -212,7 +223,7 @@ def test_an_archive_reaching_outside_its_directory_is_refused(tmp_path):
         info = tarfile.TarInfo("fetch/../../escaped")
         info.size = len(data)
         out.addfile(info, io.BytesIO(data))
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017 - refused, whichever way the archive module says it
         archive.extract_state(tar, tmp_path / "staged")
     assert not (tmp_path / "escaped").exists()
 
@@ -220,17 +231,27 @@ def test_an_archive_reaching_outside_its_directory_is_refused(tmp_path):
 # --- the pause -----------------------------------------------------------------------------
 
 
-class Systemd:
-    """systemctl as a recorder: which timers are active, and what each service is doing."""
+# Every timer started again, in the pause's order, after a run that stopped them all.
+STARTED = ["start maildivvy-fetch.timer", "start maildivvy-pass.timer",
+           "start maildivvy-snapshot.timer"]
 
-    def __init__(self, active=pause.TIMERS, busy=None, fail_start=()):
+
+class Systemd:
+    """systemctl as a recorder: which timers are active, which are not installed at all,
+    and what each service is doing."""
+
+    def __init__(self, active=pause.TIMERS, busy=None, fail_start=(), missing=()):
         self.timers = set(active)
         self.busy = dict(busy or {})     # service -> how many more polls it stays busy
         self.fail_start = set(fail_start)
+        self.missing = set(missing)      # units systemd has never been given
         self.calls = []
 
     def active(self, unit):
         return unit in self.timers
+
+    def installed(self, unit):
+        return unit not in self.missing
 
     def stop(self, unit):
         self.calls.append(("stop", unit))
@@ -260,7 +281,9 @@ def test_collection_and_fan_out_are_stopped_before_anything_is_taken_and_started
         seen.append(set(systemd.timers))
     assert seen == [set()]
     assert systemd.calls == [("stop", "maildivvy-fetch.timer"), ("stop", "maildivvy-pass.timer"),
-                             ("start", "maildivvy-fetch.timer"), ("start", "maildivvy-pass.timer")]
+                             ("stop", "maildivvy-snapshot.timer"),
+                             ("start", "maildivvy-fetch.timer"), ("start", "maildivvy-pass.timer"),
+                             ("start", "maildivvy-snapshot.timer")]
 
 
 def test_a_run_already_going_is_waited_for_and_never_cut_short():
@@ -273,6 +296,58 @@ def test_a_run_already_going_is_waited_for_and_never_cut_short():
     assert len(slept) == 3
     assert all(call[0] != "stop" or call[1].endswith(".timer") for call in systemd.calls)
     assert any("maildivvy-fetch.service" in line for line in said)
+
+
+def test_a_refetch_beside_the_pass_is_waited_for_and_no_timer_of_its_own_is_paused():
+    """The pass's timer starts the requests unit too, and a refetch there writes the fetch
+    state the backup takes: its run is waited out like the pass's. It has no timer, so an
+    upgrade from a release without it starts again exactly what it stopped."""
+    systemd = Systemd(busy={"maildivvy-requests.service": 2})
+    slept = []
+    with pause.paused(systemd, sleep=slept.append, say=quiet):
+        assert systemd.busy == {"maildivvy-requests.service": 0}
+    assert len(slept) == 2
+    assert pause.TIMERS == ("maildivvy-fetch.timer", "maildivvy-pass.timer",
+                            "maildivvy-snapshot.timer")
+
+
+def test_a_snapshots_slice_is_paused_with_collection_and_waited_for():
+    """A slice writes into the store and onto its row for up to ten minutes: its timer is
+    stopped with collection's, and a slice already going is waited out, never cut short."""
+    assert "maildivvy-snapshot.timer" in pause.TIMERS
+    assert "maildivvy-snapshot.service" in pause.SERVICES
+    systemd, said = Systemd(busy={"maildivvy-snapshot.service": 2}), []
+    with pause.paused(systemd, sleep=quiet, say=said.append):
+        assert "maildivvy-snapshot.timer" not in systemd.timers
+        assert systemd.busy == {"maildivvy-snapshot.service": 0}
+    assert ("stop", "maildivvy-snapshot.timer") in systemd.calls
+    assert said == ["waiting for maildivvy-snapshot.service to finish its run"]
+    assert systemd.timers == set(pause.TIMERS)
+
+
+def test_a_timer_installed_inside_the_pause_is_started_with_the_rest_and_a_missing_one_passed():
+    """An upgrade to the release that adds the snapshot's timer installs it, enabled and left
+    stopped, inside its own pause: nobody stopped it, so the pause starts it with the
+    others. One still not installed when the pause ends is passed without an error."""
+    systemd = Systemd(active={"maildivvy-fetch.timer", "maildivvy-pass.timer"},
+                      missing={"maildivvy-snapshot.timer"})
+    with pause.paused(systemd, sleep=quiet, say=quiet):
+        systemd.missing.clear()   # what ran inside installed it
+    assert systemd.timers == set(pause.TIMERS)
+    assert ("stop", "maildivvy-snapshot.timer") not in systemd.calls
+
+    # an upgrade that failed before its install step: nothing installed it, nothing raised
+    systemd = Systemd(active={"maildivvy-fetch.timer", "maildivvy-pass.timer"},
+                      missing={"maildivvy-snapshot.timer"})
+    with pause.paused(systemd, sleep=quiet, say=quiet):
+        pass
+    assert systemd.timers == {"maildivvy-fetch.timer", "maildivvy-pass.timer"}
+    assert ("start", "maildivvy-snapshot.timer") not in systemd.calls
+    # the control: one installed and stopped by the operator stays stopped
+    systemd = Systemd(active={"maildivvy-fetch.timer", "maildivvy-pass.timer"})
+    with pause.paused(systemd, sleep=quiet, say=quiet):
+        pass
+    assert "maildivvy-snapshot.timer" not in systemd.timers
 
 
 def test_a_timer_the_operator_had_stopped_stays_stopped():
@@ -308,6 +383,20 @@ def test_a_timer_refused_for_starting_too_often_is_cleared_and_started_again():
                      ["start", "maildivvy-fetch.timer"]]
 
 
+def test_a_unit_systemd_reads_as_not_found_is_one_never_installed():
+    shown = {"maildivvy-fetch.timer": "loaded\n", "maildivvy-snapshot.timer": "not-found\n"}
+    asked = []
+
+    def run(argv, **kwargs):
+        asked.append(argv[1:])
+        return type("Done", (), {"returncode": 0, "stdout": shown[argv[-1]], "stderr": ""})()
+
+    systemd = pause.Systemd(run=run)
+    assert systemd.installed("maildivvy-fetch.timer")
+    assert not systemd.installed("maildivvy-snapshot.timer")
+    assert asked[0] == ["show", "-p", "LoadState", "--value", "maildivvy-fetch.timer"]
+
+
 def test_one_timer_that_will_not_start_does_not_keep_the_other_stopped():
     systemd = Systemd(fail_start={"maildivvy-fetch.timer"})
     with pytest.raises(pause.SystemdError, match="maildivvy-fetch.timer"):
@@ -323,7 +412,7 @@ def test_a_run_killed_inside_the_pause_leaves_a_record_its_units_stop_resumes_fr
     systemd, record = Systemd(), tmp_path / "paused.json"
     killed = pause.paused(systemd, sleep=quiet, say=quiet, record=record)
     killed.__enter__()                       # ... and the process dies here: no __exit__
-    assert systemd.timers == set() and json.loads(record.read_text()) == list(pause.TIMERS)
+    assert systemd.timers == set() and pause.read_record(record) == list(pause.TIMERS)
     assert pause.resume_recorded(systemd, record, say=quiet) == 0
     assert systemd.timers == set(pause.TIMERS) and not record.exists()
     # after an ordinary run there is nothing to resume, and nothing is started
@@ -338,7 +427,7 @@ def test_the_next_run_resumes_what_a_killed_run_left_stopped_and_nothing_the_ope
     record.write_text(json.dumps(["maildivvy-fetch.timer"]))
     systemd = Systemd(active=())
     with pause.paused(systemd, sleep=quiet, say=quiet, record=record):
-        assert json.loads(record.read_text()) == ["maildivvy-fetch.timer"]
+        assert pause.read_record(record) == ["maildivvy-fetch.timer"]
     assert systemd.timers == {"maildivvy-fetch.timer"} and not record.exists()
 
 
@@ -348,7 +437,7 @@ def test_a_resume_cut_short_keeps_its_record_for_the_units_stop(tmp_path):
     with pytest.raises(pause.SystemdError):
         with pause.paused(systemd, sleep=quiet, say=quiet, record=record):
             pass
-    assert json.loads(record.read_text()) == list(pause.TIMERS)
+    assert pause.read_record(record) == list(pause.TIMERS)
     systemd.fail_start.clear()
     assert pause.resume_recorded(systemd, record, say=quiet) == 0
     assert systemd.timers == set(pause.TIMERS) and not record.exists()
@@ -357,14 +446,22 @@ def test_a_resume_cut_short_keeps_its_record_for_the_units_stop(tmp_path):
 # --- one run, in order ----------------------------------------------------
 
 
+# what this tree's programs ship, which a restore compares a run's schema with (0098)
+SHIPPED = [m.version for m in schema.migrations()]
+
+
 class Database:
     """pg_dump and pg_restore as a recorder, writing files a judge can read."""
 
-    def __init__(self, calls, rows=None, listed=None, fail=None):
+    def __init__(self, calls, rows=None, listed=None, fail=None, migrations=None):
         self.calls = calls
         self.rows = rows or {"account": 2, "audit": 0, "domain": 1}
         self.listed = listed
         self.fail = fail
+        self.held_migrations = SHIPPED if migrations is None else migrations
+
+    def migrations(self, path):
+        return list(self.held_migrations)
 
     def dump(self, path):
         self.calls.append("dump")
@@ -385,7 +482,7 @@ class Database:
     def restore(self, path):
         self.calls.append("restore")
         if self.fail == "restore":
-            raise archive.BackupError("pg_restore exited 1")
+            raise run.NotRestored("pg_restore exited 1, nothing was restored")
 
 
 class Recorder(Systemd):
@@ -406,8 +503,10 @@ def machine(tmp_path, calls, store_copy=None, copy_exit=0, keep=8, **database):
     backups = tmp_path / "backups"
     backups.mkdir(mode=0o700)
     paths = run.Paths(backups=backups, fetch=state_tree(tmp_path),
-                      status=tmp_path / "status" / "status.json", held=tmp_path / "upgrade-held")
+                      status=tmp_path / "status" / "status.json", held=tmp_path / "upgrade-held",
+                      upgrade_paused=tmp_path / "upgrade-paused.json", version=tmp_path / "version")
     paths.status.parent.mkdir()
+    paths.version.write_text("0.3.0\n")
 
     def copy(command, stamp):
         calls.append(f"store copy {command} {stamp}")
@@ -425,12 +524,12 @@ def test_a_run_pauses_takes_the_dump_and_the_state_then_the_store_copy_then_resu
     calls = []
     backup = machine(tmp_path, calls, store_copy="copy-the-store")
     assert backup.take() == 0
-    assert calls == ["stop maildivvy-fetch.timer", "stop maildivvy-pass.timer", "dump",
-                     "store copy copy-the-store 20260923T000000Z", ["20260923T000000Z"],
-                     "start maildivvy-fetch.timer", "start maildivvy-pass.timer"]
+    assert calls == ["stop maildivvy-fetch.timer", "stop maildivvy-pass.timer",
+                     "stop maildivvy-snapshot.timer", "dump",
+                     "store copy copy-the-store 20260923T000000Z", ["20260923T000000Z"], *STARTED]
     taken = backup.paths.backups / "20260923T000000Z"
     assert sorted(p.name for p in taken.iterdir()) == sorted(
-        [archive.DUMP, archive.MANIFEST, archive.STATE])
+        [archive.DUMP, archive.MANIFEST, archive.STATE, archive.PAIRED])
 
 
 def test_a_run_and_everything_in_it_is_readable_by_root_alone(tmp_path):
@@ -446,7 +545,7 @@ def test_a_failed_dump_leaves_nothing_that_looks_like_one_and_collection_resumes
     backup = machine(tmp_path, calls, fail="dump")
     assert backup.take() == 1
     assert list(backup.paths.backups.iterdir()) == [backup.paths.backups / ".lock"]
-    assert calls[-2:] == ["start maildivvy-fetch.timer", "start maildivvy-pass.timer"]
+    assert calls[-3:] == STARTED
     assert not backup.paths.status.exists()
 
 
@@ -465,7 +564,7 @@ def test_a_run_with_no_fetch_state_fails_after_the_dump_and_keeps_no_dump(tmp_pa
     assert backup.take() == 1
     assert "dump" in calls
     assert archive.complete_runs(os.listdir(backup.paths.backups)) == []
-    assert calls[-1] == "start maildivvy-pass.timer"
+    assert calls[-3:] == STARTED
 
 
 def test_a_store_copy_that_fails_fails_the_run_but_keeps_the_dump_and_resumes(tmp_path):
@@ -473,7 +572,7 @@ def test_a_store_copy_that_fails_fails_the_run_but_keeps_the_dump_and_resumes(tm
     backup = machine(tmp_path, calls, store_copy="false", copy_exit=3)
     assert backup.take() == 1
     assert archive.complete_runs(os.listdir(backup.paths.backups)) == ["20260923T000000Z"]
-    assert calls[-2:] == ["start maildivvy-fetch.timer", "start maildivvy-pass.timer"]
+    assert calls[-3:] == STARTED
     assert json.loads(backup.paths.status.read_text())["store_copy"] == "failed, exit 3"
 
 
@@ -494,6 +593,47 @@ def test_a_run_removes_the_runs_beyond_the_count_and_a_dead_runs_leftovers(tmp_p
     assert left == [".lock", "20260923T000001Z", "20260923T000002Z"]
 
 
+def test_days_of_a_failing_store_copy_never_remove_the_last_dump_that_has_one(tmp_path):
+    """The dump is half of a pair: once the store copy fails every night, the runs that
+    follow have no store to restore with, and the count alone would rotate out the last
+    one that has."""
+    backup = machine(tmp_path, [], store_copy="copy-the-store", keep=8)
+    assert backup.take() == 0
+    paired = archive.complete_runs(os.listdir(backup.paths.backups))[-1]
+    assert (backup.paths.backups / paired / archive.PAIRED).is_file()
+    copied = backup.store_copy
+    backup.store_copy = lambda command, stamp: 3
+    for _ in range(9):
+        assert backup.take() == 1
+    left = archive.complete_runs(os.listdir(backup.paths.backups))
+    assert left[0] == paired and len(left) == 9
+    assert [run for run in left if (backup.paths.backups / run / archive.PAIRED).exists()] == [paired]
+
+    backup.store_copy = copied
+    for _ in range(2):
+        assert backup.take() == 0
+    assert paired not in os.listdir(backup.paths.backups)   # a newer pair took its place
+
+
+def test_the_status_names_the_newest_run_whose_store_copy_succeeded(tmp_path):
+    """Health reads the restore point from the status: the runs are root's alone."""
+    def newest():
+        return json.loads(backup.paths.status.read_text())["newest_store_copied"]
+
+    backup = machine(tmp_path, [], store_copy="copy-the-store")
+    backup.store_copy = lambda command, stamp: 3
+    assert backup.take() == 1
+    assert newest() is None   # failed, and no run before it has a store copy
+    backup.store_copy = lambda command, stamp: 0
+    assert backup.take() == 0
+    paired = json.loads(backup.paths.status.read_text())["stamp"]
+    assert newest() == paired
+    backup.store_copy = lambda command, stamp: 3
+    assert backup.take() == 1
+    assert json.loads(backup.paths.status.read_text())["stamp"] != paired
+    assert newest() == paired
+
+
 def test_the_run_a_failed_upgrade_holds_as_its_way_back_outlives_the_count_until_the_hold_ends(tmp_path):
     """The backup from before an upgrade's migrations is the only one the old version can
     restore: the nightly runs and the retries taken while it is held never remove it."""
@@ -508,9 +648,10 @@ def test_the_run_a_failed_upgrade_holds_as_its_way_back_outlives_the_count_until
     assert sorted(os.listdir(backup.paths.backups)) == [".lock", "20260923T000003Z"]
 
 
-def test_the_backup_and_the_upgrade_read_one_hold():
+def test_the_backup_and_the_upgrade_read_one_hold_and_one_upgrade_pause():
     from maildivvy.installer import upgrade
     assert run.Paths().held == upgrade.HELD
+    assert run.Paths().upgrade_paused == upgrade.PAUSE_RECORD
 
 
 def test_the_status_names_the_newest_run_and_what_it_held(tmp_path):
@@ -532,8 +673,8 @@ def test_a_restore_puts_back_the_database_and_the_state_of_one_run_together(tmp_
     (backup.paths.fetch / "9").mkdir()
     calls.clear()
     assert backup.restore("20260923T000000Z") == 0
-    assert calls == ["stop maildivvy-fetch.timer", "stop maildivvy-pass.timer", "restore",
-                     "start maildivvy-fetch.timer", "start maildivvy-pass.timer"]
+    assert calls == ["stop maildivvy-fetch.timer", "stop maildivvy-pass.timer",
+                     "stop maildivvy-snapshot.timer", "restore", *STARTED]
     assert archive.state_entries(backup.paths.fetch) == taken
 
 
@@ -547,8 +688,246 @@ def test_a_database_restore_that_fails_leaves_the_state_as_it_was(tmp_path):
     backup.database.fail = "restore"
     assert backup.restore("20260923T000000Z") == 1
     assert archive.state_entries(backup.paths.fetch) == now
-    assert calls[-2:] == ["start maildivvy-fetch.timer", "start maildivvy-pass.timer"]
+    assert calls[-3:] == STARTED
     assert [p.name for p in backup.paths.fetch.parent.iterdir() if "restore" in p.name] == []
+
+
+@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGINT, signal.SIGTERM],
+                         ids=["SIGHUP", "SIGINT", "SIGTERM"])
+def test_a_run_by_hand_told_to_stop_resumes_collection_on_its_way_out(tmp_path, signum):
+    """Run from a shell, the program has no unit's ExecStopPost behind it: an SSH session
+    that drops (SIGHUP) or a Ctrl-C (SIGINT) unwinds it through the pause's `finally` as
+    systemd's SIGTERM does, instead of leaving collection stopped until the next run."""
+    calls = []
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    (backup.paths.fetch / "5" / "uidls").write_text("moved on\n")
+    now = archive.state_entries(backup.paths.fetch)
+    backup.database = ClientDatabase(tmp_path, signal_from="pg_restore", signum=signum)
+    handlers = {s: signal.getsignal(s) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)}
+    try:
+        run.stop_on_signals()
+        assert backup.restore("20260923T000000Z") == 1
+    finally:
+        for s, handler in handlers.items():
+            signal.signal(s, handler)
+    assert calls[-3:] == STARTED
+    assert not backup.paused_record.exists()
+    assert archive.state_entries(backup.paths.fetch) == now
+
+
+def test_the_state_is_the_runs_before_the_database_can_commit(tmp_path):
+    """A restore stopped between its two steps must leave the state older than the
+    database, never newer: an older state fetches mail again, a newer one skips it."""
+    backup = machine(tmp_path, [])
+    assert backup.take() == 0
+    taken = archive.state_entries(backup.paths.fetch)
+    (backup.paths.fetch / "5" / "uidls").write_text("moved on\n")
+    seen = []
+    backup.database.restore = lambda path: seen.append(archive.state_entries(backup.paths.fetch))
+    assert backup.restore("20260923T000000Z") == 0
+    assert seen == [taken]
+
+
+def test_a_restore_stopped_inside_its_commit_leaves_collection_stopped_until_run_again(tmp_path):
+    """psql told to stop after the COMMIT was sent: the database may hold either side. The
+    state stays the run's, which at worst fetches again, and collection stays stopped until
+    the restore is run again."""
+    calls, said = [], []
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    taken = archive.state_entries(backup.paths.fetch)
+    (backup.paths.fetch / "5" / "uidls").write_text("moved on\n")
+    backup.database = ClientDatabase(tmp_path, signal_from="psql", signum=signal.SIGTERM)
+    backup.say = said.append
+    calls.clear()
+    handlers = {s: signal.getsignal(s) for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)}
+    try:
+        run.stop_on_signals()
+        assert backup.restore("20260923T000000Z") == 1
+    finally:
+        for s, handler in handlers.items():
+            signal.signal(s, handler)
+    assert archive.state_entries(backup.paths.fetch) == taken
+    assert not [c for c in calls if c.startswith("start ")]
+    assert backup.paused_record.exists()
+    assert any("--restore 20260923T000000Z" in line for line in said), said
+    assert sorted(p.name for p in backup.paths.fetch.parent.iterdir() if p.name.startswith(".")) == []
+
+    backup.database = Database(calls)
+    assert backup.restore("20260923T000000Z") == 0
+    assert archive.state_entries(backup.paths.fetch) == taken
+    assert calls[-3:] == STARTED
+    assert not backup.paused_record.exists()
+
+
+def test_a_restore_stopped_inside_its_state_swap_is_completed_by_a_second_run(tmp_path, monkeypatch):
+    calls = []
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    taken = archive.state_entries(backup.paths.fetch)
+    (backup.paths.fetch / "5" / "uidls").write_text("moved on\n")
+    (backup.paths.fetch / "9").mkdir()
+    renames, rename = [], os.rename
+
+    def stopped_at_the_second(source, target):
+        renames.append(source)
+        if len(renames) == 2:
+            raise run.Terminated("told to stop (signal 15)")
+        rename(source, target)
+
+    monkeypatch.setattr(run.os, "rename", stopped_at_the_second)
+    calls.clear()
+    assert backup.restore("20260923T000000Z") == 1
+    monkeypatch.undo()
+    assert "restore" not in calls
+    assert not [c for c in calls if c.startswith("start ")]
+
+    assert backup.restore("20260923T000000Z") == 0
+    assert archive.state_entries(backup.paths.fetch) == taken
+    assert calls[-3:] == STARTED
+
+
+def torn(tmp_path, calls):
+    """A restore stopped after its COMMIT went out: collection left stopped, the record its."""
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    backup.database.restore = lambda path: (_ for _ in ()).throw(
+        archive.BackupError("psql exited 2 after the COMMIT was sent"))
+    assert backup.restore("20260923T000000Z") == 1
+    backup.database = Database(calls)
+    calls.clear()
+    return backup
+
+
+def test_a_backup_after_a_torn_restore_is_refused_and_leaves_collection_stopped(tmp_path):
+    """Its dump would be the database a restore may not have reached, beside the run's
+    state, as the newest run; and its resume would fetch over that pair. It refuses until
+    the restore is run again, and names it."""
+    calls, said = [], []
+    backup = torn(tmp_path, calls)
+    backup.say = said.append
+    newest = backup.paths.status.read_text()
+    assert backup.take() == 1
+    assert calls == [] and backup.systemd.timers == set()
+    assert backup.paths.status.read_text() == newest
+    assert any("maildivvy-backup --restore 20260923T000000Z" in line for line in said), said
+    assert sorted(p.name for p in backup.paths.backups.iterdir()) == [".lock", "20260923T000000Z"]
+
+    assert backup.restore("20260923T000000Z") == 0
+    assert not backup.paused_record.exists()
+    assert backup.take() == 0
+    assert backup.systemd.timers == set(pause.TIMERS)
+
+
+def test_the_units_resume_starts_nothing_a_restore_left_stopped_or_is_still_holding(tmp_path):
+    """The daily run fails on the lock while a restore by hand runs, and its ExecStopPost
+    reads the restore's record; or the restore was torn. Neither is the unit's to start."""
+    calls, said = [], []
+    backup = torn(tmp_path, calls)
+    assert run.resume(backup.systemd, backup.paths, said.append) == 1
+    assert calls == [] and backup.paused_record.exists()
+    assert any("maildivvy-backup --restore 20260923T000000Z" in line for line in said), said
+
+
+def test_a_backup_inside_an_upgrades_pause_starts_no_timer_the_upgrade_holds(tmp_path):
+    """The timers are the upgrade's while its record is there: a backup that would resume
+    what a killed run of its own recorded, or the unit's stop after it, would start
+    collection under the upgrade's migrations. Its record stays for a run after."""
+    calls = []
+    backup = machine(tmp_path, calls)
+    backup.systemd.timers.clear()
+    backup.paths.upgrade_paused.write_text(json.dumps({"by": "upgrade", "timers": list(pause.TIMERS)}))
+    pause.write_record(backup.paused_record, ["maildivvy-fetch.timer"], {"by": "backup"})
+    assert backup.take() == 0
+    assert run.resume(backup.systemd, backup.paths, quiet) == 0
+    assert not [c for c in calls if c.startswith("start ")]
+    assert pause.read(backup.paused_record)["timers"] == ["maildivvy-fetch.timer"]
+
+    backup.paths.upgrade_paused.unlink()     # the upgrade finished, and started its own
+    backup.systemd.timers.update({"maildivvy-pass.timer", "maildivvy-snapshot.timer"})
+    assert backup.take() == 0
+    assert backup.systemd.timers == set(pause.TIMERS) and not backup.paused_record.exists()
+
+
+def test_a_restore_that_completes_inside_an_upgrades_pause_leaves_the_timers_to_it(tmp_path):
+    """The way back from a failed upgrade restores first: the restore must not start
+    collection before the old version's installer runs, nor leave a record that refuses
+    the next backup."""
+    calls = []
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    backup.paths.upgrade_paused.write_text(json.dumps({"by": "upgrade", "timers": list(pause.TIMERS)}))
+    calls.clear()
+    assert backup.restore("20260923T000000Z") == 0
+    assert not [c for c in calls if c.startswith("start ")]
+    assert pause.read(backup.paused_record) == {"by": "backup", "timers": list(pause.TIMERS)}
+    assert run.unfinished_restore(backup.paused_record) is None
+
+
+def inside_an_upgrades_pause(tmp_path, calls):
+    """A machine with one run taken, then every timer stopped by an upgrade and recorded as its."""
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    backup.systemd.timers.clear()
+    backup.paths.upgrade_paused.write_text(json.dumps({"by": "upgrade", "timers": list(pause.TIMERS)}))
+    calls.clear()
+    return backup
+
+
+@pytest.mark.parametrize("how", ["take", "restore"])
+def test_a_run_that_stopped_no_timer_inside_an_upgrades_pause_leaves_no_record(tmp_path, how):
+    """The upgrade's own backup, and the restore on the way back from a failed upgrade, find
+    every timer stopped already: there is nothing to hand over. A record naming no timer
+    would still read as a pause to whatever finds it (the import stops on it) until the
+    next backup removed it."""
+    calls = []
+    backup = inside_an_upgrades_pause(tmp_path, calls)
+    assert getattr(backup, how)(*(["20260923T000000Z"] if how == "restore" else [])) == 0
+    assert not [c for c in calls if str(c).startswith(("stop ", "start "))]
+    assert not backup.paused_record.exists()
+    assert run.resume(backup.systemd, backup.paths, quiet) == 0 and backup.systemd.timers == set()
+
+
+def test_a_torn_restore_inside_an_upgrades_pause_keeps_its_record_though_it_names_no_timer(
+        tmp_path, monkeypatch):
+    """The record is what refuses the next backup and names the restore to run again: it
+    stays the restore's whether or not the restore stopped a timer, and a second run that
+    could not even begin its pause does not take it away."""
+    calls = []
+    backup = inside_an_upgrades_pause(tmp_path, calls)
+    backup.database.restore = lambda path: (_ for _ in ()).throw(
+        archive.BackupError("psql exited 2 after the COMMIT was sent"))
+    assert backup.restore("20260923T000000Z") == 1
+    torn = {"by": "restore", "stamp": "20260923T000000Z", "timers": []}
+    assert pause.read(backup.paused_record) == torn
+    assert backup.take() == 1 and pause.read(backup.paused_record) == torn
+
+    def full(record, timers, owner):
+        raise OSError("No space left on device")
+    monkeypatch.setattr(pause, "write_record", full)
+    backup.database = Database(calls)
+    assert backup.restore("20260923T000000Z") == 1
+    assert pause.read(backup.paused_record) == torn and "restore" not in calls
+
+
+@pytest.mark.parametrize("by, how", [("backup", "take"), ("restore", "restore")])
+def test_the_pause_record_says_who_stopped_the_timers(tmp_path, by, how):
+    backup = machine(tmp_path, [])
+    assert backup.take() == 0
+    seen = []
+    backup.database.dump = backup.database.restore = lambda *a: seen.append(
+        pause.read(backup.paused_record)) or {}
+    getattr(backup, how)(*(["20260923T000000Z"] if how == "restore" else []))
+    expected = {"by": by, "timers": list(pause.TIMERS)}
+    assert seen == [expected | ({"stamp": "20260923T000000Z"} if by == "restore" else {})]
+
+
+def test_a_record_written_before_it_named_its_owner_is_still_resumed(tmp_path):
+    """A record left by the release before, a bare list of timers, is still read."""
+    record = tmp_path / "paused.json"
+    record.write_text(json.dumps(["maildivvy-fetch.timer"]))
+    assert pause.read(record) == {"by": None, "timers": ["maildivvy-fetch.timer"]}
 
 
 def test_a_restore_of_a_run_that_is_not_there_changes_nothing(tmp_path):
@@ -556,6 +935,152 @@ def test_a_restore_of_a_run_that_is_not_there_changes_nothing(tmp_path):
     backup = machine(tmp_path, calls)
     assert backup.restore("20260101T000000Z") == 1
     assert calls == []
+
+
+# --- which release took a run, and whether this machine may restore it (0098) ----------------------
+
+
+def manifest_of(backup, stamp):
+    return json.loads((backup.paths.backups / stamp / archive.MANIFEST).read_text())
+
+
+def test_a_runs_manifest_names_the_release_the_schema_and_a_hold_it_was_taken_under(tmp_path):
+    backup = machine(tmp_path, [])
+    assert backup.take() == 0
+    found = manifest_of(backup, "20260923T000000Z")
+    assert (found["release"], found["migrations"], found["upgrade_held"]) == ("0.3.0", SHIPPED, None)
+    backup.paths.held.write_text("20260923T000000Z\n")
+    assert backup.take() == 0
+    assert manifest_of(backup, "20260923T000001Z")["upgrade_held"] == "20260923T000000Z"
+    backup.paths.version.unlink()   # a first install that has not finished
+    assert backup.take() == 0
+    assert manifest_of(backup, "20260923T000002Z")["release"] is None
+
+
+OLDER = SHIPPED[:-1]
+
+
+@pytest.mark.parametrize("manifest, installed, refused", [
+    # the schema the installed programs ship, whichever release took it
+    ({"release": "0.3.0", "migrations": SHIPPED}, "0.3.1", None),
+    ({"release": "0.3.0", "migrations": SHIPPED, "upgrade_held": "20260101T000000Z"}, "0.3.0", None),
+    # the way back from a failed upgrade: its programs may be in place, its version is not
+    ({"release": "0.2.1", "migrations": OLDER}, "0.2.1", None),
+    # a rebuilt machine on the newest release, a run of an older one
+    ({"release": "0.2.1", "migrations": OLDER}, "0.3.0", "install 0.2.1 first"),
+    # taken while a failed upgrade held its way back: the new migrations are in it
+    ({"release": "0.2.1", "migrations": OLDER, "upgrade_held": "20260101T000000Z"}, "0.2.1",
+     "Restore that run"),
+    ({"release": None, "migrations": OLDER}, None, "no finished install"),
+])
+def test_a_run_is_restored_only_on_its_own_schema_or_its_own_release(manifest, installed, refused):
+    said = run.not_restorable("20260923T000000Z", manifest, installed, SHIPPED)
+    assert said is None if refused is None else refused in said
+
+
+def test_a_restore_on_another_release_and_schema_is_refused_before_it_pauses_anything(tmp_path):
+    calls, said = [], []
+    backup = machine(tmp_path, calls, migrations=OLDER)
+    assert backup.take() == 0
+    calls.clear()
+    backup.paths.version.write_text("0.3.1\n")
+    backup.say = said.append
+    assert backup.restore("20260923T000000Z") == 1
+    assert calls == [] and "taken by Maildivvy 0.3.0" in said[-1] and "install 0.3.0 first" in said[-1]
+    backup.paths.version.write_text("0.3.0\n")   # the release that took it: restored
+    assert backup.restore("20260923T000000Z") == 0 and "restore" in calls
+
+
+def test_a_run_from_before_its_manifest_named_a_release_is_restored_with_a_warning(tmp_path):
+    calls, said = [], []
+    backup = machine(tmp_path, calls)
+    assert backup.take() == 0
+    found = backup.paths.backups / "20260923T000000Z" / archive.MANIFEST
+    old = {k: v for k, v in json.loads(found.read_text()).items()
+           if k not in ("release", "migrations", "upgrade_held")}
+    found.write_text(json.dumps(old))
+    backup.say = said.append
+    assert backup.restore("20260923T000000Z") == 0
+    assert "records neither the release nor the schema" in said[0]
+
+
+def test_the_schema_is_read_from_the_dumps_own_rows():
+    decoded = ["COPY public.account (id) FROM stdin;\n", "0002\tnot a version\n", "\\.\n",
+               "COPY public.schema_version (version, name, applied_at) FROM stdin;\n",
+               "0002\t0002_x.sql\t2026-01-01\n", "0001\t0001_initial.sql\t2026-01-01\n", "\\.\n"]
+    assert archive.migrations_of(decoded) == ["0001", "0002"]
+    assert archive.migrations_of([]) == []
+
+
+def test_the_backup_reads_the_version_file_the_installer_writes():
+    from maildivvy.installer import upgrade
+    assert run.Paths().version == upgrade.VERSION_FILE
+
+
+# --- the database restore: what pg_restore decodes goes to psql in one transaction --------------
+
+
+class ClientDatabase(run.Database):
+    """The real restore, with pg_restore and psql replaced by scripts that record."""
+
+    def __init__(self, tmp_path, decode_exit=0, client_fails=False, psql_exit=0,
+                 signal_from=None, signum=signal.SIGTERM):
+        super().__init__()
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        self.sent = tmp_path / "psql-stdin"
+        # the run told to stop while one of its two children works: the child signals us
+        stop = {name: f"kill -s {signal.Signals(signum).name[3:]} $PPID\n" if name == signal_from
+                else "" for name in ("pg_restore", "psql")}
+        (bin_dir / "pg_restore").write_text(
+            "#!/bin/sh\n"
+            f"echo \"$@\" > {tmp_path / 'pg_restore-argv'}\n"
+            "echo 'CREATE TABLE public.account ();'\n"
+            + stop["pg_restore"] + f"exit {decode_exit}\n")
+        (bin_dir / "psql").write_text(
+            f"#!/bin/sh\necho \"$@\" > {tmp_path / 'psql-argv'}\n" + (
+                "echo 'psql: error: connection refused' >&2\nexit 2\n" if client_fails
+                else f"cat > {self.sent}\n" + stop["psql"] + f"exit {psql_exit}\n"))
+        for name in ("pg_restore", "psql"):
+            (bin_dir / name).chmod(0o755)
+        self.path = f"{bin_dir}:{os.environ['PATH']}"
+
+    def _environment(self):
+        return {"PATH": self.path, "PGDATABASE": "maildivvy", "PGUSER": "maildivvy_owner"}
+
+
+def test_a_restore_replaces_what_the_owner_holds_and_commits_only_a_checked_whole(tmp_path):
+    """A migration's objects that the dump does not know (a view over a dumped table) would
+    stop pg_restore's own clean: what the owner holds goes first, in the same transaction
+    as the restore and the grants' check."""
+    database = ClientDatabase(tmp_path)
+    database.restore(tmp_path / "database.dump")
+    assert "--file=-" in (tmp_path / "pg_restore-argv").read_text().split()
+    assert "ON_ERROR_STOP=1" in (tmp_path / "psql-argv").read_text()
+    sent = database.sent.read_text()
+    order = ["BEGIN;", "DROP OWNED BY CURRENT_USER;", "CREATE TABLE public.account ();",
+             "RESET search_path;", "SELECT check_grants();", "COMMIT;"]
+    assert [line for line in sent.splitlines() if line] == order
+
+
+def test_a_dump_that_does_not_decode_to_its_end_is_never_committed(tmp_path):
+    database = ClientDatabase(tmp_path, decode_exit=1)
+    with pytest.raises(run.NotRestored, match="nothing was restored"):
+        database.restore(tmp_path / "database.dump")
+    assert "COMMIT" not in database.sent.read_text()
+
+
+def test_an_error_inside_the_transaction_is_known_to_have_restored_nothing(tmp_path):
+    """psql's exit 3 is a statement that failed under ON_ERROR_STOP: the COMMIT never ran,
+    or was the statement that failed."""
+    with pytest.raises(run.NotRestored, match="psql exited 3"):
+        ClientDatabase(tmp_path, psql_exit=3).restore(tmp_path / "database.dump")
+
+
+def test_a_client_lost_after_the_commit_was_sent_is_not_known_to_have_restored_nothing(tmp_path):
+    with pytest.raises(archive.BackupError, match="may or may not") as raised:
+        ClientDatabase(tmp_path, psql_exit=2).restore(tmp_path / "database.dump")
+    assert not isinstance(raised.value, run.NotRestored)
 
 
 # --- the settings ----------------------------------------------------------------------------------
@@ -594,3 +1119,8 @@ def test_a_status_file_that_names_no_run_is_no_backup(tmp_path, text):
     path = tmp_path / "status.json"
     path.write_text(text)
     assert status.problem(path) is not None
+
+
+def test_a_client_that_cannot_connect_is_named_as_the_reason(tmp_path):
+    with pytest.raises(archive.BackupError, match="psql exited 2.*connection refused"):
+        ClientDatabase(tmp_path, client_fails=True).restore(tmp_path / "database.dump")

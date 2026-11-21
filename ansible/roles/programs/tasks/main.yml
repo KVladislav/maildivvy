@@ -107,6 +107,26 @@
     group: vmail
     mode: "0700"
 
+# the snapshot unit's one writable path, made before it first starts,
+# on the store's filesystem in either disk layout: step 2 made and mounted the store
+- name: The snapshots of IMAP mailboxes, vmail 0700, beside the domains in the store
+  ansible.builtin.file:
+    path: "{{ maildivvy_snapshots }}"
+    state: directory
+    owner: vmail
+    group: vmail
+    mode: "0700"
+
+# where the operator stages files for maildivvy-import, on the store's filesystem
+# in either disk layout, so the import renames them into the store rather than copying
+- name: The import's staging directory, vmail 0700, beside the snapshots
+  ansible.builtin.file:
+    path: "{{ maildivvy_imports }}"
+    state: directory
+    owner: vmail
+    group: vmail
+    mode: "0700"
+
 # --- the libraries the code imports ----------------------------------------------
 
 - name: Install the interface's library, the distribution's
@@ -173,9 +193,10 @@
         mode: "0600"
       changed_when: false
 
-    # compares every path, owner, mode and digest; when any differs, removes /opt/maildivvy
-    # first and writes it whole, caches left out, then reads it back
-    - name: Deploy the code tree to /opt/maildivvy, removing the destination first when it differs
+    # compares every path, owner, mode and digest; when any differs, writes the tree whole
+    # beside /opt/maildivvy, caches left out, swaps it in at once (the running programs never
+    # find the directory missing), removes the old one and reads the new one back
+    - name: Deploy the code tree to /opt/maildivvy, swapping a whole new tree in when it differs
       maildivvy_tree:
         archive: "{{ maildivvy_code_remote.path }}"
         dest: "{{ maildivvy_opt }}"

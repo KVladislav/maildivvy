@@ -13,10 +13,16 @@ role holds no UPDATE or DELETE on it.
 `request_id` names the request an act asked for, so the journal screen can show
 whether the pipeline performed it and why not.
 
-**The secret filter judges each value by its shape, never by its key**. Refusing a key because its name contains "credential" is what broke
+**The secret filter judges each value by its shape, and never withholds by its key**.
+Refusing a key because its name contains "credential" is what broke
 the first real password change in the predecessor: `{"credential_set": true}` was withheld.
 The filter is a second line only - the real guarantee is that the interface's role
 cannot read the credential at all.
+
+One exemption reads the field: a login has three character classes as often as
+not (`ivan_petrov_01`), so under the fields `LOGIN_FIELDS` names for its act, a value that
+matches the login's own pattern is written as itself. Anything else there, and every
+other field, is still judged by its shape alone.
 """
 
 import json
@@ -39,17 +45,20 @@ INTERFACE_ACTS = (
     "create_account", "set_password", "set_account_state", "grant_admin", "revoke_admin",
     "add_external_mailbox", "deactivate_external_mailbox", "set_credential",
     "set_provider_servers", "set_pop3_login", "set_smtp_login", "set_delete_window", "resume_fetch",
-    "break_glass_use",
+    "break_glass_use", "set_protocol", "request_snapshot",
 )
 # Written by the pipeline, in the name of the administrator who asked for it.
-# These are exactly the request kinds of `schema/0001_initial.sql`.
+# These are exactly the request kinds of the newest migration that lists them.
 PIPELINE_ACTS = (
     "create_domain", "create_mailbox", "connect", "top_up", "deliver_one", "release",
     "delete_account", "delete_mailbox", "delete_external_mailbox", "delete_domain",
-    "transfer", "refetch", "test_credential", "activate_external_mailbox",
+    "transfer", "refetch", "test_credential", "activate_external_mailbox", "discard_snapshot",
 )
-# Written by the fetch runner, whose actor is the fetcher itself.
-FETCHER_ACTS = ("auto_skip_message", "fetch_frozen")
+# Written by the fetch runner, whose actor is the fetcher itself: the bounded retry's two,
+# the IMAP mark an activation's check set or reset, and a message passed over the
+# cap.
+FETCHER_ACTS = ("auto_skip_message", "fetch_frozen", "imap_mark_set", "imap_mark_reset",
+                "oversize_skip_message")
 DECLARED = frozenset(INTERFACE_ACTS + PIPELINE_ACTS + FETCHER_ACTS)
 
 WITHHELD = "<withheld>"
@@ -57,6 +66,16 @@ LONG = 200            # a string longer than this is withheld whatever its shape
 SHAPED = 12           # a string at least this long, with no space and no `@`, may be one
 CLASSES = 3           # ... when it mixes at least this many character classes
 LIMIT = 500           # at most this many rows are read
+
+# The detail keys that carry a login, per act. The transfer's recipient stays
+# readable after their account is deleted, and a POP3 or SMTP login is
+# journalled before and after because a login is not a secret.
+LOGIN_FIELDS = {
+    "transfer": ("to_login",),
+    "create_mailbox": ("login",),
+    "set_pop3_login": ("before", "after"),
+    "set_smtp_login": ("before", "after"),
+}
 
 INSERT = ("INSERT INTO audit (actor, action, target, detail, break_glass, request_id) "
           "VALUES (%s, %s, %s, %s::jsonb, %s, %s)")
@@ -120,6 +139,16 @@ def filtered(value):
     return value          # booleans, numbers and null always pass
 
 
+def filtered_detail(action, detail):
+    """`detail` filtered, with a login under its act's login fields written as itself."""
+    logins = LOGIN_FIELDS.get(action, ())
+    if not logins or not isinstance(detail, dict):
+        return filtered(detail)
+    return {key: item if key in logins and isinstance(item, str)
+            and validate.ACCOUNT_LOGIN.fullmatch(item) else filtered(item)
+            for key, item in detail.items()}
+
+
 def detail_text(detail):
     """The detail as the JSON text it is written and shown as."""
     return json.dumps(detail if detail is not None else {}, sort_keys=True, default=str)
@@ -132,7 +161,7 @@ def record(conn, actor, action, target=None, detail=None, break_glass=False, req
             f"{action!r} is not a declared act; declare it in journal.INTERFACE_ACTS "
             "before any screen writes it")
     with conn.cursor() as cursor:
-        cursor.execute(INSERT, (actor, action, target, detail_text(filtered(detail)),
+        cursor.execute(INSERT, (actor, action, target, detail_text(filtered_detail(action, detail)),
                                 break_glass, request_id))
 
 
@@ -144,8 +173,13 @@ def date_filter(text):
     """
     if text is None or not str(text).strip():
         return None
+    typed = str(text).strip()
     try:
-        return date.fromisoformat(str(text).strip())
+        # ⚠️ fromisoformat also reads a week date (`2026-W45`) and a basic one
+        # (`20261101`): the filter would narrow to a day nobody typed
+        if not validate.CALENDAR_DATE.fullmatch(typed):
+            raise ValueError(typed)
+        return date.fromisoformat(typed)
     except ValueError:
         raise validate.Refused("A date is written YYYY-MM-DD.") from None
 

@@ -10,7 +10,7 @@ maildivvy_db_port: 5432
 maildivvy_owner_conf: /etc/maildivvy/owner/db.conf
 maildivvy_owner_passfile: /etc/maildivvy/owner/pgpass
 
-maildivvy_schema_program: /opt/maildivvy/bin/maildivvy-schema
+maildivvy_schema_program: "{{ maildivvy_opt }}/bin/maildivvy-schema"
 
 # One role per consumer, each with its own password in its own passfile (#), in /etc/maildivvy/<consumer>/ beside a db.conf with no password: db.conf
 # `0640 root:<group>`, pgpass `0600 <reader>`. The consumer

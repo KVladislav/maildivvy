@@ -5,7 +5,7 @@
 # through the owner's own db.conf and passfile, over the unix socket.
 [Unit]
 Description=Maildivvy: back up the database and the fetch state together
-Documentation=file://{{ maildivvy_backup_opt }}/lib/maildivvy/backup/run.py
+Documentation=file://{{ maildivvy_opt }}/lib/maildivvy/backup/run.py
 After=postgresql.service
 
 [Service]
@@ -35,7 +35,8 @@ UMask=0077
 # already written, leaving a 45-byte archive of nothing and a unit in exit-code.
 # Nothing here writes as anyone but root, so nothing else is kept.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The database over its unix socket, systemd over D-Bus (the pause, systemd-run): no IP.
+RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true

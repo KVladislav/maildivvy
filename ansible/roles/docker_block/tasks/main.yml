@@ -1,8 +1,10 @@
 # Install step 4: the container firewall block in /etc/ufw/after.rules, before Docker
 # exists. An edit keeps a pre-change copy and runs under a
-# self-reverting timer that restores it. Whether or not anything changed,
-# the kernel's DOCKER-USER is compared with the file rule by rule, and a missing chain
-# fails the step: the block fails open when it is lost.
+# self-reverting timer that restores it. Both load the block into the
+# running firewall without stopping it, and so does a run that finds the chains
+# lost while the file keeps the block. Whether or not anything changed, the
+# kernel's DOCKER-USER is then compared with the file rule by rule, and a chain still
+# missing or different fails the step: the block fails open when it is lost.
 
 - name: Would the block change after.rules? (read with privilege)
   ansible.builtin.blockinfile:
@@ -35,9 +37,9 @@
           - systemd-run
           - "--on-active={{ maildivvy_docker_block_revert_seconds }}"
           - "--unit={{ maildivvy_docker_block_revert_unit }}"
-          - /bin/sh
+          - /bin/bash
           - -c
-          - "cp -p {{ maildivvy_after_rules_copy }} {{ maildivvy_after_rules }} && /usr/sbin/ufw reload"
+          - "set -eo pipefail; cp -p {{ maildivvy_after_rules_copy }} {{ maildivvy_after_rules }}; {{ maildivvy_docker_block_load }}"
 
     - name: Write the block into after.rules
       ansible.builtin.blockinfile:
@@ -45,8 +47,36 @@
         marker: "# {mark} {{ maildivvy_docker_block }}"
         block: "{{ lookup('ansible.builtin.template', 'docker-user.rules.j2') }}"
 
-    - name: Reload ufw, which creates DOCKER-USER from the block
-      ansible.builtin.command: ufw reload
+    - name: Load the block into the running firewall, which creates DOCKER-USER, without stopping it
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ maildivvy_docker_block_load }}
+      args:
+        executable: /bin/bash
+
+# The file keeps the block but the kernel lost its chains: they are loaded again as the
+# edit loads them, without stopping the firewall, and the run reports the change.
+# A chain nothing jumps to still fails open, and a chain cannot be lost while the
+# runtime's FORWARD jump holds it, so once the runtime's own chains exist that jump
+# comes back too, first in FORWARD, where the runtime puts it. Only chains the file
+# declares are touched, never INPUT, so this needs no timer and no new session.
+- name: Load the block again if the kernel lost its chains
+  ansible.builtin.shell: |
+    set -eo pipefail
+    if iptables -w -S DOCKER-USER >/dev/null 2>&1 && iptables -w -S maildivvy-docker-deny >/dev/null 2>&1; then
+        exit 0
+    fi
+    {{ maildivvy_docker_block_load }}
+    echo "loaded the block again"
+    if iptables -w -S DOCKER >/dev/null 2>&1 && ! iptables -w -C FORWARD -j DOCKER-USER 2>/dev/null; then
+        iptables -w -I FORWARD 1 -j DOCKER-USER
+        echo "put the runtime's FORWARD jump back"
+    fi
+  args:
+    executable: /bin/bash
+  register: maildivvy_docker_block_reload
+  changed_when: maildivvy_docker_block_reload.stdout != ''
+  when: maildivvy_docker_block_check is not changed
 
 # --- read back ---------------------------------------------------------------------
 
@@ -61,7 +91,7 @@
   ansible.builtin.meta: reset_connection
   when: maildivvy_docker_block_check is changed and maildivvy_firewall_confirmation == 'new-session'
 
-- name: Open a new session after the reload
+- name: Open a new session after the load
   ansible.builtin.ping:
   when: maildivvy_firewall_confirmation == 'new-session'
 
@@ -71,20 +101,20 @@
   changed_when: false
   failed_when: false
 
-# As step 3 on a local run: the reload is confirmed by a new SSH login from the
+# As step 3 on a local run: the load is confirmed by a new SSH login from the
 # administrator's address while the timer is armed, or the timer restores the copy.
-- name: "Waiting for a new SSH login from {{ maildivvy_admin_ssh_source }} after the reload"
+- name: "Waiting for a new SSH login from {{ maildivvy_admin_ssh_source }} after the load"
   maildivvy_ssh_login:
     source: "{{ maildivvy_admin_ssh_source }}"
     unit: "{{ maildivvy_docker_block_revert_unit }}"
     seconds: "{{ maildivvy_docker_block_revert_seconds }}"
   when: maildivvy_firewall_confirmation == 'ssh-login' and maildivvy_docker_block_timer.stdout == 'active'
 
-- name: Say that no SSH login confirmed the reload, by the administrator's console-only choice
+- name: Say that no SSH login confirmed the load, by the administrator's console-only choice
   ansible.builtin.debug:
     msg: >-
-      console-only: the container block's reload was not confirmed by any SSH login, as the
-      settings chose; SSH after the reload is not proved
+      console-only: the container block's load was not confirmed by any SSH login, as the
+      settings chose; SSH after the load is not proved
   when: maildivvy_firewall_confirmation == 'console' and maildivvy_docker_block_timer.stdout == 'active'
 
 # ⛔ Never on a local connection's own session, as step 3.

@@ -84,8 +84,10 @@ def test_the_pin_is_recorded_where_health_reads_whether_a_newer_release_is_due()
 
 
 def test_the_host_group_names_the_pinned_images_own_gid():
-    programs = yaml.safe_load((ROOT / "ansible" / "roles" / "programs" / "vars" / "main.yml").read_text())
-    assert programs["maildivvy_rspamd_gid"] == defaults()["maildivvy_rspamd_gid"] == 11333
+    programs = (ROOT / "ansible" / "roles" / "programs" / "tasks" / "main.yml").read_text()
+    # one definition, this role's default, which the programs role's group reads
+    assert defaults()["maildivvy_rspamd_gid"] == 11333
+    assert 'gid: "{{ maildivvy_rspamd_gid }}"' in programs
     # and the step reads that number out of the image, so a repin that moved it stops
     assert "The pinned image's gid is the one the host group names" in task_text()
 
@@ -226,6 +228,30 @@ def test_dnsbls_are_off_until_a_resolver_that_answers_them_is_chosen():
     assert "maildivvy_rspamd_rbl_clean_probe" in task_text()
     gate = next(t for t in tasks() if t["name"].startswith("Refuse DNSBLs"))
     assert gate["when"] == "maildivvy_rspamd_rbls | bool"
+
+
+def test_each_module_that_would_call_out_is_off_by_name_in_its_own_file_and_read_back():
+    d = defaults()
+    off = d["maildivvy_rspamd_call_outs_off"]
+    assert sorted(off) == ["fuzzy_check", "mx_check", "rspamd_update", "url_redirector"]
+    written = {f["dest"] for f in d["maildivvy_rspamd_files"]}
+    for name in off:
+        assert f"local.d/{name}.conf" in written  # a file the step writes, never one it removes
+        # the module's own switch, at the top level of its file, not inside a block
+        assert "\nenabled = false;\n" in "\n" + render(f"local.d/{name}.conf.j2")
+    # the step reads each one back from the running daemon as disabled explicitly
+    readback = next(t for t in tasks() if t["name"].startswith("The socket is the only listener"))
+    assert "maildivvy_rspamd_call_outs_off | reject('in', disabled_names) | list == []" \
+        in readback["ansible.builtin.assert"]["that"]
+    assert "Modules disabled .explicitly." in readback["vars"]["disabled"]
+
+
+def test_the_public_fuzzy_rule_is_off_by_its_own_name_as_well_as_the_module():
+    fuzzy = render("local.d/fuzzy_check.conf.j2")
+    # the stock rule's name, so turning the module back on for a storage of our own does
+    # not bring the public rule with it
+    rule = fuzzy.split('rule "rspamd.com" {', 1)[1].split("}", 1)[0]
+    assert rule.strip() == "enabled = false;"
 
 
 # --- the sender pin ----------------------------------------------------

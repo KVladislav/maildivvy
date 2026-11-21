@@ -9,8 +9,7 @@ maildivvy_backup_dir: /var/backups/maildivvy
 maildivvy_backup_status_dir: /var/lib/maildivvy/backup
 maildivvy_backup_status: "{{ maildivvy_backup_status_dir }}/status.json"
 maildivvy_backup_conf: /etc/maildivvy/backup.conf
-maildivvy_backup_opt: /opt/maildivvy
-maildivvy_backup_program: "{{ maildivvy_backup_opt }}/bin/maildivvy-backup"
+maildivvy_backup_program: "{{ maildivvy_opt }}/bin/maildivvy-backup"
 maildivvy_backup_unit: maildivvy-backup.service
 maildivvy_backup_timer: maildivvy-backup.timer
 

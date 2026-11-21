@@ -5,12 +5,22 @@
     clean        looked at, found nothing          -> delivered
     infected     found something                   -> withheld, a report in its place
     unscanned    over the size limit; nobody looked -> withheld, a report saying so
-                 (or cut short at one of the scanner's own limits, which it names)
+                 (or cut short at one of the scanner's own limits, which it names, or
+                 failed on while the daemon still answers PING: `failed`)
     unavailable  the scanner could not be reached,  -> the delivery filter holds the
-                 or failed and said ERROR              message at the provider,
-                                                       the milter answers 451
+                 or failed and then did not answer     message at the provider,
+                 PING                                  the milter answers 451
 
-`unscanned` is one message that is too big; `unavailable` is every message at once.
+`unscanned` is one message nobody looked at; `unavailable` is every message at once.
+
+⛔ A failed scan is told from a failed daemon by asking the daemon. After an
+`ERROR` other than the size limit, or a scan that runs past the client's timeout, the
+client sends `PING` on a fresh connection. An answer makes the message *unscanned* with
+`failed` set: the milter refuses it whatever the domain's too-large-to-scan setting
+says, so a message the daemon failed on never leaves unscanned. No answer is
+*unavailable*, as before. A connection that ends with no answer at all is *unavailable*
+with no PING: that is what a restart looks like, and the socket unit has the restarted
+daemon answer a PING within seconds.
 
 ⛔ The size gate is ours and it runs before any socket is contacted.
 ClamAV has two limits that behave differently: a stream over `StreamMaxLength` gets
@@ -46,7 +56,16 @@ CLAMD_CONF = Path("/etc/clamav/clamd.conf")
 RSPAMD_SOCKET = Path("/run/maildivvy/rspamd/rspamd.sock")
 
 CHUNK = 65536
-CLAMD_TIMEOUT = 120  # seconds; a scan of a message, not of an archive of them
+# ⛔ Past the daemon's `MaxScanTime` (the clamav role's, a test holds the two) by a margin. A scan that
+# takes all of it is answered `Heuristics.Limits.Exceeded.MaxScanTime FOUND`, unscanned;
+# a client that gave up first would read a timeout and fall back on the PING below. The
+# scan and the PING together stay inside the 300 s Postfix gives the milter.
+CLAMD_TIMEOUT = 180  # seconds
+# The PING after a failed scan. A daemon that cannot say PONG in this long is
+# not scanning anything either: that is the antivirus unavailable, and the hold of.
+CLAMD_PING_TIMEOUT = 10  # seconds
+# The longest one message can take in the client: the scan, then the PING.
+CLAMD_BOUND = CLAMD_TIMEOUT + CLAMD_PING_TIMEOUT
 RSPAMD_TIMEOUT = 60
 # clamd's own default for StreamMaxLength and MaxFileSize, used for a limit its
 # configuration does not state: the lower reading is the safe one, since it withholds
@@ -83,6 +102,9 @@ class Verdict:
 
     verdict: str
     detail: str | None = None
+    # ⛔ Set on an *unscanned* that the daemon failed on while it still answers PING:
+    # not a size, so `outbound_unscanned = send` does not send it.
+    failed: bool = False
 
     @property
     def withheld(self):
@@ -115,7 +137,8 @@ def size_limit(conf=CLAMD_CONF):
     """The lower of the daemon's two limits, in bytes.
 
     A limit the file does not state reads as clamd's own default. A limit that is
-    there but is not a size is refused: a number nobody can read is never guessed at.
+    there but is not a size is refused: a number nobody can read is never guessed at,
+    and the delivery filter holds collection on it.
     """
     values = {}
     try:
@@ -126,7 +149,8 @@ def size_limit(conf=CLAMD_CONF):
         line = line.strip()
         if line.startswith("#") or not line:
             continue
-        name, _, value = line.partition(" ")
+        # the name and its value apart by any run of spaces or tabs, as clamd reads them
+        name, _, value = line.replace("\t", " ").partition(" ")
         if name in ("StreamMaxLength", "MaxFileSize"):
             values[name] = parse_size(name, value.strip())
     return min(values.get("StreamMaxLength", CLAMD_DEFAULT_LIMIT),
@@ -144,7 +168,8 @@ def parse_size(name, value):
 # --- clamd --------------------------------------------------------------------------------------
 
 
-def scan_virus(body, path=CLAMD_SOCKET, max_bytes=None, conf=CLAMD_CONF, timeout=CLAMD_TIMEOUT):
+def scan_virus(body, path=CLAMD_SOCKET, max_bytes=None, conf=CLAMD_CONF, timeout=CLAMD_TIMEOUT,
+               ping_timeout=CLAMD_PING_TIMEOUT):
     """clamd over its unix socket, the gate first, then zINSTREAM."""
     if max_bytes is None:
         max_bytes = size_limit(conf)
@@ -153,7 +178,12 @@ def scan_virus(body, path=CLAMD_SOCKET, max_bytes=None, conf=CLAMD_CONF, timeout
         return Verdict(UNSCANNED, f"{len(body)} bytes is over the {max_bytes}-byte "
                                   "scan limit; nobody looked")
     try:
-        with connect(path, timeout) as sock:
+        sock = connect(path, timeout)
+    except OSError as err:
+        # Nothing was scanned and nobody answered: no PING could say more.
+        return Verdict(UNAVAILABLE, f"clamd {path}: {err}")
+    try:
+        with sock:
             sock.sendall(b"zINSTREAM\0")
             view = memoryview(body)
             try:
@@ -169,10 +199,18 @@ def scan_virus(body, path=CLAMD_SOCKET, max_bytes=None, conf=CLAMD_CONF, timeout
                     return Verdict(UNAVAILABLE, f"clamd {path}: {err}")
             else:
                 answer = read_until_nul(sock)
+    except TimeoutError as err:
+        # The scan overran the time this client gives it, past `MaxScanTime` and the
+        # margin: the daemon is slow on this message, or stuck altogether.
+        return failed_scan(f"clamd {path}: no answer in {timeout:g} s ({err})", path,
+                           ping_timeout)
     except OSError as err:
+        # ⛔ No PING here: a connection the daemon ends with no answer is what a
+        # restart looks like, and the restarted daemon answers a PING within seconds.
         return Verdict(UNAVAILABLE, f"clamd {path}: {err}")
 
     if not answer:
+        # the same: a restart, a crash, never a verdict about the message
         return Verdict(UNAVAILABLE, f"clamd {path}: closed without answering")
     if answer.endswith("FOUND"):
         if LIMITS_EXCEEDED in answer:
@@ -190,13 +228,37 @@ def scan_virus(body, path=CLAMD_SOCKET, max_bytes=None, conf=CLAMD_CONF, timeout
         # is stricter than we are. That is not a clean verdict.
         return Verdict(UNSCANNED, f"clamd: {answer}")
     if answer.endswith("ERROR"):
-        # ⛔ Any other error is the daemon failing, not a fact about this message:
-        # unscanned would let `outbound_unscanned = send` send it. It is
-        # the antivirus unavailable, a 451 outbound and the hold inbound.
-        return Verdict(UNAVAILABLE, f"clamd: {answer}")
+        # ⛔ Any other error is the daemon failing, not a fact about this message's size:
+        # plain unscanned would let `outbound_unscanned = send` send it.
+        return failed_scan(f"clamd: {answer}", path, ping_timeout)
     if answer.endswith("OK"):
         return Verdict(CLEAN, answer)
     return Verdict(UNAVAILABLE, f"clamd: unrecognised answer {answer!r}")
+
+
+def failed_scan(detail, path, ping_timeout=CLAMD_PING_TIMEOUT):
+    """A scan that ended without a verdict: the daemon failed on this message, or is down.
+
+    ⛔ Asked on a fresh connection, never the one that failed. A daemon that
+    answers PING is up, so the message is *unscanned* and withheld inbound, and refused
+    outbound whatever the domain's too-large-to-scan setting says (`failed`). One that
+    does not is *unavailable*: the hold of inbound, a 451 outbound. An answer does
+    not prove the message was the cause; either way nothing the daemon failed on is sent.
+    """
+    if ping(path, ping_timeout):
+        return Verdict(UNSCANNED, f"{detail}; the daemon answers PING, so it failed on "
+                                  "this message", failed=True)
+    return Verdict(UNAVAILABLE, f"{detail}; the daemon does not answer PING")
+
+
+def ping(path=CLAMD_SOCKET, timeout=CLAMD_PING_TIMEOUT):
+    """True when the daemon answers `PONG` on a connection of its own."""
+    try:
+        with connect(path, timeout) as sock:
+            sock.sendall(b"zPING\0")
+            return read_until_nul(sock) == "PONG"
+    except OSError:
+        return False
 
 
 def clamd_version(path=CLAMD_SOCKET, timeout=CLAMD_TIMEOUT):

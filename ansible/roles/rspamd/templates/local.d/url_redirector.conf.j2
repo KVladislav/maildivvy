@@ -1,0 +1,8 @@
+# ⛔ OFF. This module follows the links in a message - an HTTP request from this machine to
+# each known redirector it names - to score where they lead. Fetching a link from a mail
+# tells whoever sent it that the mail arrived, and what it feeds, chiefly the URL blocklists, is
+# off with the other DNSBLs.
+#
+# ⚠️ Today it would also stop for want of Redis. Named off all the same, so giving rspamd a
+# Redis for something else does not start it.
+enabled = false;

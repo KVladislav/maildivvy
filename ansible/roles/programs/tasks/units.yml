@@ -3,7 +3,10 @@
 # (vars/main.yml). A unit marked `enabled` is enabled and started, and read back. During
 # an upgrade (maildivvy_collection_paused, set by maildivvy-install) they are enabled and
 # left stopped: the installer paused collection and fan-out, and starts them again once
-# the new version is written.
+# the new version is written. So does any run while a backup's or a restore's pause is
+# recorded: its holder starts them, and a start here would run collection inside
+# the nightly store copy or over a restore that did not complete. An upgrade's record is
+# ended by the run that finishes, which starts them here and removes it after.
 
 - name: Install each program's configuration
   ansible.builtin.template:
@@ -28,16 +31,43 @@
     label: "{{ item.src | basename }}"
   register: maildivvy_units_written
 
+# A run stopped between the units and the reload leaves them written and not loaded;
+# systemd says so, and the next run reloads. None of them runs for long: a service started
+# after the reload runs the unit as written.
+- name: Read whether systemd has loaded each unit as written
+  ansible.builtin.command:
+    argv: [systemctl, show, -p, NeedDaemonReload, --value, "{{ item.src | basename | regex_replace('\\.j2$', '') }}"]
+  loop: "{{ maildivvy_program_units }}"
+  loop_control:
+    label: "{{ item.src | basename }}"
+  register: maildivvy_units_stale
+  changed_when: false
+
 - name: Tell systemd the units changed
   ansible.builtin.systemd_service:
     daemon_reload: true
   when: maildivvy_units_written is changed
+    or 'yes' in maildivvy_units_stale.results | map(attribute='stdout') | list
+
+- name: Read whether a backup's or a restore's pause is recorded
+  ansible.builtin.stat:
+    path: "{{ maildivvy_backup_pause_record }}"
+    get_checksum: false
+  register: maildivvy_backup_pause
+
+- name: Say that the timers are left to the pause that holds them
+  ansible.builtin.debug:
+    msg: "a pause is recorded in {{ maildivvy_backup_pause_record }}: the units are enabled and
+      left stopped; the backup or the restore that holds it starts them (a restore that did
+      not complete: run `maildivvy-backup --restore <stamp>` again, as it said)"
+  when: maildivvy_backup_pause.stat.exists
 
 - name: Enable and start the units that run
   ansible.builtin.systemd_service:
     name: "{{ item.src | basename | regex_replace('\\.j2$', '') }}"
     enabled: true
-    state: "{{ omit if maildivvy_collection_paused | default(false) else 'started' }}"
+    state: "{{ omit if maildivvy_collection_paused | default(false) or maildivvy_backup_pause.stat.exists
+      else 'started' }}"
   loop: "{{ maildivvy_program_units | selectattr('enabled', 'defined') | selectattr('enabled') }}"
   loop_control:
     label: "{{ item.src | basename }}"

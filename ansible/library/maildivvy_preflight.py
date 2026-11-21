@@ -77,6 +77,9 @@ DEVICE = re.compile(r"^/dev/[A-Za-z0-9._/:-]+$")
 
 HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 PASSWORD_MIN = 15
+# `openssl passwd -stdin` hashes only the first 256 bytes; Dovecot and the interface's
+# PASSWORD_MAX count the same bytes of UTF-8
+PASSWORD_MAX = 256
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # acme is the default; self-signed exists for a test machine with no DNS credential and
 # is reached only by setting it with the test flag
@@ -164,7 +167,7 @@ def _email(v):
 
 
 def _password(v):
-    return v if isinstance(v, str) and len(v) >= PASSWORD_MIN else None
+    return v if isinstance(v, str) and len(v) >= PASSWORD_MIN and len(v.encode()) <= PASSWORD_MAX else None
 
 
 def _device(v):
@@ -207,7 +210,8 @@ SETTINGS = {
     "admin_ssh_source": (False, "the address the administrator logs in from over SSH, such as 192.0.2.7",
                          _address),
     "container_pool": (False, "the range the container block treats as containers, in CIDR form", _network),
-    "breakglass_password": (True, f"the break-glass password, at least {PASSWORD_MIN} characters", _password),
+    "breakglass_password": (True, f"the break-glass password, at least {PASSWORD_MIN} characters "
+                                  f"and at most {PASSWORD_MAX} bytes", _password),
     "cert_mode": (False, f"the certificate mode, one of {', '.join(CERT_MODES)}; acme when not set",
                   lambda v: v if v in CERT_MODES else None),
     # self-signed only with the test flag
@@ -454,6 +458,27 @@ def foreign_mail_errors(packages, ours):
             f"the machine, so remove {'it' if len(foreign) == 1 else 'them'} or install on a fresh machine"]
 
 
+# --- a ruleset that is not ours --------------------------------------------
+
+def nftables_service_errors(show):
+    """[] unless the nftables package's own service is enabled or running, read from
+    `systemctl show nftables.service -p UnitFileState -p ActiveState`.
+
+    Its configuration begins with `flush ruleset` and its stop flushes too, so it is someone's
+    own ruleset; step 18 masks the unit, which it cannot do to one already in use.
+    """
+    state = dict(line.partition("=")[::2] for line in show.splitlines())
+    enabled = state.get("UnitFileState", "").startswith("enabled")
+    running = state.get("ActiveState", "inactive") not in ("inactive", "failed")
+    if not (enabled or running):
+        return []
+    how = " and ".join(word for word, yes in (("enabled", enabled), ("running", running)) if yes)
+    return [f"refused nftables.service: it is {how}, and it loads /etc/nftables.conf, which "
+            f"flushes every rule on the machine; Maildivvy owns this machine's firewall, so "
+            f"disable and stop it, moving any rules of your own elsewhere, or install on a fresh "
+            f"machine"]
+
+
 # --- the disks ----------------------------------------------------------------------
 
 
@@ -660,6 +685,12 @@ def main():
     if rc != 0:
         module.fail_json(msg=f"dpkg-query failed: {err.strip()}", errors=errors)
     errors += foreign_mail_errors(installed_packages(out), any(os.path.exists(p) for p in OURS))
+    # a machine without the package reads `UnitFileState=` and `ActiveState=inactive`, rc 0
+    rc, out, err = module.run_command(["systemctl", "show", "nftables.service", "-p", "UnitFileState",
+                                       "-p", "ActiveState"])
+    if rc != 0:
+        module.fail_json(msg=f"systemctl show failed: {err.strip()}", errors=errors)
+    errors += nftables_service_errors(out)
     if _directory(params.get("health_textfile_dir")):
         errors += textfile_dir_errors(params["health_textfile_dir"])
     mode ="separate" if _absent(params.get("disk_mode")) else params["disk_mode"]

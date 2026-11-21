@@ -9,6 +9,7 @@ import sys
 sys.dont_write_bytecode = True   # the release tree stays exactly as its MANIFEST lists it
 ROOT = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+sys.path.append(os.path.join(ROOT, "ansible", "library"))   # maildivvy_installed, which step 1 calls too
 
 from maildivvy.installer.cli import main  # noqa: E402
 

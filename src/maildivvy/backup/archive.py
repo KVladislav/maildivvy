@@ -27,6 +27,7 @@ STAMP = re.compile(r"\d{8}T\d{6}Z")
 DUMP = "database.dump"
 STATE = "fetch.tar"
 MANIFEST = "manifest.json"
+PAIRED = "store-copied"   # written into a run once its store copy exited 0
 ARCNAME = "fetch"   # the state directory's name inside the archive, whatever it is called
 
 _TABLE = re.compile(r"^\d+; \d+ \d+ TABLE public (\S+) ")
@@ -68,6 +69,14 @@ def beyond_keep(names, keep, held=None):
     return runs[:-keep] if len(runs) > keep else []
 
 
+def newest_paired(root):
+    """The newest run under `root` whose store copy succeeded, or None. The backup keeps it
+    beside the count, so nights of a failing store copy never remove the last dump
+    that has a store to be restored with."""
+    paired = [run for run in complete_runs(os.listdir(root)) if (Path(root) / run / PAIRED).is_file()]
+    return paired[-1] if paired else None
+
+
 # --- the dump -------------------------------------------------------------------------------------
 
 
@@ -101,6 +110,21 @@ def rows_counted(lines):
     if table is not None:
         raise BackupError(f"the dump ends inside the rows of table {table}: it was cut short")
     return counted
+
+
+def migrations_of(lines):
+    """The versions the decoded dump's `schema_version` rows hold, in order: its schema."""
+    found, inside = [], False
+    for line in lines:
+        line = line.rstrip("\n")
+        if not inside:
+            match = _COPY.match(line)
+            inside = bool(match) and _table_of(match.group(1)) == "schema_version"
+        elif line == _END:
+            inside = False
+        else:
+            found.append(line.split("\t", 1)[0])
+    return sorted(found)
 
 
 def dump_problems(expected, listed, counted):

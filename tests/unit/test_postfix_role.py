@@ -12,6 +12,7 @@ import yaml
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from maildivvy_postconf import actions, normalise, parse_main, parse_master, parse_overrides
+from play_vars import play_vars
 
 ROOT = Path(__file__).resolve().parents[2]
 ROLE = ROOT / "ansible" / "roles" / "postfix"
@@ -21,8 +22,11 @@ CERT_NAME = "mail.example.test"
 
 
 def variables(**changes):
-    """The role's own variables, with the settings a run supplies."""
-    values = yaml.safe_load((ROLE / "defaults" / "main.yml").read_text())
+    """The role's own variables and those it reads from earlier steps, with the settings a
+    run supplies."""
+    values = play_vars("maildivvy_published_cert", "maildivvy_published_key", "maildivvy_cert_program",
+                       "maildivvy_opt", "maildivvy_db_name", "maildivvy_postfix_queue")
+    values.update(yaml.safe_load((ROLE / "defaults" / "main.yml").read_text()))
     values.update(yaml.safe_load((ROLE / "vars" / "main.yml").read_text()))
     values["maildivvy_cert_name"] = CERT_NAME
     values["maildivvy_cert_mode"] = "acme"
@@ -134,6 +138,18 @@ def test_the_distributions_own_service_is_removed_only_while_it_is_there():
                    have_services={}, have_overrides={}) == []
 
 
+def test_a_main_cf_setting_an_earlier_version_wrote_is_removed_only_while_it_is_there():
+    # local(8) and virtual(8) are never started now, so their mailbox limits are taken away
+    absent = variables()["maildivvy_postfix_absent"]
+    assert {"mailbox_size_limit", "virtual_mailbox_limit"} <= set(absent)
+    assert not {"mailbox_size_limit", "virtual_mailbox_limit"} & set(main_cf())
+    held = actions(main={}, services={}, absent=absent, have_main={"mailbox_size_limit": "52428800"},
+                   have_services={}, have_overrides={})
+    assert held == [("remove-main", "mailbox_size_limit")]
+    assert actions(main={}, services={}, absent=absent, have_main={}, have_services={},
+                   have_overrides={}) == []
+
+
 def test_a_rewritten_service_has_every_override_written_again():
     # ⚠️ measured on 3.10.6: `postconf -M '<service>=<definition>'` DROPS the service's
     # own `-o` lines, so a definition that changed takes all of them with it
@@ -168,9 +184,11 @@ def test_a_definition_is_compared_by_its_fields_not_by_its_spacing():
 
 # --- main.cf: the boundary -----------------
 
-def test_both_transports_are_error_with_the_text_that_comes_back_in_the_refusal():
+def test_every_transport_is_error_with_the_text_that_comes_back_in_the_refusal():
     values = main_cf()
-    assert values["default_transport"] == values["relay_transport"]
+    # the machine's own addresses are the local class, never the default one
+    assert {values[f"{kind}_transport"] for kind in ("default", "relay", "local", "virtual")} == {
+        values["default_transport"]}
     assert values["default_transport"].startswith("error:")
     assert values["default_transport"] != "error"  # the text is part of the value
     assert "per-sender" in values["default_transport"]
@@ -183,8 +201,10 @@ def test_a_sender_gets_a_transport_only_through_the_per_sender_map():
     values = main_cf()
     assert values["sender_dependent_default_transport_maps"].endswith("maildivvy-transport.cf")
     assert values["sender_dependent_relayhost_maps"].endswith("maildivvy-relayhost.cf")
-    assert all(values[name].startswith("pgsql:/etc/postfix/")
-               for name in ("sender_dependent_default_transport_maps", "sender_dependent_relayhost_maps"))
+    assert values["sender_dependent_relayhost_maps"].startswith("pgsql:/etc/postfix/")
+    # the one other row is the null sender's, which no view can hold
+    assert values["sender_dependent_default_transport_maps"].split(", ")[1:] == [
+        "pgsql:/etc/postfix/maildivvy-transport.cf"]
     assert "transport_maps" not in values  # nothing keyed by recipient
 
 
@@ -215,17 +235,19 @@ def test_a_pinned_server_is_looked_up_by_next_hop_in_the_policy_view_by_its_sha2
     assert values["smtp_tls_policy_maps"] == "pgsql:/etc/postfix/maildivvy-tls-policy.cf"
     assert values["smtp_tls_fingerprint_digest"] == "sha256"
     assert values["smtp_tls_security_level"] == "secure"  # an unpinned server stays
-    view = MIGRATIONS[1].read_text().split("CREATE VIEW postfix_tls_policy AS", 1)[1].split(";", 1)[0]
+    # the view as the last migration that defines it leaves it
+    defined = [m.read_text() for m in MIGRATIONS if "VIEW postfix_tls_policy AS" in m.read_text()]
+    view = defined[-1].split("VIEW postfix_tls_policy AS", 1)[1].split(";", 1)[0]
     assert "'[' || lower(e.smtp_host) || ']:' || e.smtp_port" in view
     assert "'fingerprint match='" in view and "GROUP BY lower(e.smtp_host), e.smtp_port" in view
+    # one mailbox's pin is never joined into another's: the view answers one pin or none
+    assert "string_agg" not in view
 
 
 def test_submission_takes_a_message_up_to_50_mib_and_the_scanner_scans_as_much():
     values = variables()
     assert values["maildivvy_postfix_message_size_limit"] == 52428800
-    # local(8) and virtual(8) are fatal on a mailbox limit below the message limit
-    for name in ("message_size_limit", "mailbox_size_limit", "virtual_mailbox_limit"):
-        assert main_cf()[name] == "52428800", name
+    assert main_cf()["message_size_limit"] == "52428800"
     clamav = yaml.safe_load((ROOT / "ansible" / "roles" / "clamav" / "defaults" / "main.yml").read_text())
     assert clamav["maildivvy_clamav_stream_max"] == clamav["maildivvy_clamav_file_max"] == "50M"
 
@@ -253,9 +275,19 @@ def test_smtputf8_is_off_and_only_the_family_served_is_configured():
     assert values["inet_interfaces"] == "all"  # 465 is served off the loopback; 25 is pinned in master.cf
 
 
+def test_the_family_served_is_the_products_and_matches_the_listener_proof():
+    # `all` would add [::]:465 and stop the install at the role's own read-back
+    defaults = yaml.safe_load((ROLE / "defaults" / "main.yml").read_text())
+    assert not any("inet_protocols" in name for name in defaults)
+    raw = yaml.safe_load((ROLE / "vars" / "main.yml").read_text())["maildivvy_postfix_main"]
+    assert raw["inet_protocols"] == "ipv4"
+    proof = next(t for t in tasks() if t.get("name") == "Nothing listens on 25, and 465 is served")
+    assert any(line.endswith("== ['0.0.0.0:465']") for line in proof["ansible.builtin.assert"]["that"])
+
+
 def test_465_is_given_the_products_certificate_and_not_the_distributions_snakeoil():
     values = main_cf()
-    assert values["smtpd_tls_cert_file"] == f"/etc/ssl/certs/{CERT_NAME}.crt"
+    assert values["smtpd_tls_cert_file"] == f"/etc/maildivvy/tls/{CERT_NAME}.crt"
     assert values["smtpd_tls_key_file"] == f"/etc/ssl/private/{CERT_NAME}.key"
     assert "snakeoil" not in yaml.safe_dump(values)
     assert values["smtpd_tls_protocols"] == ">=TLSv1.2"
@@ -324,7 +356,7 @@ def test_the_login_mismatch_check_is_followed_by_an_explicit_permit_before_the_r
     # reject_sender_login_mismatch answers DUNNO on a match, so a bare reject after it
     # refuses the very messages it just approved
     restrictions = service("submissions/inet")["overrides"]["smtpd_sender_restrictions"].split(",")
-    assert restrictions == ["reject_sender_login_mismatch", "permit_sasl_authenticated", "reject"]
+    assert restrictions[2:] == ["reject_sender_login_mismatch", "permit_sasl_authenticated", "reject"]
 
 
 def test_every_path_the_chrooted_server_uses_is_relative_to_the_queue_directory():
@@ -337,11 +369,43 @@ def test_every_path_the_chrooted_server_uses_is_relative_to_the_queue_directory(
 def test_no_listener_but_465_and_sendmail_for_root_alone():
     """The loopback 25 and `sendmail` let any local process send as any mailbox."""
     values = variables()
-    assert values["maildivvy_postfix_absent"] == ["smtp/inet", "127.0.0.1:smtp/inet"]
+    services = [key for key in values["maildivvy_postfix_absent"] if "/" in key]
+    assert services == ["smtp/inet", "127.0.0.1:smtp/inet"]
     listeners = [key for key in values["maildivvy_postfix_services"] if key.endswith("/inet")]
     assert listeners == ["submissions/inet"]
     assert main_cf()["authorized_submit_users"] == "root"
 
+
+
+# --- a provider's refusal reaches the sender's domain -----------------------------------
+
+NOTICE = "maildivvy-notice/unix"
+PROGRAMS_VARS = ROOT / "ansible" / "roles" / "programs" / "vars" / "main.yml"
+
+
+def test_a_notice_from_the_null_sender_goes_to_the_notice_program():
+    # a notice's sender is empty, looked up as `<>`: with no row for it the notice went to
+    # the `error` transport, and a notice that cannot be delivered is discarded
+    maps = main_cf()["sender_dependent_default_transport_maps"].split(", ")
+    assert maps[0] == "inline:{<>=maildivvy-notice:}"
+    assert str(main_cf()["maildivvy-notice_destination_recipient_limit"]) == "1"
+    fields = normalise(service(NOTICE)["definition"]).split()
+    # unprivileged `n` and chroot `n`: pipe(8) changes to the user and runs a program
+    # outside the queue directory
+    assert fields[:8] == ["maildivvy-notice", "unix", "-", "n", "n", "-", "-", "pipe"]
+    assert "user=vmail" in fields
+    opt = yaml.safe_load(PROGRAMS_VARS.read_text())["maildivvy_opt"]
+    assert fields[-2:] == [f"argv={opt}/bin/maildivvy-notice", "${recipient}"]
+    assert (ROOT / "bin" / "maildivvy-notice").is_file()
+    assert not service(NOTICE).get("overrides")
+
+
+def test_submission_refuses_the_null_sender_before_the_login_check():
+    # the null sender passes the login check, and would reach the notice program's
+    # transport: a person's own message filed into a domain archive past the provider
+    restrictions = service("submissions/inet")["overrides"]["smtpd_sender_restrictions"].split(",")
+    assert restrictions[:2] == ["check_sender_access", "inline:{<>=REJECT}"]
+    assert "smtpd_null_access_lookup_key" not in main_cf()  # Postfix's own `<>`
 
 # --- the six lookup maps ------------------------
 
@@ -394,10 +458,30 @@ def test_postfix_check_runs_before_every_restart():
     assert check < restart, names
 
 
-def test_the_account_joins_ssl_cert_and_the_deploy_hook_is_run_again_after_it():
-    names = task_names()
-    group = next(i for i, name in enumerate(names) if "ssl-cert" in name)
-    hook = next(i for i, name in enumerate(names) if "deploy hook" in name)
-    assert group < hook, names
-    # the hook is lego's and refuses in self-signed mode, where nothing was issued
-    assert tasks()[hook]["when"] == "maildivvy_cert_mode != 'self-signed'"
+def test_postfix_is_taken_out_of_ssl_cert_and_restarted_and_proved_by_the_pair_465_serves():
+    steps = tasks()
+    # nothing adds an account to a group, and the deploy hook is not run again
+    assert not [t for t in steps if "ansible.builtin.user" in t]
+    assert not [t for t in steps if t.get("ansible.builtin.command", {}).get("argv", [None])[-1:] == ["deploy"]]
+    assert "test -r" not in task_text()
+    # an earlier version's membership is taken away, only when it is there
+    [leave] = [t for t in steps if t.get("ansible.builtin.command", {}).get("argv", [None])[0] == "gpasswd"]
+    assert leave["ansible.builtin.command"]["argv"] == ["gpasswd", "-d", "postfix", "ssl-cert"]
+    assert "'postfix' in" in leave["when"] and leave["changed_when"] is True
+    # and while a running process still holds the group, which it keeps from its start,
+    # Postfix is restarted: read from the processes, so a stopped run is finished by the next
+    held = next(t for t in steps if t.get("ansible.builtin.command", {}).get("argv", [None])[0] == "ps")
+    assert held["ansible.builtin.command"]["argv"] == ["ps", "-u", "postfix", "-o", "supgrp="]
+    restart = next(t for t in steps if t.get("ansible.builtin.systemd", {}).get("state") == "restarted")
+    assert f"'ssl-cert' in {held['register']}.stdout" in restart["when"]
+    assert steps.index(leave) < steps.index(held) < steps.index(restart)
+    # the proof is the certificate 465 serves, compared with the published one, after the restart
+    served = next(t for t in steps if t["name"] == "465 serves the published certificate")
+    assert served["ansible.builtin.assert"]["that"] == ("maildivvy_postfix_served.stdout == "
+                                                        "maildivvy_postfix_published.stdout")
+    dial = next(t for t in steps if t.get("register") == "maildivvy_postfix_served")
+    assert "s_client -connect 127.0.0.1:465" in dial["ansible.builtin.shell"]["cmd"]
+    assert "pipefail" in dial["ansible.builtin.shell"]["cmd"]
+    published = next(t for t in steps if t.get("register") == "maildivvy_postfix_published")
+    assert published["ansible.builtin.command"]["argv"][-1] == "{{ maildivvy_published_cert }}"
+    assert steps.index(restart) < steps.index(dial) < steps.index(served)

@@ -2,9 +2,8 @@
 # this is a setting. The bounds the checks judge by have their defaults in the program
 # (src/maildivvy/health/settings.py); an operator moves one in /etc/maildivvy/health.conf.
 
-maildivvy_health_opt: /opt/maildivvy
-maildivvy_health_program: "{{ maildivvy_health_opt }}/bin/maildivvy-health"
-maildivvy_health_helper: "{{ maildivvy_health_opt }}/bin/maildivvy-health-helper"
+maildivvy_health_program: "{{ maildivvy_opt }}/bin/maildivvy-health"
+maildivvy_health_helper: "{{ maildivvy_opt }}/bin/maildivvy-health-helper"
 # The report and the upstream answers it keeps: maildivvy-health's, readable by the
 # operator's collector. src/maildivvy/health/settings.py's STATE_DIR; a unit test holds
 # the two spellings together.
@@ -13,37 +12,57 @@ maildivvy_health_report: "{{ maildivvy_health_dir }}/health.json"
 maildivvy_health_user: maildivvy-health
 maildivvy_health_unit: maildivvy-health.service
 maildivvy_health_timer: maildivvy-health.timer
+# The ledger's daily pass over every name, its result kept beside the report.
+maildivvy_health_ledger_unit: maildivvy-health-ledger.service
+maildivvy_health_ledger_timer: maildivvy-health-ledger.timer
+# The helpers' sockets, each with a template service beside it (`<name>@.service`).
+maildivvy_health_sockets: [maildivvy-health-store.socket, maildivvy-health-system.socket]
 # The two helpers, started by systemd per connection: the store's as the mail owner, the
 # system's as root. Their sockets are settings.py's STORE_SOCKET and SYSTEM_SOCKET.
 maildivvy_health_store_socket: /run/maildivvy/health-store.sock
 maildivvy_health_system_socket: /run/maildivvy/health-system.sock
-maildivvy_health_store: /srv/maildivvy/store
-maildivvy_health_index: /srv/maildivvy/index
 
 # Every five minutes ("every few minutes"); a report three runs old is stale.
 maildivvy_health_calendar: "*:0/5"
-# A run reads every mailbox of every domain against the ledger.
+# A run holds only the names changed since the last one to the ledger.
 maildivvy_health_run_timeout: 900
+# The daily pass, at night: away from the backup at midnight, and before the day's mail.
+maildivvy_health_ledger_calendar: "*-*-* 03:30:00"
+# The pass reads every name of every mailbox; the store helper that reads them for it is
+# bounded the same. Many times what a year's volume took.
+maildivvy_health_ledger_timeout: 3600
+# The store helper's memory bound: about 360 MiB for an archive of 500,000
+# messages in a snippet, not yet measured at the import's volume.
+maildivvy_health_store_memory_max: 1G
 
 # What the step's proof accepts (docs/architecture.md § Installation, step 17): every
 # subsystem PASS, or UNKNOWN only where no data exists yet. These are the checks that
-# cannot read anything on a machine that holds no mail yet; any other UNKNOWN, and every
-# FAIL, stops the install. `ban` and `network` are read by steps 18 and 19, which make
+# cannot read anything on a machine that holds no mail yet, each with the words its
+# UNKNOWN says that with: an UNKNOWN of theirs saying anything else (a reading that timed
+# out or failed) stops the install, a first one or an upgrade, as any other
+# UNKNOWN and every FAIL do. `ban` and `network` are read by steps 18 and 19, which make
 # what they check.
 maildivvy_health_later_steps: [ban, network]
 maildivvy_health_no_data_yet:
-  - collection/external mailboxes
+  collection/external mailboxes: [no external mailbox yet]
   # the fetch timer runs every few minutes: no fetch has run yet on a fresh install
-  - collection/fetch runs
+  collection/fetch runs: [the fetch has not run since the boot]
   # and so its journal holds no line yet to count unchecked deliveries in
-  - collection/retrieval check
-  - collection/deletion windows
-  - store/ledger
-  - store/link classes
-  - search/search
+  collection/retrieval check: [the fetch has not run in the window]
+  collection/deletion windows: [no external mailbox]
+  # the window's first scan only sets where the next one begins
+  store/ledger: [the window starts with this run, no delivery row yet]
+  # and the daily pass this step takes finds no delivery row yet
+  store/daily ledger: [no delivery row yet]
+  store/link classes: [the store does not hold both]
+  search/search: [nothing to search yet]
   # the pass runs on the minute; steps 13 to 17 can all fall inside one minute (41 s on
   # the test VM, 2026-09-24), and then no pass has run yet when step 17 reads health
-  - store/fan-out
+  store/fan-out: [the pass has not run yet]
+  # and the requests that wait on a provider, which every pass starts beside it
+  store/provider requests: [has not run yet]
+  # and so its journal holds no line yet to count skipped messages in
+  store/fan-out skips: [the pass has not run in the window]
 
 # The FAILs the proof prints and accepts: a newer upstream release is a reason to
 # repin, not a step that did not work, and stopping on it failed every install from the
@@ -51,8 +70,8 @@ maildivvy_health_no_data_yet:
 # only: every other FAIL stops the install.
 maildivvy_health_not_stopping: [spam/repin]
 
-# The proof, on the machine: argv is the report, the later steps, the no-data checks and
-# the FAILs that do not stop the install. A WARN is accepted and printed: it is a signal
+# The proof, on the machine: argv is the report, the later steps, the no-data checks (JSON:
+# {key: [words]}) and the FAILs that do not stop the install. A WARN is accepted and printed: it is a signal
 # for the operator the install cannot act on (a self-signed certificate, a Sent link that
 # failed yesterday), never a step that did not work; so is a FAIL of
 # maildivvy_health_not_stopping. It prints every reading that is not accepted, and exits 1
@@ -60,7 +79,8 @@ maildivvy_health_not_stopping: [spam/repin]
 maildivvy_health_proof: |
   import json, sys
   path, later, no_data, not_stopping = sys.argv[1:5]
-  later, no_data, not_stopping = (set(arg.split(",")) for arg in (later, no_data, not_stopping))
+  later, not_stopping = (set(arg.split(",")) for arg in (later, not_stopping))
+  no_data = json.loads(no_data)
   whole = json.load(open(path))
   assert whole["complete"] is True and len(whole["subsystems"]) == 15, "the report is not whole"
   wrong, warned, read = [], [], 0
@@ -73,7 +93,8 @@ maildivvy_health_proof: |
           line = f"{state} {key}: {check['reading']} - {check['problem']}"
           if state == "WARN" or (state == "FAIL" and key in not_stopping):
               warned.append(line)
-          elif not (state == "PASS" or (state == "UNKNOWN" and key in no_data)):
+          elif not (state == "PASS" or (state == "UNKNOWN" and any(
+                  words in (check["problem"] or "") for words in no_data.get(key, ())))):
               wrong.append(line)
   print("\n".join(wrong + warned) or f"{read} readings accepted")
   sys.exit(1 if wrong or not read else 0)

@@ -90,6 +90,24 @@ def test_a_firewall_in_place_plans_nothing():
     assert plan(wanted, wanted) == ([], [], [])
 
 
+@pytest.mark.parametrize("setting, ufws", [
+    ("203.0.113.7/32", "203.0.113.7"),                 # ufw drops a host mask
+    ("2001:db8::1/128", "2001:db8::1"),
+    ("2001:DB8:1:0::/48", "2001:db8:1::/48"),           # and rewrites the address
+    ("198.51.100.0/255.255.255.0", "198.51.100.0/24"),  # and turns a dotted mask into a prefix
+])
+def test_a_network_ufw_spells_otherwise_is_the_same_rule(setting, ufws):
+    """A setting in another spelling than ufw's own is in force once written: planning a delete
+    for it would remove the administrator's SSH rule on every re-run."""
+    any_ = "::/0" if ":" in ufws else "0.0.0.0/0"
+    current = [("allow", "tcp", "22", any_, "any", ufws, "in")]
+    assert plan(current, desired([setting], [22])) == ([], [], [])
+    # the control: another network is still added, and the one in force deleted
+    add, delete, _ = plan(current, desired(["192.0.2.0/24"], [22]))
+    assert len(add) == 1 and delete == [["ufw", "delete", "allow", "proto", "tcp", "from", ufws, "to", "any",
+                                         "port", "22"]]
+
+
 def test_a_rule_the_install_cannot_express_is_refused_not_guessed():
     app = ("allow", "tcp", "22", "0.0.0.0/0", "any", "0.0.0.0/0", "OpenSSH", "-", "in")
     add, delete, errors = plan([app], desired(["192.0.2.0/24"], [22]))
@@ -103,6 +121,7 @@ PUBLISHED = """\
 ### tuple ### allow tcp 465 0.0.0.0/0 any 0.0.0.0/0 in
 -A ufw-user-input -p tcp --dport 465 -j ACCEPT
 ### tuple ### allow tcp 993 ::/0 any ::/0 in
+# (that IPv6 rule as step 19 wrote it before the machine served IPv4 alone)
 -A ufw6-user-input -p tcp --dport 993 -j ACCEPT
 """
 
@@ -114,27 +133,36 @@ def test_the_firewall_step_keeps_the_publications_rules_and_never_writes_them_it
     current = parse_tuples(USER_RULES + PUBLISHED)
     kept = published_rules(current, [993, 465])
     assert kept == [("allow", "tcp", "993", "0.0.0.0/0", "any", "0.0.0.0/0", "in"),
-                    ("allow", "tcp", "465", "0.0.0.0/0", "any", "0.0.0.0/0", "in"),
-                    ("allow", "tcp", "993", "::/0", "any", "::/0", "in")]
+                    ("allow", "tcp", "465", "0.0.0.0/0", "any", "0.0.0.0/0", "in")]
     wanted = desired(["192.0.2.0/24"], [22, 443])
     add, delete, errors = plan(current, wanted, kept)
-    assert errors == [] and not any("993" in argv or "465" in argv for argv in add + delete)
-    assert delete == [["ufw", "delete", "allow", "proto", "tcp", "from", "198.51.100.0/24", "to", "any",
-                       "port", "443"]]   # the control: the step still deletes what is not its own
-    # the kernel is expected to hold them, in their own family, from anywhere
+    assert errors == [] and not any("993" in argv or "465" in argv for argv in add)
+    assert ["ufw", "delete", "allow", "proto", "tcp", "from", "198.51.100.0/24", "to", "any",
+            "port", "443"] in delete   # the control: the step still deletes what is not its own
+    # the kernel is expected to hold them, from anywhere, over IPv4 alone
     rules = kernel_rules(["192.0.2.0/24"], [22, 443], kept)
     assert "-A ufw-user-input -p tcp --dport 993 -j ACCEPT" in rules[4]
     assert "-A ufw-user-input -p tcp --dport 465 -j ACCEPT" in rules[4]
-    assert rules[6] == ["-A ufw6-user-input -p tcp --dport 993 -j ACCEPT"]
+    assert rules[6] == []
     # a machine not published: nothing of the mail ports is kept, planned or expected
     assert published_rules(parse_tuples(USER_RULES), [993, 465]) == []
 
 
-def test_the_firewall_step_keeps_the_very_ports_publication_opens():
+def test_an_ipv6_publication_an_earlier_release_wrote_is_deleted_and_only_it():
+    """Until the machine served IPv4 alone, step 19 opened 993 and 465 over IPv6 as
+    well: on that machine a re-run of step 3 deletes the IPv6 rule and keeps the IPv4 one."""
+    current = parse_tuples(USER_RULES + PUBLISHED)
+    _add, delete, errors = plan(current, desired(["192.0.2.0/24"], [22, 443]),
+                                published_rules(current, [993, 465]))
+    assert errors == []
+    assert ["ufw", "delete", "allow", "proto", "tcp", "from", "::/0", "to", "any", "port", "993"] in delete
+    assert not any(argv[-1] in ("993", "465") and "::/0" not in argv for argv in delete)  # the control
+
+
+def test_each_published_port_has_its_connection_budget():
     roles = Path(__file__).resolve().parents[2] / "ansible" / "roles"
-    firewall = yaml.safe_load((roles / "firewall" / "defaults" / "main.yml").read_text())
     publish = yaml.safe_load((roles / "publish" / "defaults" / "main.yml").read_text())
-    assert firewall["maildivvy_mail_ports"] == publish["maildivvy_publish_ports"] == [993, 465]
+    assert publish["maildivvy_publish_ports"] == [993, 465]
     assert set(publish["maildivvy_publish_rate_limits"]) == set(publish["maildivvy_publish_ports"])
 
 
@@ -323,7 +351,8 @@ def test_the_wait_is_bounded_even_if_the_timer_never_fires():
 def test_both_firewall_steps_are_confirmed_the_same_way():
     roles = Path(__file__).resolve().parents[2] / "ansible" / "roles"
     firewall = yaml.safe_load((roles / "firewall" / "defaults" / "main.yml").read_text())
-    block = yaml.safe_load((roles / "docker_block" / "defaults" / "main.yml").read_text())
+    block = (roles / "docker_block" / "tasks" / "main.yml").read_text()
+    # one definition, the firewall role's, which step 4 reads (no copy to drift)
     for name in ("maildivvy_firewall_confirmation", "maildivvy_admin_ssh_source"):
-        assert firewall[name] == block[name], name
+        assert name in firewall and name in block, name
     assert firewall["maildivvy_firewall_confirmation"] == "new-session"   # the control machine's

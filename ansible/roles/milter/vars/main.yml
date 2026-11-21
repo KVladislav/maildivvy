@@ -10,20 +10,22 @@ maildivvy_milter_unit: maildivvy-milter.service
 
 # ⛔ INSIDE POSTFIX'S QUEUE. `submissions` is chrooted to /var/spool/postfix, so a
 # socket at /run/… comes up correctly and no submission can ever reach it. Postfix names
-# it relatively, from inside the jail.
-maildivvy_milter_queue: /var/spool/postfix
-maildivvy_milter_socket_dir: "{{ maildivvy_milter_queue }}/maildivvy"
+# it relatively, from inside the jail. The queue is the Postfix package's.
+maildivvy_milter_socket_dir: "{{ maildivvy_postfix_queue }}/maildivvy"
 maildivvy_milter_socket: "{{ maildivvy_milter_socket_dir }}/milter.sock"
 maildivvy_milter_binding: "unix:maildivvy/milter.sock"
 # The rollback drill's binding: a socket nothing listens on, so the fail-closed default
 # is exercised before the real one is written.
 maildivvy_milter_nonexistent: "unix:maildivvy/does-not-exist.sock"
+# ⛔ The drill's own submission service: a copy of `submissions` on the loopback, set up
+# at the drill's start and removed at its end. The drill never touches the live service,
+# which a re-run would otherwise leave unbound, with no From check and no scan, for as
+# long as the drill takes.
+maildivvy_milter_drill_port: 19465
+maildivvy_milter_drill_service: "127.0.0.1:{{ maildivvy_milter_drill_port }}/inet"
 
-maildivvy_milter_opt: /opt/maildivvy
-maildivvy_milter_etc: /etc/maildivvy
-maildivvy_milter_db_conf: "{{ maildivvy_milter_etc }}/milter/db.conf"
-maildivvy_milter_clamd_socket: /run/clamav/clamd.ctl
-maildivvy_milter_program: "{{ maildivvy_milter_opt }}/bin/maildivvy-milter"
+maildivvy_milter_db_conf: "{{ maildivvy_etc }}/milter/db.conf"
+maildivvy_milter_program: "{{ maildivvy_opt }}/bin/maildivvy-milter"
 # The step's own submission probe, for the rollback drill and its two controls.
 maildivvy_milter_probe_program: /usr/local/sbin/maildivvy-submission-probe
 

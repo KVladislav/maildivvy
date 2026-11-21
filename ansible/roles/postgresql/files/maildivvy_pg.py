@@ -41,6 +41,8 @@ DATABASE = "maildivvy"
 HOST = "localhost"  # the unix socket, as libpq names it in a passfile
 PORT = 5432
 ROLE = re.compile(r"maildivvy_[a-z]+")
+# what `openssl passwd -stdin` hashes whole; the interface's PASSWORD_MAX
+PASSWORD_MAX = 256
 BREAK_GLASS_HASH = re.compile(r"\$6\$([./0-9A-Za-z]{16})\$[./0-9A-Za-z]{86}")
 
 
@@ -122,6 +124,8 @@ def set_password(role, passfile, reader, database, host=HOST):
 
 
 def openssl_sha512_crypt(password, salt=None):
+    if len(password.encode()) > PASSWORD_MAX:   # openssl would hash only the start of it
+        raise PgError(f"the break-glass password is longer than {PASSWORD_MAX} bytes")
     argv = ["openssl", "passwd", "-6", "-stdin"] + (["-salt", salt] if salt else [])
     out = subprocess.run(argv, input=password + "\n", capture_output=True, text=True, check=True).stdout.strip()
     if not BREAK_GLASS_HASH.fullmatch(out):

@@ -1,0 +1,15 @@
+# Managed by Ansible (roles/health). Install step 17.
+# The ledger's daily pass, in the night, away from the backup at
+# midnight. Every health run reports its age: older than ledger_pass_hours, UNKNOWN.
+[Unit]
+Description=Maildivvy: hold every name in the store to the ledger, daily
+
+[Timer]
+OnCalendar={{ maildivvy_health_ledger_calendar }}
+# a pass missed while the machine was down is taken when it is back
+Persistent=true
+AccuracySec=10s
+Unit={{ maildivvy_health_ledger_unit }}
+
+[Install]
+WantedBy=timers.target

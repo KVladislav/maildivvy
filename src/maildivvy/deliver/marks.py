@@ -38,14 +38,15 @@ import math
 import quopri
 
 from maildivvy.deliver import report
+# The fields the pass reads back are named once, in the module it reads them through.
+from maildivvy.lib.headers import NONE, REASON_HEADER, SPAM_MARK_HEADER, SPAM_SCORE_HEADER, WITHHELD_HEADER
 
 SCAN_HEADER = "X-Maildivvy-Scan"
 SCAN_DETAIL_HEADER = "X-Maildivvy-Scan-Detail"
-SPAM_MARK_HEADER = "X-Maildivvy-Spam-Mark"
-SPAM_SCORE_HEADER = "X-Maildivvy-Spam-Score"
 SPAM_ACTION_HEADER = "X-Maildivvy-Spam-Action"
 SPAM_DETAIL_HEADER = "X-Maildivvy-Spam-Detail"
 MARK_DETAIL_HEADER = "X-Maildivvy-Spam-Mark-Detail"
+LEADING_FOLD_HEADER = "X-Maildivvy-Leading-Fold"
 
 # The literal written where the scanner gave no number. Never an omitted header.
 NO_SCORE = "unavailable"
@@ -71,6 +72,10 @@ NOT_ENCODABLE = "notice-not-encodable"
 NO_TEXT_LEAF = "no-text-leaf"
 SERIALISE_FAILED = "serialise-failed"
 
+# A charset name is at most 40 characters (the IANA registry); a longer one is the
+# sender's text, and the detail is a header line of ours, so it is not copied in.
+NAME_MAX = 40
+
 SKIP_REASONS = (PARSE_FAILED, ROUND_TRIP_UNEQUAL, DEFECTS, PROTECTED_TYPE,
                 UNKNOWN_TRANSFER_ENCODING, UNKNOWN_CHARSET, NOT_ENCODABLE,
                 NO_TEXT_LEAF, SERIALISE_FAILED)
@@ -93,8 +98,8 @@ def verdict_headers(verdict, detail, score, action, spam, score_detail, mark_det
         # ⛔ And both of these into every message too: the pass
         # reads them, so a sender's copy must never be the first occurrence. A message
         # filed with this block is never a report; the report has no block.
-        (report.WITHHELD_HEADER, withheld_id or report.NONE),
-        (report.REASON_HEADER, report.NONE),
+        (WITHHELD_HEADER, withheld_id or NONE),
+        (REASON_HEADER, NONE),
     ]
     return [(name, value) for name, value in headers if value is not None]
 
@@ -104,8 +109,15 @@ def insert_headers(raw, headers):
 
     A value is collapsed to one line first: a CR or an LF inside one is not an escaping
     problem here, it is a new header.
+
+    ⛔ A message whose first line begins with whitespace would continue the block's last
+    header, one the pass reads. mpop's own `Received:` comes first on a fetch, and the
+    block does not lean on that: such a message gets one more header, read by nothing,
+    for its first line to continue. Its bytes are kept as they came.
     """
     eol = line_ending(split_header_block(raw)[0]).decode("ascii")
+    if raw[:1] in (b" ", b"\t"):
+        headers = [*headers, (LEADING_FOLD_HEADER, "the message's first line continues this")]
     block = "".join(f"{name}: {report.one_line(value)}{eol}" for name, value in headers)
     return block.encode("utf-8", "replace") + raw
 
@@ -221,7 +233,9 @@ def mark_body(raw, notice_text, notice_html):
         charset = part.get_content_charset() or "us-ascii"
         encoding = (part.get("Content-Transfer-Encoding") or "").strip().lower()
         if encoding not in KNOWN_ENCODINGS:
-            return raw, f"{UNKNOWN_TRANSFER_ENCODING}: {encoding}"
+            return raw, f"{UNKNOWN_TRANSFER_ENCODING}: {named(encoding, 'transfer encoding')}"
+        if len(charset) > NAME_MAX:
+            return raw, f"{UNKNOWN_CHARSET}: charset too long"
         text = notice_html if part.get_content_type() == "text/html" else notice_text
         try:
             codecs.lookup(charset)
@@ -243,6 +257,11 @@ def mark_body(raw, notice_text, notice_html):
         return message.as_bytes(), None
     except Exception as err:  # noqa: BLE001 - any write fault at all
         return raw, f"{SERIALISE_FAILED}: {type(err).__name__}"
+
+
+def named(value, what):
+    """A name the sender declared, for the detail; one too long to be a name is not."""
+    return value if len(value) <= NAME_MAX else f"{what} too long"
 
 
 def set_payload(part, data, encoding):

@@ -15,6 +15,7 @@ the server answered the RETR. Everything in this module about exit codes was mea
 on the test VM against the stub provider:
 
     exit 74 + `returned exit status 75 (EX_TEMPFAIL`  the antivirus hold
+    exit 74 + `returned exit status 73`               the store's hold
     exit 74 + `returned exit status <other>`          our delivery refused THIS message
     exit 74 + `cannot read from TLS connection`       the connection died at RETR
     exit 76 + `command RETR n failed`                 the provider refused THIS message
@@ -23,12 +24,17 @@ on the test VM against the stub provider:
 ⛔ THE HOLD IS NOT A STUCK MESSAGE. mpop's exit code is 74 for it and for a
 plain refusal alike, so the two are told apart by mpop's own line; counting the hold
 toward the stuck-message hour would start skipping mail the antivirus was only late for.
+
+⛔ NOR IS A STORE THAT CANNOT TAKE MAIL. The filter exits 73 when its probe
+finds the store full, read-only or Dovecot not answering; counted as this message's,
+a store outage longer than the hour skipped each mailbox's next message.
 """
 
 import re
 from dataclasses import dataclass
 
 EX_OK = 0
+EX_CANTCREAT = 73  # what the delivery filter exits while the store cannot take mail
 EX_IOERR = 74
 EX_TEMPFAIL = 75  # what the delivery filter exits while the antivirus is unreachable
 EX_PROTOCOL = 76
@@ -43,10 +49,12 @@ STATUSES = (OK, NO_NEW_MAIL, AUTH_FAILED, ERROR)
 # the order of reading.
 UNRECORDED = "unrecorded"      # the runner could not record what it decided
 TIMEOUT = "timeout"            # our own timeout killed mpop
+MARK = "mark"                  # an IMAP row with no mark it can trust collects nothing
 STUCK_MESSAGE = "stuck_message"  # mpop named one message it could not take
+STORE = "store"                # the archive's store could not take any message
 UNREACHABLE = "unreachable"    # the provider could not be reached
 TRANSIENT = "transient"        # anything else, the antivirus hold included
-CAUSES = (UNRECORDED, TIMEOUT, STUCK_MESSAGE, UNREACHABLE, TRANSIENT)
+CAUSES = (UNRECORDED, TIMEOUT, MARK, STUCK_MESSAGE, STORE, UNREACHABLE, TRANSIENT)
 
 # The generic trailers. They name the account and the configuration file and nothing
 # about the failure, so the LAST line is the one line worth dropping.
@@ -54,7 +62,9 @@ GENERIC = ("error during mail retrieval", "error during delivery")
 
 RETR_FAILED = re.compile(r"^mpop: command RETR (\d+) failed", re.M)
 # mpop names the delivery command's own sysexits status in a line of its own.
-DELIVERY_STATUS = re.compile(r"returned exit status (\d+)")
+# ⛔ Anchored to mpop's own lines: the delivery filter's stderr reaches the same output,
+# and under `--debug` so do message bodies, so a phrase found anywhere is not mpop's.
+DELIVERY_STATUS = re.compile(r"^mpop: .* returned exit status (\d+)", re.M)
 # Words that mean the provider was not reached. Lower case: the reading folds the line.
 UNREACHABLE_WORDS = ("connect", "timed out", "refused", "unreachable", "resolve",
                      "cannot locate host", "network", "no route")
@@ -67,8 +77,9 @@ NO_MPOP_DETAIL = "mpop reported no message of its own"
 #   nothing new to retrieve  `new: no messages, total: 1 message in 20 bytes`
 #   something retrieved      `new: 1 message in 20 bytes, total: …`
 # So the 1.4.21 wording alone would read an empty provider mailbox as `ok`. The words
-# that mean "nothing came" are the two below, and only a retrieval removes them.
-NOTHING_RETRIEVED = "no messages"
+# that mean "nothing came" are the two below, and only a retrieval removes them. They
+# are read at the start of a line, where mpop's status line has them, and nowhere else.
+NOTHING_RETRIEVED = re.compile(r"^(?:new: )?no messages(?:,|$)", re.M)
 
 
 @dataclass(frozen=True)
@@ -77,6 +88,7 @@ class Outcome:
     cause: str | None
     detail: str | None
     held: bool = False
+    store_held: bool = False  # the store could not take mail, collection holds
     message_level: bool = False
     retr_number: int | None = None
     # ⛔ The run reached the delivery filter and it answered with a real
@@ -85,6 +97,13 @@ class Outcome:
     # is the hold. The runner clears `held_since` on this, so a hold that ends with a
     # refused message does not go on reporting the antivirus as down.
     scanner_answered: bool = False
+
+    def __post_init__(self):
+        # ⛔ A NUL in the detail is refused by the database, and the record of that refusal
+        # raised again, out of the run and past every mailbox after this one. The
+        # detail is words for a screen: a NUL there says nothing.
+        if self.detail and "\x00" in self.detail:
+            object.__setattr__(self, "detail", self.detail.replace("\x00", " "))
 
 
 def mpop_lines(out):
@@ -123,6 +142,11 @@ def held(rc, out):
     return rc == EX_IOERR and delivery_status(out) == EX_TEMPFAIL
 
 
+def store_held(rc, out):
+    """the archive's store cannot take mail and this message waits at the provider."""
+    return rc == EX_IOERR and delivery_status(out) == EX_CANTCREAT
+
+
 def retr_number(out):
     """The message number in `command RETR n failed`, or None."""
     found = RETR_FAILED.search(out)
@@ -130,18 +154,20 @@ def retr_number(out):
 
 
 def message_level(rc, out):
-    """, minus the hold."""
+    """, minus the holds."""
     if rc == EX_PROTOCOL:
         return RETR_FAILED.search(out) is not None
     if rc == EX_IOERR:
         status = delivery_status(out)
-        return status is not None and status != EX_TEMPFAIL
+        return status is not None and status not in (EX_TEMPFAIL, EX_CANTCREAT)
     return False
 
 
 def cause_of(rc, out, stuck):
     if stuck:
         return STUCK_MESSAGE
+    if store_held(rc, out):
+        return STORE
     folded = "\n".join(mpop_lines(out)).lower()
     if any(word in folded for word in UNREACHABLE_WORDS):
         return UNREACHABLE
@@ -151,7 +177,7 @@ def cause_of(rc, out, stuck):
 def read(rc, out):
     """What one fetch run was."""
     if rc == EX_OK:
-        return Outcome(NO_NEW_MAIL if NOTHING_RETRIEVED in out else OK, None, None)
+        return Outcome(NO_NEW_MAIL if NOTHING_RETRIEVED.search(out) else OK, None, None)
     if rc == EX_NOPERM:
         # A refused credential is its own status and never goes through the
         # classification: it has a human cause, and a screen says so.
@@ -159,17 +185,20 @@ def read(rc, out):
     stuck = message_level(rc, out)
     delivered = delivery_status(out)
     return Outcome(ERROR, cause_of(rc, out, stuck), fetch_detail(out),
-                   held=held(rc, out), message_level=stuck, retr_number=retr_number(out),
+                   held=held(rc, out), store_held=store_held(rc, out), message_level=stuck,
+                   retr_number=retr_number(out),
                    scanner_answered=delivered is not None and delivered != EX_TEMPFAIL)
 
 
-def timed_out(seconds):
-    """Our own timeout killed mpop.
+def timed_out(seconds, killed=False):
+    """Our own timeout stopped mpop, or killed it when it did not stop. Only a stopped mpop saved what it delivered.
 
     None of the child's output is kept: on this path - a connection closed inside a
     message body - it has no bound.
     """
-    return Outcome(ERROR, TIMEOUT, f"timed out after {int(seconds)} s; mpop killed")
+    ended = ("mpop killed" if killed else
+             "mpop stopped, and the next run continues after what it delivered")
+    return Outcome(ERROR, TIMEOUT, f"timed out after {int(seconds)} s; {ended}")
 
 
 def read_test(rc, out):
