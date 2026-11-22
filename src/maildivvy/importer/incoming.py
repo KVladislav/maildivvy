@@ -33,11 +33,10 @@ ARCHIVED = """
      WHERE domain_id = %s AND archive_uid IS NOT NULL AND id > %s ORDER BY id
 """
 CURSOR = "SELECT last_uid FROM pass_cursor WHERE domain_id = %s AND mailbox = 'INBOX'"
-# The INBOX numbers of a range that an imported row holds.
+# Of the imported names the pass passed, those a row holds, by base name (`0100`).
 RECORDED = """
-    SELECT archive_uid FROM message
-     WHERE domain_id = %s AND state = 'delivered' AND imported_at IS NOT NULL
-       AND archive_uid BETWEEN %s AND %s
+    SELECT archive_base FROM message
+     WHERE domain_id = %s AND state = 'delivered' AND archive_base = ANY(%s)
 """
 
 
@@ -97,9 +96,9 @@ class Incoming:
                                     f"{first}:{last}")
         except doveadm.DoveadmError as err:
             raise run.Stop(f"Dovecot did not say which messages the pass passed: {err}") from None
-        named = {int(r["uid"]) for r in records if store.imported(r.get("storageid"))}
+        named = {r["storageid"] for r in records if store.imported(r.get("storageid"))}
         with self.conn.cursor() as cur:
-            cur.execute(RECORDED, (self.domain_id, first, last))
+            cur.execute(RECORDED, (self.domain_id, sorted(named)))
             held = {row[0] for row in cur.fetchall()}
         self.conn.commit()
         self.unrecorded += len(named - held)

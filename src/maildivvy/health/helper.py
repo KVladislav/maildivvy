@@ -287,18 +287,19 @@ def read_ledger_pass(root=None):
             with conn.cursor() as cur:
                 cur.execute(ONE_MOMENT)
                 cur.execute(ledger.CURSORS, (label,))
-                cursors = {folder: (last_uid, kept) for folder, last_uid, kept in cur.fetchall()}
+                cursors = {folder: (last_uid, kept, base) for folder, last_uid, kept, base
+                           in cur.fetchall()}
                 cur.execute(ledger.MESSAGES, (label,))
-                by_uid = ledger.by_folder_and_uid(cur.fetchall())
+                bases = ledger.by_base(cur.fetchall())
                 cur.execute(DELIVERY_COUNT.format(ledger.DELIVERIES), (label,))
                 deliveries = cur.fetchone()[0]
                 cur.execute(ledger.MAILBOXES, (label,))
                 mailboxes = list(cur.fetchall())
                 cur.execute("COMMIT")
-            listing = ledger.archive_listing(label)   # ⛔ after the rows, never before
-            inodes = ledger.archive_inodes(label, by_uid, root, listing=listing)
-            under = ledger.under_cursor(label, listing, by_uid, cursors)
-            del listing, by_uid   # the archive's size each: what is held from here is its inodes
+            listing = ledger.archive_listing(label, root)   # ⛔ after the rows, never before
+            inodes = ledger.archive_inodes(label, bases, root, listing=listing)
+            under = ledger.under_cursor(label, listing, bases, cursors)
+            del listing, bases   # the archive's size each: what is held from here is its inodes
             findings = []
             for mailbox_id, account in mailboxes:
                 # this mailbox's rows, read before its names as the domain's were

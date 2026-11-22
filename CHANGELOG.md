@@ -5,6 +5,23 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-22
+
+### Changed
+
+- The archive's messages are recorded by their file's name, which never changes, and no
+  longer by the number Dovecot gives them in a folder. A folder Dovecot numbers again
+  (its `dovecot-uidlist` lost or replaced, after a restore of the store for one) is
+  repaired by the next fan-out on its own: nothing stops, health's fan-out check reads
+  a WARN naming what was matched again, and `maildivvy-pass --renumber` is removed. Top-ups
+  and other requests find a message's file without asking Dovecot, and health's ledger
+  checks read the archive's directories instead of listing every folder through Dovecot.
+- Upgrading: the messages already recorded are given their file's name by the first
+  fan-out of each folder after the upgrade, while the folder's numbering still holds. A
+  folder Dovecot had already numbered again before the upgrade stops with a line naming
+  the way back: back to 0.3.1 as the upgrade prints it, `maildivvy-pass --renumber` there,
+  then this upgrade again. The upgrade adds a database migration.
+
 ## 0.3.1 - 2026-11-21
 
 ### Fixed

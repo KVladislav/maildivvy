@@ -69,8 +69,9 @@ class Bulk:
         for uid in range(1, messages + 1):
             self.ids[uid] = f"17000000{uid:02d}.M{uid}P1.host"
             (archive / "cur" / f"{self.ids[uid]}:2,").write_text(f"message {uid}")
-            database.sql("INSERT INTO message (domain_id, archive_uid, received_at) VALUES "
-                         "(%s, %s, coalesce(%s, clock_timestamp()))", (self.domain, uid, received))
+            database.sql("INSERT INTO message (domain_id, archive_uid, archive_base, received_at) "
+                         "VALUES (%s, %s, %s, coalesce(%s, clock_timestamp()))",
+                         (self.domain, uid, self.ids[uid], received))
         self.fetched = []
         monkeypatch.setattr(requests.doveadm, "fetch", self.fetch)
         self.conns, self.pid, self.made = [], None, 0

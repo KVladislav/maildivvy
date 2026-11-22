@@ -150,26 +150,36 @@ def test_an_archive_uid_has_one_row_per_folder(database, pipeline, domain):
     run(pipeline, "UPDATE message SET state = 'released' WHERE archive_uid = 7 AND state = 'withheld'")
 
 
-def test_a_folder_renumbered_with_its_numbers_swapped_is_given_them_after_they_are_cleared(
+def test_a_folder_renumbered_with_its_numbers_swapped_is_given_them_by_base_name(
         database, pipeline, domain):
-    from maildivvy.fanout import pass_
-    first, second = (run(pipeline, "INSERT INTO message (domain_id, archive_uid) VALUES (%s, %s) "
-                                   "RETURNING id", (domain, uid))[0][0] for uid in (1, 2))
-    refused(database, pipeline, pass_.RENUMBER_ROW, (2, first), "UniqueViolation")
+    record = ("INSERT INTO message (domain_id, archive_uid, archive_base, state) "
+              "VALUES (%s, %s, %s, %s) RETURNING id")
+    first, second, gone = (run(pipeline, record, (domain, uid, f"b{uid}", "delivered"))[0][0]
+                           for uid in (1, 2, 3))
+    held = run(pipeline, record, (domain, 1, "q1", "withheld"))[0][0]   # the quarantine's own 1
+    refused(database, pipeline, "UPDATE message SET archive_uid = 2 WHERE id = %s", (first,),
+            "UniqueViolation")
     with pipeline.cursor() as cur:
-        cur.execute(pass_.UNNUMBER, (domain, True))
-        cur.execute(pass_.RENUMBER_ROW, (2, first))
-        cur.execute(pass_.RENUMBER_ROW, (1, second))
+        # b1 and b2 swapped, b3 gone, and a file no row names numbered 3
+        rowless, without_file = ledger.renumber_rows(cur, domain, ledger.INBOX,
+                                                     [(1, "b2"), (2, "b1"), (3, "new")])
     pipeline.commit()
-    assert database.sql("SELECT id, archive_uid FROM message ORDER BY id") == [(first, 2), (second, 1)]
+    assert (rowless, without_file) == ([3], 1)
+    assert database.sql("SELECT id, archive_uid FROM message ORDER BY id") == [
+        (first, 2), (second, 1), (gone, None), (held, 1)]
 
 
-def test_the_window_looks_a_message_up_by_its_folder_and_uid(database, pipeline, domain):
-    rows = {}
-    for uid, state in ((3, "delivered"), (3, "withheld"), (4, "delivered")):
-        rows[(uid, state)] = run(pipeline, "INSERT INTO message (domain_id, archive_uid, state) "
-                                           "VALUES (%s, %s, %s) RETURNING id", (domain, uid, state))[0][0]
-    asked = sorted([(ledger.INBOX, 3), ("Quarantine", 4)])
-    found = run(pipeline, ledger.MESSAGES_BY_UID,
-                ([folder == ledger.INBOX for folder, _ in asked], [uid for _, uid in asked], "alpha"))
-    assert found == [(rows[(3, "delivered")], 3, "delivered")]   # not the quarantine's 3, no quarantine 4
+def test_an_archive_base_name_is_one_row_per_domain_and_the_window_looks_it_up(
+        database, pipeline, domain):
+    record = ("INSERT INTO message (domain_id, archive_uid, archive_base, state) "
+              "VALUES (%s, %s, %s, %s) RETURNING id")
+    inbox = run(pipeline, record, (domain, 3, "1757.M3.host,S=1,W=1", "delivered"))[0][0]
+    held = run(pipeline, record, (domain, 3, "1757.M9.host,S=1,W=1", "withheld"))[0][0]
+    run(pipeline, record, (domain, None, None, "delivered"))   # the Sent hook's rows hold none
+    run(pipeline, record, (domain, None, None, "delivered"))
+    refused(database, pipeline, record, (domain, 4, "1757.M3.host,S=1,W=1", "withheld"),
+            "UniqueViolation")
+    for wrong in ("1757.M3.host:2,S", "../1757.M3.host", ""):
+        refused(database, pipeline, record, (domain, 5, wrong, "delivered"), "CheckViolation")
+    found = run(pipeline, ledger.MESSAGES_BY_BASE, ("alpha", ["1757.M9.host,S=1,W=1", "nothing"]))
+    assert found == [(held, "1757.M9.host,S=1,W=1")] and inbox != held

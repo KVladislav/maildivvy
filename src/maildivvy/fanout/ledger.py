@@ -23,10 +23,11 @@ anything yet; it would have gone FAIL on the first ordinary deletion.
 second name for one inode and writes no row, and the specification says that is not an
 unaccounted write.
 
-⛔ KEY ON THE FOLDER AND THE UID TOGETHER. A UID names a message only
-inside its mailbox: one archive's UID 1 is a different message in INBOX and in the
-quarantine folder. Which folder a row belongs to is the row's own state, never
-something to guess from the UID.
+⛔ KEY ON THE BASE NAME, NEVER ON THE UID (`0100`). A UID names a message only inside its
+folder, and only while Dovecot keeps the numbering it gave; the
+file's base name is the same in every folder and under every numbering, and is the name
+of each of its hardlinks. Which folder a row's UID counts in is still the row's own
+state, never something to guess from the UID.
 
 ⛔ SELECT ON WHAT THE PRODUCT WROTE, NEVER ON A STORED HEADER. A count of
 this machine's own notices by a prefix match on the stored subject read 9 of 10 and
@@ -57,9 +58,9 @@ LINK = """
 
 # The archive's own rows: the product wrote every column named here.
 MESSAGES = """
-    SELECT m.id, m.archive_uid, m.state
+    SELECT m.id, m.archive_base
       FROM message m JOIN domain d ON d.id = m.domain_id
-     WHERE d.label = %s AND m.archive_uid IS NOT NULL
+     WHERE d.label = %s AND m.archive_base IS NOT NULL
 """
 DELIVERIES = """
     SELECT dl.message_id, dl.mailbox_id
@@ -68,50 +69,111 @@ DELIVERIES = """
      WHERE d.label = %s
 """
 MAILBOXES = "SELECT mailbox_id, account FROM mailbox_receives WHERE domain = %s ORDER BY mailbox_id"
-# Where the pass has read each archive folder to, and the numbering that UID is of.
+# Where the pass has read each archive folder to, the numbering that UID is of
+# and the file it named (`0100`).
 CURSORS = """
-    SELECT c.mailbox, c.last_uid, c.uidvalidity
+    SELECT c.mailbox, c.last_uid, c.uidvalidity, c.last_base
       FROM pass_cursor c JOIN domain d ON d.id = c.domain_id
      WHERE d.label = %s
 """
-# The window's lookups: only the messages and the rows its names point at, each by its
-# folder and UID together, which is the ledger's unique index: one lookup per
-# name, never every row of the domain.
-MESSAGES_BY_UID = """
-    SELECT m.id, m.archive_uid, m.state
-      FROM unnest(%s::boolean[], %s::bigint[]) AS k (inbox, uid)
-      JOIN message m ON m.archive_uid = k.uid AND (m.state = 'delivered') = k.inbox
-     WHERE m.domain_id = (SELECT id FROM domain WHERE label = %s) AND m.archive_uid IS NOT NULL
+# The window's lookups: only the messages its names point at, by base name, which is the
+# ledger's unique index (`0100`): one lookup per name, never every row of the domain.
+MESSAGES_BY_BASE = """
+    SELECT m.id, m.archive_base FROM message m
+     WHERE m.domain_id = (SELECT id FROM domain WHERE label = %s) AND m.archive_base = ANY(%s)
 """
 DELIVERIES_OF = "SELECT message_id, mailbox_id FROM delivery WHERE message_id = ANY(%s)"
 
-# --- the numbering the ledger's UIDs belong to -----------------------------------------
+# --- the numbering the cursor's UID belongs to (`0100`) ---------------------------------
 #
-# ⛔ A UID NAMES ONE FILE ONLY WHILE THE FOLDER'S UIDLIST IS THE ONE IT WAS GIVEN BY. The
-# pass's tick and every request that links by UID hold the folder to two facts before
-# they read a UID, as measured on Dovecot 2.4.2: its UIDVALIDITY is the one kept
-# on its cursor row, which a folder whose index trees were both lost changes as it
-# numbers its files again from 1, closing any gap; and the cursor's own UID is still
-# there, which a folder that lost its uidlist alone (`ctl/`) does not keep, since
-# Dovecot numbers every file again above the old numbers under the same UIDVALIDITY. A
-# row keeping no UIDVALIDITY takes Dovecot's, as the first tick after the upgrade does.
+# ⛔ A MESSAGE IS ITS FILE'S BASE NAME; A UID IS ONLY WHERE THE PASS HAS READ TO. The base name
+# (Dovecot's storage id) never changes and is the name of every hardlink (`0100`); a UID names
+# one file only while the folder's uidlist is the one it was given by. So before a tick
+# lists a folder above its cursor it asks whether the cursor still means what it did: the
+# folder's UIDVALIDITY is the one its row keeps (both index trees lost: a new one, numbered
+# from 1), and the UID at the cursor is still there and names the file the cursor was moved
+# to (the uidlist alone lost: every file numbered again above the old numbers under the same
+# UIDVALIDITY; an older uidlist put back: the same numbers on other files). A folder that
+# fails is CHANGED, and the tick gives its rows their new UIDs by base name and records
+# whatever file has no row (`fanout/pass_.py`'s `reconcile`); nothing stops.
+#
+# ⛔ A ROW WITH NO BASE NAME YET IS NAMED BY ITS UID, AND ONLY UNDER THE NUMBERING IT WAS GIVEN.
+# Rows the previous release wrote are UNNAMED until their folder's first tick under this one
+# lists the folder and names them, which is right only while two facts hold. A folder
+# renumbered before its rows were named has no exact way to them: it stops, and says the way
+# back.
 
-NUMBERING = "SELECT uidvalidity, last_uid FROM pass_cursor WHERE domain_id = %s AND mailbox = %s"
+NUMBERING = ("SELECT uidvalidity, last_uid, last_base FROM pass_cursor "
+             "WHERE domain_id = %s AND mailbox = %s")
 ADOPT = ("UPDATE pass_cursor SET uidvalidity = %s "
          "WHERE domain_id = %s AND mailbox = %s AND uidvalidity IS NULL")
-# the way back's command, run as the mail owner (`fanout/pass_.py`'s `renumber`)
-RENUMBER = f"runuser -u {store.MAIL_USER} -- /opt/maildivvy/bin/maildivvy-pass"
+ADOPT_BASE = ("UPDATE pass_cursor SET last_base = %s "
+              "WHERE domain_id = %s AND mailbox = %s AND last_base IS NULL")
+# the cursor's file once the folder's rows are named: the previous release, run again by the
+# upgrade's way back, moved `last_uid` and left this release's `last_base` behind it
+NAMED_AT = "UPDATE pass_cursor SET last_base = %s WHERE domain_id = %s AND mailbox = %s"
+# the UID the row of the cursor's last file was given, to ask whether it still names that file
+UID_OF = "SELECT archive_uid FROM message WHERE domain_id = %s AND archive_base = %s"
+# the folder's rows still named by their UID alone (migration 0012's `message_unnamed_idx`)
+UNNAMED = """
+    SELECT 1 FROM message WHERE domain_id = %s AND (state = 'delivered') = %s
+       AND archive_uid IS NOT NULL AND archive_base IS NULL LIMIT 1
+"""
+NAME_BY_UID = """
+    UPDATE message m SET archive_base = k.base
+      FROM unnest(%s::bigint[], %s::text[]) AS k (uid, base)
+     WHERE m.domain_id = %s AND (m.state = 'delivered') = %s
+       AND m.archive_uid = k.uid AND m.archive_base IS NULL
+"""
+# a row whose UID names no file under a numbering that holds: its file was expunged by hand
+NO_FILE = """
+    UPDATE message SET archive_uid = NULL WHERE domain_id = %s AND (state = 'delivered') = %s
+       AND archive_uid IS NOT NULL AND archive_base IS NULL
+"""
+# A changed numbering: every UID of the folder goes first (the unique index), then
+# each row takes the UID its file has now; a row whose file is gone keeps none.
+UNNUMBER = ("UPDATE message SET archive_uid = NULL "
+            "WHERE domain_id = %s AND archive_uid IS NOT NULL AND (state = 'delivered') = %s")
+NUMBER_BY_BASE = """
+    UPDATE message m SET archive_uid = k.uid
+      FROM unnest(%s::bigint[], %s::text[]) AS k (uid, base)
+     WHERE m.domain_id = %s AND (m.state = 'delivered') = %s AND m.archive_base = k.base
+"""
+ROWLESS = """
+    SELECT k.uid FROM unnest(%s::bigint[], %s::text[]) AS k (uid, base)
+     WHERE NOT EXISTS (SELECT 1 FROM message m WHERE m.domain_id = %s AND m.archive_base = k.base)
+     ORDER BY k.uid
+"""
+WITHOUT_FILE = """
+    SELECT count(*) FROM message WHERE domain_id = %s AND (state = 'delivered') = %s
+       AND archive_base IS NOT NULL AND archive_uid IS NULL
+"""
+# the previous release's way back, which a folder renumbered before its rows were named needs
+PREVIOUS_RENUMBER = f"runuser -u {store.MAIL_USER} -- /opt/maildivvy/bin/maildivvy-pass"
+
+KEPT, UNNAMED_ROWS, CHANGED = "kept", "unnamed", "changed"
+
+
+class Numbering(NamedTuple):
+    """What a folder's cursor means now: `state` KEPT, UNNAMED_ROWS (the numbering holds and
+    rows wait for their names) or CHANGED; Dovecot's UIDVALIDITY and the base name at the
+    cursor's UID (None: no such UID, or no cursor yet)."""
+
+    state: str
+    uidvalidity: int | None
+    base: str | None
 
 
 class Renumbered(Exception):
-    """An archive folder no longer numbers its files as the ledger's UIDs were given."""
+    """A folder numbered again before the rows of the previous release were named."""
 
     def __init__(self, label, folder, why):
         self.label, self.folder = label, folder
         super().__init__(
-            f"{label} {folder}: {why}, so a UID may name another message: nothing is "
-            f"linked from it until `{RENUMBER} --only {label} --folder {folder} --renumber` "
-            "gives the rows their new numbers")
+            f"{label} {folder}: {why}, before its rows had their archive names, so no row can "
+            "be told its file: nothing is recorded or linked from it. Go back to the previous "
+            "release (the upgrade's way back), run its "
+            f"`{PREVIOUS_RENUMBER} --only {label} --folder {folder} --renumber`, and upgrade again")
 
 
 def uidvalidity(label, folder):
@@ -130,9 +192,9 @@ def uidvalidity(label, folder):
                                    f"{status!r}") from None
 
 
-def holds_uid(label, folder, uid):
-    """Does the folder still hold this UID, its file looked up by name? Asked of a folder
-    known to exist.
+def storage_at(label, folder, uid):
+    """The base name of the file the folder numbers `uid`, or None for no such UID. Asked
+    of a folder known to exist.
 
     ⚠️ BY ITS STORAGE ID, NEVER BY THE UID ALONE. A folder whose uidlist is gone and
     whose maildir has not changed since its last sync answers its old UIDs from the index;
@@ -146,32 +208,95 @@ def holds_uid(label, folder, uid):
         records = doveadm.run(("fetch",), login, *argv)
     except doveadm.DoveadmError:
         records = doveadm.run(("fetch",), login, *argv)
-    return any(record.get("uid") == str(int(uid)) and record.get("storageid")
-               for record in records)
+    for record in records:
+        if record.get("uid") == str(int(uid)) and record.get("storageid"):
+            return record["storageid"]
+    return None
 
 
-def same_numbering(cur, domain_id, label, folder):
-    """Raise `Renumbered` unless the folder still numbers its files as its cursor row says.
+def numbering(cur, domain_id, label, folder):
+    """The folder's `Numbering`, its cursor row locked by the caller; raises `Renumbered`
+    for a folder numbered again while rows of it still wait for their names.
 
-    A row that is not there, or a folder that is not there, has no UID of the ledger's
-    to protect yet; a row keeping no UIDVALIDITY takes Dovecot's.
+    A row keeping no UIDVALIDITY takes Dovecot's, and one keeping no base name the one at
+    its UID, as the first tick after the upgrade does. A row or a folder that is not there
+    has nothing to protect.
     """
     cur.execute(NUMBERING, (domain_id, folder))
     row = cur.fetchone()
     if row is None:
-        return
-    kept, last_uid = row
+        return Numbering(KEPT, None, None)
+    kept, last_uid, last_base = row
     now = uidvalidity(label, folder)
     if now is None:
-        return
+        return Numbering(KEPT, None, None)
     if kept is None:
         cur.execute(ADOPT, (now, domain_id, folder))
-    elif int(kept) != now:
-        raise Renumbered(label, folder, f"the archive's UIDVALIDITY is {now}, the ledger's "
-                                        f"UIDs are {int(kept)}'s")
-    if last_uid and not holds_uid(label, folder, last_uid):
-        raise Renumbered(label, folder, f"the archive holds no UID {int(last_uid)}, the "
-                                        "cursor's, any more")
+        kept = now
+    at = storage_at(label, folder, last_uid) if last_uid else None
+    holds = int(kept) == now and (not last_uid or at is not None)
+    cur.execute(UNNAMED, (domain_id, folder == INBOX))
+    if cur.fetchone() is not None:
+        if holds and last_base is not None and at != last_base:
+            # The cursor moved without its base name (the previous release ran again after
+            # this one), or an older uidlist was put back: either way the file this release
+            # last read must still have the UID its row keeps.
+            cur.execute(UID_OF, (domain_id, last_base))
+            found = cur.fetchone()
+            holds = (found is not None and found[0] is not None
+                     and storage_at(label, folder, found[0]) == last_base)
+            if not holds:
+                raise Renumbered(label, folder, f"the archive's UID {int(last_uid)}, the "
+                                                "cursor's, names another file than its rows say")
+        if not holds:
+            raise Renumbered(label, folder, (
+                f"the archive's UIDVALIDITY is {now}, the ledger's UIDs are {int(kept)}'s"
+                if int(kept) != now else
+                f"the archive holds no UID {int(last_uid)}, the cursor's, any more"))
+        return Numbering(UNNAMED_ROWS, now, at)
+    if not holds or (last_base is not None and at != last_base):
+        return Numbering(CHANGED, now, at)
+    if last_base is None and at is not None:
+        cur.execute(ADOPT_BASE, (at, domain_id, folder))
+    return Numbering(KEPT, now, at)
+
+
+def folder_records(label, folder):
+    """Every file of the folder as Dovecot numbers it now: `[(uid, base name)]`, by UID."""
+    records = doveadm.fetch(f"{store.ARCHIVE}@{label}", folder, ["uid", "storageid"], "all")
+    return sorted((int(r["uid"]), r["storageid"]) for r in records if r.get("storageid"))
+
+
+def name_rows(cur, domain_id, label, folder, found):
+    """Give the folder's unnamed rows their base names, by the UIDs they were given under a
+    numbering that still holds (`found` UNNAMED_ROWS); returns (named, without a file).
+
+    A row whose UID names no file is a message expunged by hand: its UID is cleared, as a
+    renumbering clears a row with no file, and it stays without a name.
+    """
+    listed = folder_records(label, folder)
+    inbox = folder == INBOX
+    cur.execute(NAME_BY_UID, ([uid for uid, _ in listed], [base for _, base in listed],
+                              domain_id, inbox))
+    named = cur.rowcount
+    cur.execute(NO_FILE, (domain_id, inbox))
+    gone = cur.rowcount
+    cur.execute(NAMED_AT, (found.base, domain_id, folder))
+    return named, gone
+
+
+def renumber_rows(cur, domain_id, folder, listed):
+    """Each of the folder's rows given the UID its file has now, by base name; returns
+    (the UIDs of `listed` whose file no row names, how many of the folder's rows have no
+    file). `listed` is `folder_records`' answer."""
+    inbox = folder == INBOX
+    uids, bases = [uid for uid, _ in listed], [base for _, base in listed]
+    cur.execute(UNNUMBER, (domain_id, inbox))
+    cur.execute(NUMBER_BY_BASE, (uids, bases, domain_id, inbox))
+    cur.execute(ROWLESS, (uids, bases, domain_id))
+    rowless = [int(uid) for uid, in cur.fetchall()]
+    cur.execute(WITHOUT_FILE, (domain_id, inbox))
+    return rowless, int(cur.fetchone()[0])
 
 
 class Finding(NamedTuple):
@@ -203,9 +328,9 @@ def folder_of(state):
     return INBOX if state == "delivered" else store.QUARANTINE
 
 
-def by_folder_and_uid(rows):
-    """`(folder, uid) -> message id` from rows of (id, archive_uid, state)."""
-    return {(folder_of(state), int(uid)): message_id for message_id, uid, state in rows}
+def by_base(rows):
+    """`base name -> message id` from rows of (id, archive_base) (`0100`)."""
+    return {base: message_id for message_id, base in rows}
 
 
 def inode_of(path):
@@ -250,63 +375,72 @@ def unaccounted_in(archive_by_inode, mailbox_id, account, has_row, domain, root=
     return findings
 
 
-def archive_listing(domain):
-    """`{folder: Dovecot's records}` of the archive's folders, each record its `uid` and
-    `storageid`; a folder that does not exist holds nothing and is left out.
+def archive_listing(domain, root=store.STORE_ROOT):
+    """`{folder: {base name: inode}}` of the archive's folders, from their directories; a
+    folder that does not exist holds nothing and is left out.
 
-    The archive's names come from Dovecot by UID, never from a directory listing.
-    Taken once and read twice by the daily pass: for the inodes the ledger
-    has a row for, and for the messages it has none for (`under_cursor`).
+    ⛔ A LISTING, AND NO `doveadm`, SINCE THE ROWS CARRY THE BASE NAME (`0100`). Only the
+    directories' entries are read, for their names and inode numbers: no file is opened,
+    nothing is picked to link, and a file still being written is in `tmp/`,
+    which is not read. A name renamed from `new/` to `cur/` while this reads may be read
+    twice, which one base holds once, or not at all, which the next run reads. Taken once
+    and read twice by the daily pass: for the inodes the ledger has a row for, and for
+    the files it has none for (`under_cursor`).
     """
-    login = f"{store.ARCHIVE}@{domain}"
     listing = {}
     for folder in FOLDERS:
-        try:
-            listing[folder] = doveadm.fetch(login, folder, ["uid", "storageid"], "all")
-        except doveadm.DoveadmError as err:
-            if err.returncode != doveadm.EX_NOUSER:  # else no such folder: nothing is in it
-                raise
+        folder_maildir = store.maildir(store.archive_home(domain, root), folder)
+        found, there = {}, False
+        for part in store.PARTS:
+            try:
+                with os.scandir(folder_maildir / part) as entries:
+                    there = True
+                    for entry in entries:
+                        found[store.base_name(entry.name)] = entry.inode()
+            except FileNotFoundError:
+                continue
+        if there:
+            listing[folder] = found
     return listing
 
 
-def archive_inodes(domain, by_uid, root=store.STORE_ROOT, listing=None):
+def archive_inodes(domain, bases, root=store.STORE_ROOT, listing=None):
     """`inode -> message id` for every archive file the ledger has a row for.
 
-    `listing` is `archive_listing`'s answer when the caller took it already. A file the
-    archive no longer holds is simply absent: a row outliving its file is normal.
+    `bases` is `by_base`'s, and `listing` `archive_listing`'s answer when the caller took
+    it already. A file the archive no longer holds is simply absent: a row outliving its
+    file is normal.
     """
-    listing = archive_listing(domain) if listing is None else listing
+    listing = archive_listing(domain, root) if listing is None else listing
     found = {}
-    for folder, records in listing.items():
-        folder_maildir = store.maildir(store.archive_home(domain, root), folder)
-        for record in records:
-            message_id = by_uid.get((folder, int(record["uid"])))
-            path = store.resolve(folder_maildir, record["storageid"]) if message_id else None
-            inode = inode_of(path) if path is not None else None
-            if inode is not None:
+    for files in listing.values():
+        for base, inode in files.items():
+            message_id = bases.get(base)
+            if message_id is not None:
                 found[inode] = message_id
     return found
 
 
 # --- the archive's messages no row holds --------------------------------------------
 #
-# ⛔ A MESSAGE THE PASS SKIPPED IS A UID AT OR BELOW ITS FOLDER'S CURSOR WITH NO ROW. The pass
+# ⛔ A MESSAGE THE PASS SKIPPED IS A FILE AT OR BELOW ITS FOLDER'S CURSOR WITH NO ROW. The pass
 # moves its cursor past a message the database refused, naming it in one journal line; from
 # then on no reading that starts from a row or from a person's mailbox can see it, since it
 # has neither a row nor a name anywhere but the archive. The archive's own listing held to
 # the rows is the one reading that lasts as long as the state does.
 #
-# ⛔ THE CURSORS AND THE ROWS ARE OF ONE MOMENT, AND THE LISTING IS TAKEN AFTER IT. A tick
-# commits its rows and its cursor together, so a UID at or below a cursor read with the rows
-# has a row among them unless it was skipped. A cursor read later than the rows would name
-# every message a tick recorded in between; rows read later than the cursor would name a
-# whole archive whose domain was deleted in between, its rows first and its files after.
-# A UID above the cursor is mail the next tick records, and never a finding.
+# ⛔ THE ROWS, THEN THE DIRECTORIES, THEN DOVECOT FOR WHAT IS ABOVE THE CURSOR. The rows and
+# the cursors are read at one moment (a tick commits its rows and its cursor together), the
+# folder's names after them, and Dovecot is asked last for the UIDs above the cursor read
+# with the rows: a file that arrived after the rows is above that cursor whether or not a
+# tick recorded it since, and so is never a finding. Rows read later than the names would
+# name a whole archive whose domain was deleted in between, its rows first and its files
+# after.
 #
-# ⛔ NEVER ACROSS A NUMBERING. The rows' UIDs and the listing's name the same
-# files only while the folder numbers them as its cursor row says. A folder that fails
-# either of the pass's two tests is named apart and not counted: the pass stops at it,
-# health's fan-out check reads that, and `--renumber` tries every rowless file again.
+# ⛔ NEVER WHILE THE CURSOR MEANS SOMETHING ELSE (`0100`). A folder whose numbering
+# changed is given its new numbers by the pass's next tick; until then "above the cursor"
+# is not what it was, and the folder is named apart and not counted. So is a folder whose
+# cursor has no base name yet: its rows are named by the pass's first tick of it.
 
 # How many UIDs one folder's finding names; the count says how many there are.
 NAMED = 10
@@ -323,53 +457,44 @@ class Unrecorded(NamedTuple):
 class UnderCursor(NamedTuple):
     """One domain's archive held to its rows: how many messages at or below the cursors
     were read, the folders holding some with no row, and the folders not read because
-    their numbering is no longer the ledger's."""
+    their cursor does not mean what it did, or does not say yet."""
 
     read: int
     unrecorded: list
     renumbered: list
 
 
-def numbered_as_kept(domain, folder, kept, holds_cursor):
-    """Does the folder still number its files as its cursor row says? The pass's own two
-    tests (`same_numbering`), read without writing: whether the folder holds the cursor's
-    UID is read from the listing already taken, which names every file."""
-    if not holds_cursor:
-        return False
-    if kept is None:   # a row no tick has given a UIDVALIDITY yet: Dovecot's is taken
-        return True
-    now = uidvalidity(domain, folder)
-    return now is not None and now == int(kept)
+def under_cursor(domain, listing, bases, cursors):
+    """The archive's files at or below each folder's cursor that no row holds.
 
-
-def under_cursor(domain, listing, by_uid, cursors):
-    """The archive's messages at or below each folder's cursor that no row holds.
-
-    `listing` is `archive_listing`'s, `by_uid` is `by_folder_and_uid`'s and `cursors` is
-    `{folder: (last_uid, uidvalidity)}` from `CURSORS`, the last two read at one moment
+    `listing` is `archive_listing`'s, `bases` is `by_base`'s and `cursors` is `{folder:
+    (last_uid, uidvalidity, last_base)}` from `CURSORS`, the last two read at one moment
     before the listing was taken. A folder with no cursor row, or one nothing was read of
-    yet, has nothing at or below it.
+    yet, has nothing at or below it. Dovecot is asked once a folder, for its UIDs from the
+    cursor's up; and, only for a folder holding files with no row, once more for the UIDs
+    of those, which the finding names.
     """
+    login = f"{store.ARCHIVE}@{domain}"
     read, unrecorded, renumbered = 0, [], []
     for folder in FOLDERS:
-        last_uid, kept = cursors.get(folder, (0, None))
+        last_uid, kept, last_base = cursors.get(folder, (0, None, None))
         if folder not in listing or not last_uid:
             continue
-        below, rowless, holds_cursor = 0, [], False
-        for record in listing[folder]:
-            uid = int(record["uid"])
-            if uid > last_uid:
-                continue
-            below += 1
-            holds_cursor = holds_cursor or uid == last_uid
-            if (folder, uid) not in by_uid:
-                rowless.append(uid)
-        if not numbered_as_kept(domain, folder, kept, holds_cursor):
+        records = doveadm.fetch(login, folder, ["uid", "storageid"], "uid", f"{int(last_uid)}:*")
+        at = {int(r["uid"]): r.get("storageid") for r in records}
+        now = uidvalidity(domain, folder) if kept is not None else None
+        if last_base is None or at.get(int(last_uid)) != last_base or (
+                kept is not None and now != int(kept)):
             renumbered.append(folder)
             continue
-        read += below
+        above = {base for uid, base in at.items() if uid > last_uid}
+        below = [base for base in listing[folder] if base not in above]
+        read += len(below)
+        rowless = {base for base in below if base not in bases}
         if rowless:
-            unrecorded.append(Unrecorded(folder, len(rowless), sorted(rowless)[:NAMED]))
+            numbered = doveadm.fetch(login, folder, ["uid", "storageid"], "uid", f"1:{int(last_uid)}")
+            uids = sorted(int(r["uid"]) for r in numbered if r.get("storageid") in rowless)
+            unrecorded.append(Unrecorded(folder, len(rowless), uids[:NAMED]))
     return UnderCursor(read, unrecorded, renumbered)
 
 
@@ -377,12 +502,12 @@ def check(conn, domain, root=store.STORE_ROOT):
     """Every name in this domain's mailboxes that the ledger does not account for."""
     with conn.cursor() as cur:
         cur.execute(MESSAGES, (domain,))
-        by_uid = by_folder_and_uid(cur.fetchall())
+        bases = by_base(cur.fetchall())
         cur.execute(DELIVERIES, (domain,))
         deliveries = {(message_id, mailbox_id) for message_id, mailbox_id in cur.fetchall()}
         cur.execute(MAILBOXES, (domain,))
         mailboxes = list(cur.fetchall())
-    return unaccounted(archive_inodes(domain, by_uid, root), mailboxes, deliveries, domain, root)
+    return unaccounted(archive_inodes(domain, bases, root), mailboxes, deliveries, domain, root)
 
 
 # --- the window: what changed since the last scan -------------------------------------
@@ -434,38 +559,24 @@ def names_of(box_home, inodes):
         yield from listed
 
 
-def archive_uids(domain, inodes, root=store.STORE_ROOT):
-    """`(folder, uid) -> inode` for each of `inodes` the archive holds a file for.
+def archive_bases(domain, inodes, root=store.STORE_ROOT):
+    """`inode -> base name` for each of `inodes` the archive holds a file for.
 
-    The archive's directories are listed for their inode numbers alone; which message a
-    name is comes from Dovecot, by its storage id (the base name a rename keeps), never
-    from the name. A folder holding none of the inodes is not asked about.
+    The archive's directories are listed for their names and inode numbers alone; which
+    message a name is comes from its base name, which the row carries (`0100`), never
+    from Dovecot's numbering.
     """
-    login = f"{store.ARCHIVE}@{domain}"
     found = {}
     for folder in FOLDERS:
         folder_maildir = store.maildir(store.archive_home(domain, root), folder)
-        bases = {}
         for part in store.PARTS:
             try:
                 with os.scandir(folder_maildir / part) as entries:
                     for entry in entries:
                         if entry.inode() in inodes:
-                            bases[store.base_name(entry.name)] = entry.inode()
+                            found[entry.inode()] = store.base_name(entry.name)
             except FileNotFoundError:
                 continue
-        if not bases:
-            continue
-        try:
-            records = doveadm.fetch(login, folder, ["uid", "storageid"], "all")
-        except doveadm.DoveadmError as err:
-            if err.returncode == doveadm.EX_NOUSER:
-                continue
-            raise
-        for record in records:
-            inode = bases.get(record.get("storageid"))
-            if inode is not None:
-                found[(folder, int(record["uid"]))] = inode
     return found
 
 
@@ -502,14 +613,13 @@ def window(cur, domain, since, carried=(), root=store.STORE_ROOT):
     inodes = {inode for names in changed.values() for _, inode in names}
     by_inode = {}
     if inodes:
-        uids = archive_uids(domain, inodes, root)
-        if uids:
-            pairs = sorted(uids)
-            cur.execute(MESSAGES_BY_UID, ([folder == INBOX for folder, _ in pairs],
-                                          [uid for _, uid in pairs], domain))
-            for (folder, uid), message_id in by_folder_and_uid(cur.fetchall()).items():
-                if (folder, uid) in uids:
-                    by_inode[uids[(folder, uid)]] = message_id
+        names = archive_bases(domain, inodes, root)
+        if names:
+            cur.execute(MESSAGES_BY_BASE, (domain, sorted(set(names.values()))))
+            rows = by_base(cur.fetchall())
+            for inode, base in names.items():
+                if base in rows:
+                    by_inode[inode] = rows[base]
     for inodes_held in held.values():
         for inode, message_id in inodes_held.items():
             by_inode.setdefault(inode, message_id)

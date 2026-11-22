@@ -943,18 +943,37 @@ def test_the_fan_out_ran_recently_and_succeeded():
     assert states(data.judge_fanout(False, data.BACKUP_PAUSE, shown, NOW, CONF)) == [WARN, PASS]
 
 
-def test_a_pass_stopped_by_a_renumbered_folder_fails_naming_each_folder_once():
+def test_a_pass_stopped_by_a_folder_renumbered_before_its_rows_were_named_fails_naming_each_once():
     shown = {"Result": "exit-code", "ExecMainStatus": "1",
              "ExecMainExitTimestamp": "Wed 2026-09-23 11:59:02 UTC"}
-    line = (f"{pass_.RENUMBERED} alpha INBOX: the archive's UIDVALIDITY is 222, the ledger's "
+    line = (f"{pass_.UNNAMED} alpha INBOX: the archive's UIDVALIDITY is 222, the ledger's "
             "UIDs are 111's, ...")
-    lines = ["maildivvy-pass: beta: DoveadmError: ...", line, line.replace("alpha", "gamma"), line]
+    repaired = f"{pass_.RENUMBERED} delta INBOX: its numbering changed (UIDVALIDITY 9); ..."
+    lines = ["maildivvy-pass: beta: DoveadmError: ...", line, repaired,
+             line.replace("alpha", "gamma"), line]
     _, found = data.judge_fanout(True, "", shown, NOW, CONF, lines)
-    assert found.state == FAIL and "alpha INBOX; gamma INBOX until" in found.problem
-    assert "--renumber" in found.problem and pass_.RENUMBERED in found.problem
-    # any other failure reads as before
-    _, other = data.judge_fanout(True, "", shown, NOW, CONF, lines[:1])
-    assert other.state == FAIL and "renumber" not in other.problem
+    assert found.state == FAIL and "linked from alpha INBOX; gamma INBOX: go back" in found.problem
+    assert "--renumber" in found.problem and pass_.UNNAMED in found.problem
+    # any other failure reads as before, and a folder the pass set right is no stop
+    for others in (lines[:1], lines[:1] + [repaired]):
+        _, other = data.judge_fanout(True, "", shown, NOW, CONF, others)
+        assert other.state == FAIL and "renumber" not in other.problem
+
+
+def test_a_folder_the_pass_set_right_after_a_renumbering_warns_naming_it_once():
+    """Nothing is lost, but an index tree went missing or was put back: the operator is
+    told, beside the skips, for as long as the line is in the window."""
+    line = (f"{pass_.RENUMBERED} example INBOX: its numbering changed (UIDVALIDITY 222); 3 row(s) "
+            "given their files' new UIDs by base name, 1 file(s) with no row recorded, 0 row(s) "
+            "with no file")
+    found = data.judge_skipped(["maildivvy-pass: example INBOX: 1 recorded", line, line],
+                               CONF.fanout_skip_hours)
+    assert found.state == WARN and "1 archive folder(s) renumbered" in found.reading
+    assert "Dovecot numbered example INBOX again" in found.problem
+    assert pass_.RENUMBERED in found.problem and pass_.SKIPPED not in found.problem
+    skipped = f"{pass_.SKIPPED} example INBOX UID 3: ...; record it with `...`"
+    both = data.judge_skipped([line, skipped], CONF.fanout_skip_hours)
+    assert both.state == WARN and pass_.SKIPPED in both.problem and pass_.RENUMBERED in both.problem
 
 
 def test_the_provider_requests_unit_is_read_beside_the_pass():
@@ -1615,33 +1634,53 @@ class BetweenCursor:
         return iter(self.cursor)
 
 
+def base(uid):
+    return f"1757.M{uid}.host"
+
+
+def recorded(database, domain, uid):
+    """The delivered row the pass writes for the archive's file of this UID."""
+    database.sql("INSERT INTO message (domain_id, archive_uid, archive_base) VALUES (%s, %s, %s) "
+                 "ON CONFLICT DO NOTHING", (domain, uid, base(uid)))
+
+
 def archive_scene(database, monkeypatch, listing, uidvalidity=77, cursor=0, rows=(),
                   while_listing=None, between=None):
     """The domain `example`, its INBOX cursor at `cursor` under UIDVALIDITY 77 and a
-    delivered row for each UID of `rows`; Dovecot lists the archive as `listing`
-    ({folder: UIDs}). The daily pass then reads the unit tier's real database as the
-    store helper does: as the pipeline's role, in a read-only session. Returns the
-    domain's id."""
+    delivered row for each UID of `rows`; the archive's directories hold `listing`
+    ({folder: UIDs}), each file named `base(uid)`, and Dovecot numbers them so. The daily
+    pass then reads the unit tier's real database as the store helper does: as the
+    pipeline's role, in a read-only session. Returns the domain's id."""
     domain = database.value("INSERT INTO domain (label, archive_password_hash) VALUES "
                             "('example', %s) RETURNING id", (HASH,))
-    database.sql("INSERT INTO pass_cursor (domain_id, mailbox, last_uid, uidvalidity) "
-                 "VALUES (%s, 'INBOX', %s, 77)", (domain, cursor))
+    database.sql("INSERT INTO pass_cursor (domain_id, mailbox, last_uid, uidvalidity, last_base) "
+                 "VALUES (%s, 'INBOX', %s, 77, %s)", (domain, cursor, base(cursor) if cursor else None))
     for uid in rows:
-        database.sql("INSERT INTO message (domain_id, archive_uid) VALUES (%s, %s)", (domain, uid))
+        recorded(database, domain, uid)
+    directories = ledger.archive_listing
 
-    def fetch(login, folder, fields, *search):
-        assert login == "archive@example" and search == ("all",)
+    def archive_listing(label, root=None):
+        """The real directories where the scene made them (`ledger_world`), else these."""
         if while_listing:
             while_listing()
-        if folder not in listing:
-            raise doveadm.DoveadmError("no such folder", doveadm.EX_NOUSER)
-        return [{"uid": str(uid), "storageid": f"1757.M{uid}.host"} for uid in listing[folder]]
+        made = directories(label, root) if root is not None else {}
+        return made or {folder: {base(uid): 1000 + uid for uid in uids}
+                        for folder, uids in listing.items()}
+
+    def fetch(login, folder, fields, *search):
+        assert login == "archive@example" and search[0] == "uid", search
+        first, _, last = search[1].partition(":")
+        uids = listing.get(folder, [])
+        top = max(uids, default=0) if last == "*" else int(last)
+        return [{"uid": str(uid), "storageid": base(uid)} for uid in uids
+                if int(first) <= uid <= top]
 
     def connection():
         conn = database.connect("pipeline")
         conn.set_session(readonly=True, autocommit=True)
         return Between(conn, *between) if between else conn
 
+    monkeypatch.setattr(ledger, "archive_listing", archive_listing)
     monkeypatch.setattr(doveadm, "fetch", fetch)
     monkeypatch.setattr(doveadm, "mailbox_status", lambda *_: {"uidvalidity": str(uidvalidity)})
     monkeypatch.setattr(helper, "pipeline_connection", connection)
@@ -1677,7 +1716,7 @@ def test_a_message_the_pass_skipped_fails_the_daily_pass_a_day_later_and_two_day
     stale = at + datetime.timedelta(hours=CONF.ledger_pass_hours + 1)
     assert data.judge_pass(taken(reading, at), stale, CONF)[0].state == FAIL
     # recorded by hand, the next pass reads it gone
-    database.sql("INSERT INTO message (domain_id, archive_uid) VALUES (%s, 3)", (domain,))
+    recorded(database, domain, 3)
     reading = helper.read_ledger_pass()
     assert reading["domains"]["example"]["unrecorded"] == []
     found = data.judge_pass(taken(reading, at), at, CONF)[0]
@@ -1689,11 +1728,10 @@ def test_mail_a_tick_recorded_while_the_daily_pass_read_is_no_finding(database, 
     the rows put UIDs 2 and 3 in the listing with no row among those read: they are above
     the cursor of that same moment, so they are the next reading's."""
     def tick():   # run once per folder listed; the ledger holds a UID once
-        database.sql("INSERT INTO message (domain_id, archive_uid) SELECT id, 2 FROM domain "
-                     "ON CONFLICT DO NOTHING")
-        database.sql("INSERT INTO message (domain_id, archive_uid) SELECT id, 3 FROM domain "
-                     "ON CONFLICT DO NOTHING")
-        database.sql("UPDATE pass_cursor SET last_uid = 3")
+        domain = database.value("SELECT id FROM domain")
+        recorded(database, domain, 2)
+        recorded(database, domain, 3)
+        database.sql("UPDATE pass_cursor SET last_uid = 3, last_base = %s", (base(3),))
 
     for between in ((ledger.CURSORS, tick), (ledger.MESSAGES, tick), None):
         archive_scene(database, monkeypatch, {"INBOX": [1, 2, 3]}, cursor=1, rows=(1,),
@@ -1721,24 +1759,19 @@ def test_a_domain_deleted_while_the_daily_pass_read_it_leaves_no_finding(databas
 
 def test_a_renumbered_folder_keeps_its_own_reading_and_adds_no_finding_to_the_daily_pass(
         database, monkeypatch):
-    """Dovecot numbered the folder again (another UIDVALIDITY than the cursor's): the rows'
-    UIDs name other files, and every file would read as unrecorded. The pass stops at
-    that folder and the fan-out check says so; the daily pass names the folder as not
-    counted, and no UID of it."""
+    """Dovecot numbered the folder again (another UIDVALIDITY than the cursor's), and the
+    pass has not set it right yet: "below the cursor" is another numbering's, and every
+    file would read as unrecorded. The daily pass names the folder as not counted, and no
+    UID of it; the pass's line, once it has, is the skips check's to warn of."""
     archive_scene(database, monkeypatch, {"INBOX": [1, 2, 3]}, uidvalidity=78, cursor=3)
     reading = helper.read_ledger_pass()
     assert reading["domains"]["example"]["unrecorded"] == []
     assert reading["domains"]["example"]["renumbered"] == ["INBOX"]
     found = data.judge_pass(taken(reading, NOW), NOW, CONF)[0]
     assert found.state == UNKNOWN and "UID" not in (found.problem or "")   # no delivery row here
-    assert "(example INBOX not counted: its numbering changed)" in found.reading
+    assert "(example INBOX not counted: its cursor is not what it was" in found.reading
     reading["domains"]["example"]["deliveries"] = 4
     assert data.judge_ledger(reading).state == PASS
-    # the state's own reading: the pass's line, read by the fan-out check
-    shown = {"Result": "exit-code", "ExecMainStatus": "1",
-             "ExecMainExitTimestamp": "Wed 2026-09-23 11:59:02 UTC"}
-    _, fanout = data.judge_fanout(True, "", shown, NOW, CONF, [f"{pass_.RENUMBERED} example INBOX: ..."])
-    assert fanout.state == FAIL and "example INBOX until" in fanout.problem
 
 
 def test_an_unrecorded_message_fails_with_no_delivery_row_at_all_and_beside_any_other_finding():
@@ -1838,8 +1871,9 @@ def test_names_a_request_is_still_linking_warn_and_are_named_once_it_ends(
                                "RETURNING id", (account, other))
     database.sql("UPDATE request SET payload = jsonb_build_object('mailbox_id', %s::bigint)",
                  (elsewhere,))
-    monkeypatch.setattr(ledger, "archive_listing", lambda label: {} if label == "other"
-                        else {"INBOX": [{"uid": str(u), "storageid": f"1757.M{u}.host"} for u in (1, 2)]})
+    listing = ledger.archive_listing
+    monkeypatch.setattr(ledger, "archive_listing", lambda label, root=None: {} if label == "other"
+                        else listing(label, root))
     found = helper.read_ledger_pass(root=tmp_path)["domains"]["example"]
     assert len(found["findings"]) == 1 and "linking" not in found
     # the request ended: the name it left with no row is a finding
@@ -1965,8 +1999,8 @@ def test_a_pass_running_when_health_reads_it_is_judged_by_its_run_and_the_one_be
     _, found = data.judge_fanout(True, "", going, NOW, CONF, (), (before[0], "failed"))
     assert found.state == FAIL and "last run failed" in found.problem
     _, found = data.judge_fanout(True, "", going, NOW, CONF,
-                                 [f"{pass_.RENUMBERED} example INBOX: ..."], (before[0], "failed"))
-    assert found.state == FAIL and "example INBOX until" in found.problem
+                                 [f"{pass_.UNNAMED} example INBOX: ..."], (before[0], "failed"))
+    assert found.state == FAIL and "linked from example INBOX: go back" in found.problem
     # the provider requests, beside every pass
     assert data.judge_provider_requests(going, before, NOW, CONF).state == PASS
     assert data.judge_provider_requests(hung, before, NOW, CONF).state == WARN

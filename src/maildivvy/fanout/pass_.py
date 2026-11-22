@@ -2,7 +2,6 @@
 
     maildivvy-pass [--only <domain>] [--store-root <the store's root>]
     maildivvy-pass --only <domain> [--folder <folder>] --uid <n>    a skipped message, by hand
-    maildivvy-pass --only <domain> [--folder <folder>] --renumber   a folder Dovecot renumbered
 
 A timer runs this every minute for every domain, including a domain with no external
 mailbox in front of it: a free domain is ordinary, mail can still be put into its
@@ -53,17 +52,23 @@ the whole domain's tick and leaves every cursor where it was for the sake of one
 header. An unreadable or oversized score is stored as null, and nothing is decided from
 the number: everything that filters on spam filters on the stored verdict.
 
-⛔ A TICK READS NO UID OF A FOLDER DOVECOT NUMBERED AGAIN. Before either folder is
-listed, each is held to the UIDVALIDITY its cursor row keeps and to its cursor's own UID
-still being there; a folder that fails either fails the domain's tick with nothing
-recorded or linked, in one `maildivvy-pass: renumbered:` line a folder, which health
-reads, until `--renumber` gives the folder's rows their new numbers.
+⛔ A ROW IS ITS FILE'S BASE NAME, AND A FOLDER DOVECOT NUMBERED AGAIN IS REPAIRED HERE
+(`0100`). Before either folder is listed, each cursor is held to the UIDVALIDITY its
+row keeps and to the UID at it still naming the file it was moved to. A folder that fails
+is listed whole: each row takes the UID its file has now, by base name; every file no row
+names is recorded and linked as new mail is; the cursor goes to the newest UID; and one
+`maildivvy-pass: renumbered:` line says so, which health reads. Nothing is linked twice
+(a name that is there is not made again, a row that is there is not written again), and
+nothing a person deleted comes back: their row is still there, by base name. The rows the
+previous release wrote are given their base names by their folder's first tick, by UID,
+while the numbering holds; a folder renumbered before that stops, in one
+`maildivvy-pass: no archive names:` line naming the way back.
 
 ⛔ AN IMPORTED MESSAGE IS RECORDED AND REACHES NOBODY. The import files a
 message into the archive's INBOX under a storage id of its own (`store.imported`); the
 pass records it delivered, not spam, with no score, no withheld id and no report, whatever
 filter headers an old store left in it, its `received_at` the moment its name carries and
-`imported_at` the insert, and links it to nobody, on a tick, a `--renumber` and a `--uid`
+`imported_at` the insert, and links it to nobody, on a tick, a renumbering and a `--uid`
 alike: people get history only by a top-up. One such name in the quarantine is no import
 of ours, and is skipped and named, never recorded.
 
@@ -90,7 +95,8 @@ INBOX = ledger.INBOX
 
 EX_CONFIG = 78
 SKIPPED = "maildivvy-pass: skipped:"  # ⛔ the marker health counts; nothing else carries it
-RENUMBERED = "maildivvy-pass: renumbered:"  # ⛔ the marker health names a folder by
+RENUMBERED = "maildivvy-pass: renumbered:"  # ⛔ a folder repaired, which health warns of (`0100`)
+UNNAMED = "maildivvy-pass: no archive names:"  # ⛔ a folder stopped, which health names (`0100`)
 BY_HAND = "/opt/maildivvy/bin/maildivvy-pass"  # the installed command a skipped line names
 
 SCORE_LIMIT = Decimal(10) ** 4  # `message.spam_score` is numeric(6,2)
@@ -109,7 +115,11 @@ CURSOR = """
 # FOR UPDATE: two passes at once then queue per (domain, mailbox) instead of reading one
 # range twice.
 READ_CURSOR = "SELECT last_uid FROM pass_cursor WHERE domain_id = %s AND mailbox = %s FOR UPDATE"
-MOVE_CURSOR = "UPDATE pass_cursor SET last_uid = %s WHERE domain_id = %s AND mailbox = %s"
+# The cursor and the file at it (`0100`); after a renumbering, the numbering's UIDVALIDITY too.
+MOVE_CURSOR = ("UPDATE pass_cursor SET last_uid = %s, last_base = %s "
+               "WHERE domain_id = %s AND mailbox = %s")
+NEW_NUMBERING = ("UPDATE pass_cursor SET last_uid = %s, last_base = %s, uidvalidity = %s "
+                 "WHERE domain_id = %s AND mailbox = %s")
 
 # Who receives in this domain, whatever the person's state,
 # minus the pairs the ledger already accounts for in ANY state: a delivery row that
@@ -126,16 +136,17 @@ RECEIVERS = """
 
 RECORD = """
     INSERT INTO message (domain_id, message_id_header, archive_uid, state, withheld_id,
-                         report_of, message_date, sender, subject, is_spam, spam_score)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                         report_of, message_date, sender, subject, is_spam, spam_score,
+                         archive_base)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
 """
 # An imported message: the same columns in the same order, then the moment it
 # arrived in the old store, and the insert's own moment beside it.
 RECORD_IMPORTED = """
     INSERT INTO message (domain_id, message_id_header, archive_uid, state, withheld_id,
                          report_of, message_date, sender, subject, is_spam, spam_score,
-                         received_at, imported_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp()) RETURNING id
+                         archive_base, received_at, imported_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp()) RETURNING id
 """
 REPORTED = """
     SELECT id FROM message
@@ -299,8 +310,18 @@ def above(login, folder, last_uid):
     return sorted((read(record) for record in records), key=lambda m: m.uid)
 
 
+def named(message):
+    """The message's base name, the key its row is written under (`0100`). Dovecot gives
+    every maildir message one: a record without it is Dovecot's fault, not the message's,
+    and fails the tick."""
+    if not message.storageid:
+        raise doveadm.DoveadmError(f"UID {message.uid} came with no storage id")
+    return message.storageid
+
+
 def record_message(cursor, domain, folder, message):
     """Write the ledger's message row, and the report's link to what it replaces."""
+    base = named(message)
     if message.received is not None:
         return record_imported(cursor, domain, folder, message)
     report_of = None
@@ -316,7 +337,8 @@ def record_message(cursor, domain, folder, message):
         # ⛔ The withheld id is the WITHHELD message's, so a release finds one row by it;
         # the report carries the link in `report_of` instead.
         None if message.is_report else message.withheld_id,
-        report_of, message.date, message.sender, message.subject, message.spam, message.score))
+        report_of, message.date, message.sender, message.subject, message.spam, message.score,
+        base))
     message_id = cursor.fetchone()[0]
     if folder == store.QUARANTINE and message.withheld_id and not message.is_report:
         cursor.execute(ORPHAN_REPORTS, (message_id, domain.id, messageid.stored(
@@ -332,7 +354,7 @@ def record_imported(cursor, domain, folder, message):
                       "where the import files nothing")
     cursor.execute(RECORD_IMPORTED, (
         domain.id, messageid.stored(message.message_id), message.uid, "delivered", None, None,
-        message.date, message.sender, message.subject, False, None,
+        message.date, message.sender, message.subject, False, None, message.storageid,
         datetime.datetime.fromtimestamp(message.received, datetime.UTC)))
     return cursor.fetchone()[0]
 
@@ -347,27 +369,63 @@ def listing(conn, domain, folder):
 
 
 class Stopped(Exception):
-    """A domain's tick stopped because Dovecot renumbered one or both of its folders."""
+    """A domain's tick stopped: a folder was numbered again before its rows were named."""
 
     def __init__(self, renumbered):
         self.renumbered = renumbered
         super().__init__("; ".join(str(each) for each in renumbered))
 
 
-def same_numbering(conn, domain):
-    """Both folders held to the numbering their cursor rows keep, the cursors locked,
-    before either is listed; every one renumbered is named at once."""
-    renumbered = []
+class Cursor(NamedTuple):
+    """Where a tick moves a folder's cursor to when it was not where the listing starts:
+    after a renumbering, the newest file and the new numbering (`0100`)."""
+
+    uid: int
+    base: str | None
+    uidvalidity: int
+
+
+def numbering(conn, domain):
+    """`{folder: ledger.Numbering}` of both folders, the cursors locked, before either is
+    listed; a folder whose rows still wait for their base names gets them here. Every
+    folder renumbered before its rows were named is named at once (`0100`)."""
+    found, stopped = {}, []
     with conn.cursor() as cur:
         for folder in ledger.FOLDERS:
             cur.execute(CURSOR, (domain.id, folder))
             cur.execute(READ_CURSOR, (domain.id, folder))
             try:
-                ledger.same_numbering(cur, domain.id, domain.label, folder)
+                found[folder] = ledger.numbering(cur, domain.id, domain.label, folder)
             except ledger.Renumbered as err:
-                renumbered.append(err)
-    if renumbered:
-        raise Stopped(renumbered)
+                stopped.append(err)
+                continue
+            if found[folder].state == ledger.UNNAMED_ROWS:
+                count, gone = ledger.name_rows(cur, domain.id, domain.label, folder, found[folder])
+                sys.stderr.write(f"maildivvy-pass: {domain.label} {folder}: {count} row(s) given "
+                                 f"their archive names, {gone} whose file is gone\n")
+    if stopped:
+        raise Stopped(stopped)
+    return found
+
+
+def reconcile(conn, domain, folder, found):
+    """A renumbered folder (`0100`): `(the files no row names, as a tick reads them, the
+    cursor to move to)`. Every row is given its file's UID by base name first; the files
+    are then recorded by `tick` as new mail is, and the line saying so is written."""
+    listed = ledger.folder_records(domain.label, folder)
+    with conn.cursor() as cur:
+        rowless, without_file = ledger.renumber_rows(cur, domain.id, folder, listed)
+    login = f"{store.ARCHIVE}@{domain.label}"
+    messages = []
+    for uid_set in doveadm.uid_sets(rowless):
+        messages += [read(record) for record in doveadm.fetch(login, folder, FIELDS, "uid", uid_set)]
+    messages.sort(key=lambda m: m.uid)
+    newest = listed[-1] if listed else (0, None)
+    sys.stderr.write(f"{RENUMBERED} {domain.label} {folder}: its numbering changed (UIDVALIDITY "
+                     f"{found.uidvalidity}); {len(listed) - len(rowless)} row(s) given their "
+                     f"files' new UIDs by base name, {len(rowless)} file(s) with no row "
+                     f"recorded, {without_file} row(s) with no file\n")
+    return messages, Cursor(newest[0], newest[1], found.uidvalidity)
 
 
 def fan_one(cur, domain, folder, message, args):
@@ -383,11 +441,13 @@ def fan_one(cur, domain, folder, message, args):
     receivers = cur.fetchall()
     if not receivers:
         return []
-    # ⛔ Asked of Dovecot by UID, never by listing the directory, and asked again once
-    # if the name moved in between. An unresolved name raises and the tick
-    # fails with the cursor where it was.
-    source = doveadm.message_file(domain.label, store.ARCHIVE, folder, message.uid,
-                                  root=args.store_root)
+    # ⛔ By the base name Dovecot gave with the record, never by listing the directory;
+    # asked of Dovecot by UID, twice, when the name moved in between. An
+    # unresolved name raises and the tick fails with the cursor where it was.
+    folder_maildir = store.maildir(store.home(domain.label, store.ARCHIVE, args.store_root), folder)
+    source = (store.resolve(folder_maildir, named(message))
+              or doveadm.message_file(domain.label, store.ARCHIVE, folder, message.uid,
+                                      root=args.store_root))
     for mailbox_id, _ in receivers:
         cur.execute(ledger.LINK, (message_id, mailbox_id))
     return store.link_into(source, [store.maildir(store.home(domain.label, account, args.store_root))
@@ -431,10 +491,11 @@ def skipped(domain, folder, uid, err):
                      f"--folder {folder} --uid {uid}`\n")
 
 
-def tick(conn, domain, folder, args, messages=None):
+def tick(conn, domain, folder, args, messages=None, cursor=None):
     """One (domain, mailbox): record what is above the cursor, link it, move the cursor.
 
-    `messages` is the listing when the caller took it already (see `fan_out`).
+    `messages` is the listing when the caller took it already (see `fan_out`); `cursor`
+    is where to move the cursor when it is not the newest of them (`reconcile`).
     """
     if messages is None:
         messages = listing(conn, domain, folder)
@@ -453,12 +514,17 @@ def tick(conn, domain, folder, args, messages=None):
                 cur.execute("RELEASE SAVEPOINT message")
                 recorded += 1
 
-        if not messages:
+        if not messages and cursor is None:
             return 0
         # ⛔ After the last link, before the commit, and the cursor last of
         # all.
         store.fsync_dirs(touched)
-        cur.execute(MOVE_CURSOR, (max(m.uid for m in messages), domain.id, folder))
+        if cursor is not None:
+            cur.execute(NEW_NUMBERING, (cursor.uid, cursor.base, cursor.uidvalidity,
+                                        domain.id, folder))
+        else:
+            newest = max(messages, key=lambda m: m.uid)
+            cur.execute(MOVE_CURSOR, (newest.uid, newest.storageid, domain.id, folder))
     return recorded
 
 
@@ -472,14 +538,20 @@ def fan_out(conn, domain, args):
     report in the listing and its message out of it, and the report's row pointed at
     nothing for ever: the next tick reads above the cursor, and the report is below it.
     """
-    same_numbering(conn, domain)
-    inbox = listing(conn, domain, INBOX)
+    found = numbering(conn, domain)
+    taken = {}
+    for folder in (INBOX, store.QUARANTINE):   # ⛔ INBOX listed first
+        if found[folder].state == ledger.CHANGED:
+            taken[folder] = reconcile(conn, domain, folder, found[folder])
+        else:
+            taken[folder] = (listing(conn, domain, folder), None)
     # ⛔ The quarantine first, whatever order `ledger.FOLDERS` names them in: a report's
     # row points at the message it replaces through the withheld id, and
     # the filter files the withheld message before the report, so recording the
     # quarantine first is what lets one run record both and link them.
     for folder in (store.QUARANTINE, INBOX):
-        count = tick(conn, domain, folder, args, messages=inbox if folder == INBOX else None)
+        messages, cursor = taken[folder]
+        count = tick(conn, domain, folder, args, messages=messages, cursor=cursor)
         if count:
             sys.stderr.write(f"maildivvy-pass: {domain.label} {folder}: {count} recorded\n")
 
@@ -495,7 +567,9 @@ def record_one(conn, domain, folder, uid, args):
         cur.execute(CURSOR, (domain.id, folder))
         cur.execute(READ_CURSOR, (domain.id, folder))  # and a running pass waits for us
         last_uid = cur.fetchone()[0]
-        ledger.same_numbering(cur, domain.id, domain.label, folder)
+        if ledger.numbering(cur, domain.id, domain.label, folder).state != ledger.KEPT:
+            raise Refused("its numbering changed, or its rows have no archive names yet: the "
+                          "next pass gives them, and records every file no row names")
         if uid > last_uid:
             raise Refused(f"above the cursor ({last_uid}): the next pass records it")
         cur.execute(HELD, (domain.id, uid, folder == INBOX))
@@ -507,118 +581,6 @@ def record_one(conn, domain, folder, uid, args):
         cur.execute("SAVEPOINT message")
         store.fsync_dirs(fan_one_or_bare(cur, domain, folder, read(records[0]), args))
     conn.commit()
-
-
-# --- the way back from a renumbered folder ------------------------------------------------
-
-# A folder's rows as the pass wrote them, oldest number first.
-FOLDER_ROWS = """
-    SELECT id, archive_uid, message_id_header, sender, subject, withheld_id FROM message
-     WHERE domain_id = %s AND archive_uid IS NOT NULL AND (state = 'delivered') = %s
-     ORDER BY archive_uid, id
-"""
-RENUMBER_ROW = "UPDATE message SET archive_uid = %s WHERE id = %s"
-# ⛔ EVERY NUMBER OF THE FOLDER GOES FIRST: one row per folder and UID is unique,
-# and a row given its new number one at a time would meet another still holding it. A row
-# no file matches keeps none: its file is not in the folder to link.
-UNNUMBER = ("UPDATE message SET archive_uid = NULL "
-            "WHERE domain_id = %s AND archive_uid IS NOT NULL AND (state = 'delivered') = %s")
-NEW_NUMBERING = ("UPDATE pass_cursor SET last_uid = %s, uidvalidity = %s "
-                 "WHERE domain_id = %s AND mailbox = %s")
-
-
-def row_key(message):
-    """What `record_message` writes of a message that a renumbering leaves unchanged."""
-    return (messageid.stored(message.message_id), message.sender, message.subject,
-            None if message.is_report else message.withheld_id)
-
-
-def as_read_now(value):
-    """A stored text as the headers are read today (`headers.CONTROLS`): a row
-    written before the control characters were left out still holds them, and its file is
-    read without. A digest is of the header as it was, and stays as it is."""
-    if not isinstance(value, str) or value.startswith("sha256:"):
-        return value
-    return value.translate(headers.CONTROLS).strip() or None
-
-
-def stored_key(fields):
-    """A row's `row_key`, its Message-ID, sender and subject read as `as_read_now` reads."""
-    message_id, sender, subject, withheld_id = fields
-    return (as_read_now(message_id), as_read_now(sender), as_read_now(subject), withheld_id)
-
-
-def matched(rows, messages):
-    """`({row id: its new UID}, [the rows no file was found for])`.
-
-    A row is the file whose fields it was written from; rows and files that share those
-    fields pair in order, the oldest number with the oldest, since Dovecot numbers a
-    rebuilt folder by its file names, which are the order of arrival.
-    """
-    files = {}
-    for message in sorted(messages, key=lambda m: m.uid):
-        files.setdefault(row_key(message), []).append(message.uid)
-    found, lost = {}, []
-    for row_id, old_uid, *fields in rows:
-        uids = files.get(stored_key(fields))
-        if uids:
-            found[row_id] = uids.pop(0)
-        else:
-            lost.append((row_id, old_uid))
-    return found, lost
-
-
-def renumber(conn, domain, folder, args):
-    """Give a renumbered folder's rows their new UIDs, and the cursor the new numbering.
-
-    Each row is matched to the file it was written from, by the fields the pass read of
-    it, and given that file's new UID; a row no file matches has no number any more (its
-    file is not in the folder to link) and is returned. The cursor moves to the newest
-    matched file. A file below it with no row is recorded and linked here, as a tick
-    would: a delivery into a folder that lost its uidlist numbers its own message first,
-    and a message the pass once skipped is tried again.
-
-    ⛔ UNLESS A ROW WAS LEFT UNMATCHED. Its file may be one of those with no row,
-    read today otherwise than when the row was written, and recorded again it would reach
-    every receiver a second time: the outcome exists to prevent. Then no file is
-    recorded, and both lists go to the operator, who records with `--uid` only what is
-    not one of those rows. Returns `(renumbered, lost rows, recorded, the UIDs of the
-    files left unrecorded)`.
-    """
-    with conn.cursor() as cur:
-        cur.execute(CURSOR, (domain.id, folder))
-        cur.execute(READ_CURSOR, (domain.id, folder))
-        last_uid = cur.fetchone()[0]
-        now = ledger.uidvalidity(domain.label, folder)
-        if now is None:
-            raise Refused(f"{store.ARCHIVE}@{domain.label} has no folder {folder}")
-        try:
-            ledger.same_numbering(cur, domain.id, domain.label, folder)
-        except ledger.Renumbered:
-            pass
-        else:
-            raise Refused(f"it numbers its files as the ledger's UIDs were given (UIDVALIDITY "
-                          f"{now}, the cursor's UID there): nothing to renumber")
-        cur.execute(FOLDER_ROWS, (domain.id, folder == INBOX))
-        rows = cur.fetchall()
-        messages = [read(record) for record in
-                    doveadm.fetch(f"{store.ARCHIVE}@{domain.label}", folder, FIELDS, "all")]
-        found, lost = matched(rows, messages)
-        if rows and not found:
-            raise Refused(f"none of its {len(rows)} rows matches a file of the folder")
-        if not rows and last_uid:
-            raise Refused(f"no row of it to find the cursor ({last_uid}) by")
-        cur.execute(UNNUMBER, (domain.id, folder == INBOX))
-        for row_id, uid in found.items():
-            cur.execute(RENUMBER_ROW, (uid, row_id))
-        cursor, rowed = max(found.values(), default=0), set(found.values())
-        rowless = [m for m in messages if m.uid <= cursor and m.uid not in rowed]
-    unrecorded = [m.uid for m in rowless] if lost else []
-    recorded = tick(conn, domain, folder, args, messages=rowless) if rowless and not lost else 0
-    with conn.cursor() as cur:
-        cur.execute(NEW_NUMBERING, (cursor, now, domain.id, folder))
-    conn.commit()
-    return len(found), lost, recorded, unrecorded
 
 
 # --- the command line -------------------------------------------------------------------------
@@ -633,9 +595,6 @@ def parse_args(argv):
     parser.add_argument("--uid", type=int, default=None,
                         help="record and link this one UID the pass skipped; needs --only")
     parser.add_argument("--folder", choices=ledger.FOLDERS, default=INBOX, help="the UID's folder")
-    parser.add_argument("--renumber", action="store_true",
-                        help="give the folder's rows the numbers Dovecot gave their files "
-                             "after a renumbering, and accept its UIDVALIDITY; needs --only")
     # what maildivvy-requests.service runs, beside the pass
     parser.add_argument("--provider-requests", action="store_true",
                         help="fan nothing out; drain only the requests that wait on a "
@@ -643,46 +602,27 @@ def parse_args(argv):
     args = parser.parse_args(argv)
     if args.uid is not None and args.only is None:
         parser.error("--uid is a UID of one domain's folder: name the domain with --only")
-    if args.renumber and (args.only is None or args.uid is not None):
-        parser.error("--renumber is one domain's folder: name the domain with --only, and no --uid")
     return args
 
 
 def by_hand(conn, args):
-    """`--uid` or `--renumber`: one domain's folder, and nothing else of the run (no
-    fan-out, no request queue)."""
+    """`--uid`: one domain's folder, and nothing else of the run (no fan-out, no request
+    queue)."""
     with conn.cursor() as cur:
         cur.execute(DOMAINS)
         domains = [Domain(*row) for row in cur.fetchall() if row[1] == args.only]
-    where = f"{args.only} {args.folder}" + ("" if args.renumber else f" UID {args.uid}")
+    where = f"{args.only} {args.folder} UID {args.uid}"
     if not domains:
         sys.stderr.write(f"maildivvy-pass: {where}: no such domain\n")
         return 1
     try:
-        if args.renumber:
-            count, lost, recorded, unrecorded = renumber(conn, domains[0], args.folder, args)
-        else:
-            record_one(conn, domains[0], args.folder, args.uid, args)
+        record_one(conn, domains[0], args.folder, args.uid, args)
     except Exception as err:  # noqa: BLE001 - one line for the operator, and exit 1
         conn.rollback()
         sys.stderr.write(f"maildivvy-pass: {where}: {type(err).__name__}: {err}\n")
         return 1
-    if not args.renumber:
-        sys.stderr.write(f"maildivvy-pass: {where}: recorded\n")
-        return 0
-    for row_id, old_uid in lost:
-        sys.stderr.write(f"maildivvy-pass: {where}: message {row_id} (UID {old_uid}) has no "
-                         "file in the folder any more; its number is cleared\n")
-    for uid in unrecorded:
-        # it may be one of the rows above, read otherwise today
-        sys.stderr.write(f"maildivvy-pass: {where}: UID {uid} has no row and was NOT "
-                         "recorded: if it is none of the messages above, record it with "
-                         f"`runuser -u {store.MAIL_USER} -- {BY_HAND} --only {args.only} "
-                         f"--folder {args.folder} --uid {uid}`\n")
-    sys.stderr.write(f"maildivvy-pass: {where}: {count} message(s) renumbered, "
-                     f"{len(lost)} without a file, {recorded} recorded, "
-                     f"{len(unrecorded)} left unrecorded\n")
-    return 1 if lost else 0
+    sys.stderr.write(f"maildivvy-pass: {where}: recorded\n")
+    return 0
 
 
 def connect(args):
@@ -716,7 +656,7 @@ def main(argv=None):
         sys.stderr.write(f"maildivvy-pass: {err}\n")
         return EX_CONFIG
 
-    if args.uid is not None or args.renumber:
+    if args.uid is not None:
         try:
             return by_hand(conn, args)
         finally:
@@ -735,11 +675,11 @@ def main(argv=None):
             try:
                 fan_out(conn, domain, args)
                 conn.commit()
-            except Stopped as err:  # this domain alone, a line a folder, which health reads
+            except Stopped as err:  # `0100`: this domain alone, a line a folder, which health reads
                 conn.rollback()
                 failed = True
                 for each in err.renumbered:
-                    sys.stderr.write(f"{RENUMBERED} {each}\n")
+                    sys.stderr.write(f"{UNNAMED} {each}\n")
             except Exception as err:  # noqa: BLE001 - this domain alone
                 conn.rollback()
                 failed = True

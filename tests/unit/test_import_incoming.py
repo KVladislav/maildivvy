@@ -81,9 +81,10 @@ class World:
             data = (self.box / "cur" / name).read_bytes()
             section = source.header_section(data[:4096])
             message_id = source.first_value(section, "message-id") or None
-            self.database.sql("INSERT INTO message (domain_id, archive_uid, message_id_header, "
-                              "imported_at) VALUES (%s, %s, %s, clock_timestamp())",
-                              (self.domain, uid, message_id))
+            self.database.sql("INSERT INTO message (domain_id, archive_uid, archive_base, "
+                              "message_id_header, imported_at) VALUES (%s, %s, %s, %s, "
+                              "clock_timestamp())",
+                              (self.domain, uid, store.name_parts(name)[0], message_id))
             self.recorded.add(name)
         self.database.sql("INSERT INTO pass_cursor (domain_id, mailbox, last_uid) VALUES "
                           "(%s, 'INBOX', %s) ON CONFLICT (domain_id, mailbox) DO UPDATE SET "

@@ -297,7 +297,7 @@ def test_the_count_and_the_delivery_read_the_same_text_and_the_same_parameters()
     # the only difference between the two is what is selected, never a condition
     # nor a page: the rows above an id, in the order of the ids, so many of them
     assert requests.SELECT_FOR.replace(requests.SELECTOR, "") \
-        == "SELECT m.id, m.archive_uid, m.state AND m.id > %s ORDER BY m.id LIMIT %s"
+        == "SELECT m.id, m.archive_base, m.state AND m.id > %s ORDER BY m.id LIMIT %s"
     assert requests.COUNT_FOR.replace(requests.SELECTOR, "") == "SELECT count(*)"
     assert requests.selector_params(1, 2, "a", "b") == requests.selector_params(1, 2, "a", "b")
 
@@ -421,8 +421,8 @@ def test_a_release_removes_the_reports_names_before_it_deletes_their_rows(monkey
     monkeypatch.setattr(requests, "remove_report",
                         lambda *a: order.append("names") or 2)
     monkeypatch.setattr(requests, "report_file", lambda *a: (None, "r1"))
-    # the message, its domain, its reports, the two folders' numbering (no row), receivers
-    cursor = Cursor([(50, 3, "withheld", 1), ("alpha",), [(51, 4)], None, None, []])
+    # the message, its domain, its reports, the receivers
+    cursor = Cursor([(50, "w50", "withheld", 1, 3), ("alpha",), [(51, "r1", 4)], []])
     real = cursor.execute
     cursor.execute = lambda sql, params=None: (
         order.append("rows") if sql.startswith("DELETE FROM delivery") else None,
@@ -432,40 +432,53 @@ def test_a_release_removes_the_reports_names_before_it_deletes_their_rows(monkey
     assert order == ["names", "rows"], "the report's rows went before its names"
 
 
-RELEASE = [(50, 3, "withheld", 1), ("alpha",), [(51, 4)], None, None]   # then receivers
+RELEASE = [(50, "w50", "withheld", 1, 3), ("alpha",)]   # then its reports, then receivers
 
 
-def test_a_release_whose_report_cannot_be_looked_up_fails_with_nothing_changed(monkeypatch):
-    """A doveadm that fails or times out is not "the report is gone": read so, the release
-    deleted the report's rows and the report stayed in every mailbox for good."""
+def test_a_release_whose_report_cannot_be_read_fails_with_nothing_changed(monkeypatch):
+    """A report whose file cannot be read is not "the report is gone": read so, the release
+    deleted the report's rows and the report stayed in every mailbox for good. Nor is one
+    the pass has not named yet."""
     def refuse(*a, **k):
-        raise requests.doveadm.DoveadmError("doveadm fetch timed out after 60 s")
+        raise PermissionError("the archive could not be read")
 
-    monkeypatch.setattr(requests.doveadm, "fetch", refuse)
-    cursor = Cursor([*RELEASE, []])
-    with pytest.raises(requests.RequestFailed, match="could not be looked up, so nothing was "
-                                                     "released: doveadm fetch timed out"):
-        requests.release(cursor, request_of(kind="release", payload={"message_id": 50}),
-                         requests.Context())
-    statements = [statement for statement, _ in cursor.statements]
-    assert not any(s.startswith(("DELETE", "UPDATE message", "INSERT")) for s in statements)
+    monkeypatch.setattr(requests.store, "resolve", refuse)
+    for reports, said in (([(51, "r1", 4)], "could not be read, so nothing was released: the "
+                                            "archive could not be read"),
+                          ([(51, None, 4)], "has no archive name yet")):
+        cursor = Cursor([*RELEASE, reports, []])
+        with pytest.raises(requests.RequestFailed, match=said):
+            requests.release(cursor, request_of(kind="release", payload={"message_id": 50}),
+                             requests.Context())
+        statements = [statement for statement, _ in cursor.statements]
+        assert not any(s.startswith(("DELETE", "UPDATE message", "INSERT")) for s in statements)
 
 
-@pytest.mark.parametrize("records, removed", [([], 0), ([{"uid": "4", "storageid": "r1"}], 1)])
-def test_a_report_the_archive_answers_no_record_for_is_gone_and_one_it_names_goes(
-        monkeypatch, tmp_path, records, removed):
-    """No record for the UID is the one answer that says the report is not there; a record
-    whose file is gone still names the base name the names are found by."""
-    monkeypatch.setattr(requests.doveadm, "fetch", lambda *a, **k: records)
+@pytest.mark.parametrize("there", [False, True])
+def test_a_report_is_found_by_its_base_name_whether_or_not_its_file_is_there(tmp_path, there):
+    """A report's file gone from the archive still names the base name the names in
+    people's mailboxes are found by, and Dovecot is not asked."""
     context = context_of(tmp_path)
+    if there:
+        archived(context.store_root, requests.INBOX, [4])
     box = maildir(context.store_root, "alpha", "ivan")
-    (box / "cur" / "r1:2,S").write_text("report")
-    cursor = Cursor([*RELEASE, [], [(5, "ivan")]])
+    (box / "cur" / "1700000004.M4P1.host:2,S").write_text("report")
+    # the reports, nobody receiving the original, then the report's holders
+    cursor = Cursor([*RELEASE, [(51, "1700000004.M4P1.host", 4)], [], [(5, "ivan")]])
     said = requests.release(cursor, request_of(kind="release", payload={"message_id": 50}),
                             context)
-    assert said.endswith(f"{removed} report name(s) removed")
-    assert (box / "cur" / "r1:2,S").exists() == (not removed)
+    assert said.endswith("1 report name(s) removed")
+    assert not (box / "cur" / "1700000004.M4P1.host:2,S").exists()
     assert ("DELETE FROM delivery WHERE message_id = %s", (51,)) in cursor.statements
+
+
+def test_a_report_with_no_archive_number_is_gone_and_its_rows_go(capsys):
+    cursor = Cursor([*RELEASE, [(51, None, None)], []])
+    said = requests.release(cursor, request_of(kind="release", payload={"message_id": 50}),
+                            requests.Context())
+    assert said.endswith("0 report name(s) removed")
+    assert ("DELETE FROM delivery WHERE message_id = %s", (51,)) in cursor.statements
+    assert "the report 51 of alpha has no archive name" in capsys.readouterr().err
 
 
 def bounded(bound, namespace, key):
@@ -1127,54 +1140,37 @@ def test_delivering_by_id_refuses_a_message_of_another_domain():
 
 
 def test_releasing_a_message_that_is_not_withheld_is_refused():
-    cursor = Cursor([(50, 7, "delivered", 1)])
+    cursor = Cursor([(50, "m50", "delivered", 1, 7)])
     with pytest.raises(requests.RequestFailed) as refused:
         requests.release(cursor, request_of(kind="release", payload={"message_id": 50}),
                          requests.Context())
     assert "not withheld" in str(refused.value)
 
 
-# --- no UID under another UIDVALIDITY --------------------------------------------------
-
-
-def renumbered_archive(monkeypatch, now=222):
-    """Dovecot's UIDVALIDITY for every archive folder; no file is ever asked for."""
-    monkeypatch.setattr(requests.ledger.doveadm, "mailbox_status",
-                        lambda login, folder, *fields: {"uidvalidity": str(now)})
-    for name in ("message_file", "fetch"):
-        monkeypatch.setattr(requests.doveadm, name,
-                            lambda *a, **k: pytest.fail("a UID was read under another UIDVALIDITY"))
+# --- no UID read, no numbering checked: a row's file is its base name (`0100`) ------------------
 
 
 @pytest.mark.parametrize("kind, answers", [
-    # the mailbox, its rows in range, the folder's kept UIDVALIDITY
-    ("connect", [(1, "ivan", "alpha", None, 1), None, [(50, 3, "delivered")], (111, 3)]),
-    ("top_up", [(1, "ivan", "alpha", None, 1), [(50, 3, "released")], (111, 3)]),
-    # the mailbox, the message, the folder's kept UIDVALIDITY
-    ("deliver_one", [(1, "ivan", "alpha", None, 1), (50, 3, "delivered", 1), (111, 3)]),
-    # the message, its domain, its reports, the quarantine's kept UIDVALIDITY
-    ("release", [(50, 3, "withheld", 1), ("alpha",), [], (111, 3)]),
+    # the mailbox, its rows in range
+    ("connect", [(1, "ivan", "alpha", None, 1), None, [(50, None, "delivered")]]),
+    ("top_up", [(1, "ivan", "alpha", None, 1), [(50, None, "released")]]),
+    # the mailbox, the message
+    ("deliver_one", [(1, "ivan", "alpha", None, 1), (50, None, "delivered", 1, 3)]),
+    # the message, its domain
+    ("release", [(50, None, "withheld", 1, 3), ("alpha",)]),
 ])
-def test_a_handler_that_links_by_uid_fails_with_nothing_linked_when_the_folder_was_renumbered(
+def test_a_row_the_pass_has_not_named_yet_fails_its_request_with_nothing_linked(
         monkeypatch, kind, answers):
-    renumbered_archive(monkeypatch)
+    """The previous release's rows, in a folder the pass has not ticked since the upgrade:
+    a UID alone, which this release never links by."""
+    for name in ("message_file", "fetch", "run", "mailbox_status"):
+        monkeypatch.setattr(requests.doveadm, name,
+                            lambda *a, **k: pytest.fail("Dovecot was asked for a message's file"))
     cursor = Cursor(answers)
     payload = {"mailbox_id": 1, "message_id": 50, "since": "2026-01-01", "until": "2026-12-31"}
-    with pytest.raises(requests.RequestFailed) as refused:
+    with pytest.raises(requests.RequestFailed, match="message 50 of alpha has no archive name yet"):
         requests.HANDLERS[kind](cursor, request_of(kind=kind, payload=payload), requests.Context())
-    assert "UIDVALIDITY is 222" in str(refused.value) and "111's" in str(refused.value)
-    assert "--renumber" in str(refused.value)
     assert not [sql for sql, _ in cursor.statements if sql.startswith(("INSERT", "UPDATE", "DELETE"))]
-
-
-def test_a_cursor_row_keeping_no_uidvalidity_takes_dovecots_and_the_same_one_passes(monkeypatch):
-    renumbered_archive(monkeypatch, now=111)
-    cursor = Cursor([(None, 0), (111, 0), None])
-    requests.numbered(cursor, 1, "alpha", "INBOX")      # none kept: Dovecot's is taken
-    assert cursor.statements[-1] == (" ".join(requests.ledger.ADOPT.split()), (111, 1, "INBOX"))
-    requests.numbered(cursor, 1, "alpha", "INBOX")      # the same: nothing to say
-    requests.numbered(cursor, 1, "alpha", "Quarantine")  # no cursor row: no UID of ours yet
-    assert len([sql for sql, _ in cursor.statements if sql.startswith("UPDATE")]) == 1
 
 
 def test_deleting_a_mapped_domain_is_refused_and_the_refusal_names_the_mailbox():
@@ -1420,96 +1416,78 @@ def archived(root, folder, uids):
     return ids
 
 
-def test_a_connect_asks_dovecot_once_per_folder_and_never_once_per_message(tmp_path, monkeypatch):
+def test_a_connect_finds_each_file_by_its_base_name_in_its_own_folder_and_never_asks_dovecot(
+        tmp_path, monkeypatch):
     """A year of one domain is tens of thousands of messages: a lookup each was two
-    doveadm processes a message inside the one request."""
+    doveadm processes a message, and a lookup a batch one reading of the folder's whole
+    uidlist. The base name on the row names the file in the folder its state says."""
     context = context_of(tmp_path)
     inbox = archived(context.store_root, requests.INBOX, [3, 4, 9])
     held = archived(context.store_root, store.QUARANTINE, [2])
-    ids = {requests.INBOX: inbox, store.QUARANTINE: held}
-    asked = []
-
-    def fetch(login, folder, fields, *search):
-        asked.append((login, folder, search))
-        wanted = set(named(search[1]))
-        return [{"uid": str(uid), "storageid": sid} for uid, sid in ids[folder].items()
-                if uid in wanted]
-
-    monkeypatch.setattr(requests.doveadm, "fetch", fetch)
-    monkeypatch.setattr(requests.doveadm, "storage_id",
-                        lambda *a: pytest.fail("a lookup of one message"))
+    for name in ("fetch", "run", "storage_id", "message_file"):
+        monkeypatch.setattr(requests.doveadm, name, lambda *a, **k: pytest.fail("Dovecot asked"))
     maildir(context.store_root, "alpha", "ivan")
-    rows = [(11, 3, "delivered"), (12, 4, "delivered"), (13, 2, "released"),
-            (14, 9, "delivered")]
+    rows = [(11, inbox[3], "delivered"), (12, inbox[4], "delivered"), (13, held[2], "released"),
+            (14, inbox[9], "delivered")]
     as_of = datetime.datetime(2026, 9, 1)
-    # the mailbox, its rows, and no cursor row for either folder's numbering
-    cursor = Cursor([(5, "ivan", "alpha", as_of, 1), None, rows, None, None])
+    cursor = Cursor([(5, "ivan", "alpha", as_of, 1), None, rows])
     answer = requests.connect(cursor, request_of(payload={"mailbox_id": 5}), context)
     assert answer == "connected 4 message(s) to ivan@alpha"
-    assert sorted(asked) == [("archive@alpha", requests.INBOX, ("uid", "3:4,9")),
-                             ("archive@alpha", store.QUARANTINE, ("uid", "2"))]
     names = sorted(p.name for p in (store.maildir(store.home("alpha", "ivan", context.store_root))
                                     / "new").iterdir())
     assert names == sorted([*inbox.values(), held[2]])
     links = [params for statement, params in cursor.statements
              if statement == " ".join(ledger.LINK.split())]
     assert links == [(11, 5), (12, 5), (13, 5), (14, 5)]
+    # a released message's base name is not looked for in INBOX
+    cursor = Cursor([(6, "olga", "alpha", as_of, 1), None, [(15, held[2], "delivered")]])
+    maildir(context.store_root, "alpha", "olga")
+    with pytest.raises(requests.RequestFailed, match=f"{held[2]} is not in archive@alpha's INBOX"):
+        requests.connect(cursor, request_of(payload={"mailbox_id": 6}), context)
 
 
-def test_a_file_renamed_after_the_folders_answer_is_asked_for_again(tmp_path, monkeypatch):
+def test_a_file_renamed_after_the_batch_found_it_is_looked_for_again(tmp_path, monkeypatch):
     context = context_of(tmp_path)
     inbox = archived(context.store_root, requests.INBOX, [3])
     folder = store.maildir(store.archive_home("alpha", context.store_root))
-    # a person's client set a flag in between: the name Dovecot gave is gone
+    # a flag set in between: the name the batch found is gone
     os.rename(folder / "cur" / f"{inbox[3]}:2,", folder / "cur" / f"{inbox[3]}:2,S")
     monkeypatch.setattr(requests, "archive_files",
-                        lambda *a: {3: folder / "cur" / f"{inbox[3]}:2,"})
-    asked_again = []
-    monkeypatch.setattr(requests.doveadm, "message_file", lambda *a, **k: asked_again.append(a)
-                        or folder / "cur" / f"{inbox[3]}:2,S")
+                        lambda *a: {inbox[3]: folder / "cur" / f"{inbox[3]}:2,"})
     maildir(context.store_root, "alpha", "ivan")
     cursor = Cursor([(5, "ivan", "alpha", datetime.datetime(2026, 9, 1), 1),
-                     None, [(11, 3, "delivered")], None])
+                     None, [(11, inbox[3], "delivered")]])
     requests.connect(cursor, request_of(payload={"mailbox_id": 5}), context)
-    assert asked_again == [("alpha", store.ARCHIVE, requests.INBOX, 3)]
     assert (store.maildir(store.home("alpha", "ivan", context.store_root)) / "new"
             / inbox[3]).exists()
 
 
-def test_a_uid_answered_with_no_storage_id_is_asked_for_alone_and_never_breaks_the_folder(
-        tmp_path, monkeypatch):
+def test_a_base_name_with_no_file_is_left_out_of_a_batch_and_never_breaks_the_folder(tmp_path):
     context = context_of(tmp_path)
-    inbox = archived(context.store_root, requests.INBOX, [3, 4])
-    monkeypatch.setattr(requests.doveadm, "fetch", lambda *a: [
-        {"uid": "3", "storageid": inbox[3]}, {"uid": "4", "storageid": ""}])
-    assert requests.archive_files("alpha", requests.INBOX, [3, 4], context.store_root) == {
-        3: store.maildir(store.archive_home("alpha", context.store_root)) / "cur" / f"{inbox[3]}:2,"}
+    inbox = archived(context.store_root, requests.INBOX, [3])
+    assert requests.archive_files("alpha", requests.INBOX, [inbox[3], "1700000099.M99P1.host"],
+                                  context.store_root) == {
+        inbox[3]: store.maildir(store.archive_home("alpha", context.store_root)) / "cur" / f"{inbox[3]}:2,"}
 
 
-def test_a_batch_of_consecutive_numbers_is_one_asking_of_dovecot_however_many_they_are(
-        tmp_path, monkeypatch):
-    """Every doveadm asked for a storage id reads the folder's whole uidlist: a
-    batch of imported history is one run of numbers, and one asking."""
-    context = context_of(tmp_path)
-    asked = []
-    monkeypatch.setattr(requests.doveadm, "fetch",
-                        lambda login, folder, fields, *search: asked.append(search) or [])
-    requests.archive_files("alpha", requests.INBOX, range(20_001, 30_001), context.store_root)
-    assert asked == [("uid", "20001:30000")]
+def test_a_batch_of_consecutive_numbers_is_one_asking_of_dovecot_however_many_they_are():
+    """What is left of asking Dovecot by UID, the pass's renumbering (`0100`): a run of
+    numbers is one set."""
+    assert requests.doveadm.uid_sets(range(20_001, 30_001)) == ["20001:30000"]
     # numbers already given leave holes: still one set, its runs joined
-    assert requests.uid_sets([7, 3, 4, 5, 9, 10, 4]) == ["3:5,7,9:10"]
-    assert requests.uid_sets([]) == []
+    assert requests.doveadm.uid_sets([7, 3, 4, 5, 9, 10, 4]) == ["3:5,7,9:10"]
+    assert requests.doveadm.uid_sets([]) == []
 
 
 def test_scattered_numbers_are_split_at_the_bound_and_every_one_is_named_once(monkeypatch):
-    monkeypatch.setattr(requests, "UID_SET_BYTES", 64)
+    monkeypatch.setattr(requests.doveadm, "UID_SET_BYTES", 64)
     uids = [*range(1, 400, 2), *range(1_000_000, 1_000_050), 2_000_000]
-    sets = requests.uid_sets(uids)
+    sets = requests.doveadm.uid_sets(uids)
     assert len(sets) > 1 and all(len(each) <= 64 for each in sets)
     assert [uid for each in sets for uid in named(each)] == sorted(uids)
     # one number longer than the bound is still asked for, alone
-    monkeypatch.setattr(requests, "UID_SET_BYTES", 3)
-    assert requests.uid_sets([10_000, 10_001, 20_000]) == ["10000:10001", "20000"]
+    monkeypatch.setattr(requests.doveadm, "UID_SET_BYTES", 3)
+    assert requests.doveadm.uid_sets([10_000, 10_001, 20_000]) == ["10000:10001", "20000"]
 
 
 # --- a top-up names imported mail as old mail -------------------------------------------
@@ -1556,12 +1534,10 @@ def test_a_top_up_names_imported_mail_seen_or_unseen_in_its_year_folder_and_coll
     live = archived(context.store_root, requests.INBOX, [3])
     old = imported_files(context.store_root, {1: True, 2: False})
     ids = {**live, **old}
-    monkeypatch.setattr(requests.doveadm, "fetch", lambda login, folder, fields, *search: [
-        {"uid": str(uid), "storageid": ids[uid]} for uid in named(search[1])])
     asked = subscribing(monkeypatch, context.store_root)
     maildir(context.store_root, "alpha", "ivan")
-    rows = [(11, 1, "delivered"), (12, 2, "delivered"), (13, 3, "delivered")]
-    cursor = Cursor([(5, "ivan", "alpha", datetime.datetime(2026, 9, 1), 1), rows, None])
+    rows = [(11, ids[1], "delivered"), (12, ids[2], "delivered"), (13, ids[3], "delivered")]
+    cursor = Cursor([(5, "ivan", "alpha", datetime.datetime(2026, 9, 1), 1), rows])
     answer = requests.top_up(cursor, request_of(kind="top_up", payload={
         "mailbox_id": 5, "since": "2016-01-01", "until": "9999-12-31"}), context)
     assert answer.startswith("topped up 3 message(s) to ivan@alpha")
@@ -1606,12 +1582,10 @@ def test_a_top_up_dovecot_cannot_make_the_folders_for_fails_saying_so_and_names_
     live = archived(context.store_root, requests.INBOX, [3])
     old = imported_files(context.store_root, {1: True})
     ids = {**live, **old}
-    monkeypatch.setattr(requests.doveadm, "fetch", lambda login, folder, fields, *search: [
-        {"uid": str(uid), "storageid": ids[uid]} for uid in named(search[1])])
     subscribing(monkeypatch, context.store_root, refused=True)
     maildir(context.store_root, "alpha", "ivan")
     cursor = Cursor([(5, "ivan", "alpha", datetime.datetime(2026, 9, 1), 1),
-                     [(13, 3, "delivered"), (11, 1, "delivered")], None])
+                     [(13, ids[3], "delivered"), (11, ids[1], "delivered")]])
     with pytest.raises(requests.RequestFailed, match="Archives could not be made and subscribed.*"
                                                      "unblock them and ask again"):
         requests.top_up(cursor, request_of(kind="top_up", payload={
@@ -1625,12 +1599,9 @@ def test_a_top_up_dovecot_cannot_make_the_folders_for_fails_saying_so_and_names_
 def test_a_deliver_one_puts_an_imported_message_back_into_its_year_folder(tmp_path, monkeypatch):
     context = context_of(tmp_path)
     old = imported_files(context.store_root, {1: True})
-    archive = store.maildir(store.archive_home("alpha", context.store_root))
-    monkeypatch.setattr(requests.doveadm, "message_file", lambda label, account, folder, uid, root:
-                        archive / "cur" / f"{old[uid]}:2,S")
     subscribing(monkeypatch, context.store_root)
     cursor = Cursor([(5, "ivan", "alpha", datetime.datetime(2026, 9, 1), 1),
-                     (11, 1, "delivered", 1), None])
+                     (11, old[1], "delivered", 1, 1)])
     requests.deliver_one(cursor, request_of(kind="deliver_one", payload={
         "mailbox_id": 5, "message_id": 11}), context)
     year = store.maildir(store.home("alpha", "ivan", context.store_root), "Archives/2016")
@@ -1697,9 +1668,11 @@ def scene(database):
     mailbox = database.value("INSERT INTO mailbox (account_id, domain_id) SELECT id, %s FROM "
                              "account WHERE login = 'ivan' RETURNING id", (domain,))
     for uid, received in ((1, "2016-03-15"), (2, "2019-07-01"), (3, "2024-01-05")):
-        database.sql("INSERT INTO message (domain_id, archive_uid, received_at, imported_at) "
-                     "VALUES (%s, %s, %s, clock_timestamp())", (domain, uid, received))
-    database.sql("INSERT INTO message (domain_id, archive_uid) VALUES (%s, 4)", (domain,))
+        database.sql("INSERT INTO message (domain_id, archive_uid, archive_base, received_at, "
+                     "imported_at) VALUES (%s, %s, %s, %s, clock_timestamp())",
+                     (domain, uid, f"base{uid}", received))
+    database.sql("INSERT INTO message (domain_id, archive_uid, archive_base) VALUES (%s, 4, 'base4')",
+                 (domain,))
     return domain, mailbox
 
 
@@ -1712,7 +1685,7 @@ def test_a_top_ups_count_is_what_it_links_and_takes_imported_history_by_its_old_
                                        ("2016-03-15", "2016-03-15", [1]),
                                        ("2000-01-01", requests.WIDE_UNTIL, [1, 2, 3, 4])):
                 selected = requests.select_for(cur, mailbox, domain, since, until)
-                assert [row[1] for row in selected] == uids, (since, until)
+                assert [row[1] for row in selected] == [f"base{uid}" for uid in uids], (since, until)
                 assert requests.count_for(cur, mailbox, domain, since, until) == len(uids)
     finally:
         conn.close()
@@ -1727,7 +1700,7 @@ def test_a_connect_reaches_no_imported_row_older_than_the_mailbox(database):
             rows = requests.select_for(cur, mailbox, domain, as_of, requests.WIDE_UNTIL)
     finally:
         conn.close()
-    assert [row[1] for row in rows] == [4]   # collected after the mailbox: the control
+    assert [row[1] for row in rows] == ["base4"]   # collected after the mailbox: the control
 
 
 
@@ -1737,16 +1710,14 @@ def test_a_connect_reaches_no_imported_row_older_than_the_mailbox(database):
 def test_a_batch_is_its_names_then_their_directories_fsync_then_its_rows(tmp_path, monkeypatch):
     context = context_of(tmp_path)
     ids = archived(context.store_root, requests.INBOX, [3, 4, 9])
-    monkeypatch.setattr(requests.doveadm, "fetch", lambda login, folder, fields, *search: [
-        {"uid": str(uid), "storageid": ids[uid]} for uid in named(search[1])])
     box = maildir(context.store_root, "alpha", "ivan")
-    cursor = Cursor([None])   # no cursor row for the folder's numbering
+    cursor = Cursor()
     order = []
     monkeypatch.setattr(requests.store, "fsync_dirs", lambda directories: order.append(
         (sorted(str(d) for d in directories), len(list((box / "new").iterdir())),
          [s for s, _ in cursor.statements if s.startswith("INSERT")])))
-    requests.link_messages(cursor, [(11, 3, "delivered"), (12, 4, "delivered"),
-                                    (13, 9, "delivered")],
+    requests.link_messages(cursor, [(11, ids[3], "delivered"), (12, ids[4], "delivered"),
+                                    (13, ids[9], "delivered")],
                            requests.Mailbox(5, "ivan", "alpha", None, 1), context)
     # one fsync of the one directory, with every name made and no row written yet
     assert order == [([str(box / "new")], 3, [])]
@@ -1769,8 +1740,8 @@ def test_a_top_up_commits_each_batch_as_it_goes_with_its_count_on_the_request(bu
     assert world.drain() == (1, 0)
     assert seen == [(0, "running", None), (2, "running", "2 message(s) linked so far"),
                     (4, "running", "4 message(s) linked so far")]
-    # never more than a batch selected, and the folder asked for one batch's numbers
-    assert pages == [2, 2, 1] and world.fetched == ["1:2", "3:4", "5"]
+    # never more than a batch selected, and Dovecot never asked (`0100`)
+    assert pages == [2, 2, 1] and world.fetched == []
     state, result, payload = world.request(asked)
     assert (state, result) == ("done", "topped up 5 message(s) to ivan@alpha, 2000-01-01 "
                                        "to 2030-12-31")

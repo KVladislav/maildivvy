@@ -141,6 +141,38 @@ def fetch(login, mailbox, fields, *search):
     return run(("fetch",), login, " ".join(fields), "mailbox", mailbox, *search)
 
 
+# ⛔ One `doveadm fetch` for as many UIDs as fit one UID set of this many bytes: every
+# `doveadm` asked for a storage id reads the folder's whole `dovecot-uidlist`, 0.4 s of it
+# at 400,000 messages, whatever it is asked. Runs of consecutive numbers are a few
+# bytes; 10,000 scattered seven-digit numbers are five sets. The kernel's bound on one
+# argument is 128 KiB.
+UID_SET_BYTES = 16 * 1024
+
+
+def uid_sets(uids):
+    """The UIDs as IMAP sequence sets, as `doveadm fetch ... uid <set>` reads them: runs of
+    consecutive numbers as `first:last`, joined by commas, each set at most `UID_SET_BYTES`
+    long. Every UID is in exactly one set."""
+    runs = []
+    for uid in sorted({int(uid) for uid in uids}):
+        if runs and uid == runs[-1][1] + 1:
+            runs[-1][1] = uid
+        else:
+            runs.append([uid, uid])
+    sets, parts, size = [], [], 0
+    for first, last in runs:
+        part = str(first) if first == last else f"{first}:{last}"
+        if parts and size + 1 + len(part) > UID_SET_BYTES:
+            sets.append(",".join(parts))
+            parts, size = [], 0
+        size += len(part) + bool(parts)
+        parts.append(part)
+    if parts:
+        sets.append(",".join(parts))
+    return sets
+
+
+
 def storage_id(login, mailbox, uid):
     """The storage id of the message with this UID: its maildir base name."""
     records = fetch(login, mailbox, ["uid", "storageid"], "uid", str(int(uid)))

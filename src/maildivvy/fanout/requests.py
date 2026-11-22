@@ -52,19 +52,18 @@ those logins, waits until none is left, removes the directories and clears the l
 A list still on a failed request is what is left to remove, and every later drain
 tries it again (`remove_left`).
 
-⛔ A MESSAGE'S UID IS LOOKED UP IN THE MAILBOX IT COUNTS IN. UIDs are per
-mailbox, so a withheld message's `archive_uid` is its number in the quarantine folder,
-and a released message's still is - only a `delivered` message's counts in INBOX.
-Measured on the predecessor: a release that asked INBOX for the number found
-another message, hit EEXIST (success) and reported "released to 3 mailboxes" having
-linked nothing; had the receivers not held that other message already, it would have
-linked somebody else's mail into all three.
+⛔ A MESSAGE'S FILE IS LOOKED UP IN THE FOLDER IT IS IN. A withheld message's
+file is in the quarantine folder, and a released message's still is - only a `delivered`
+message's is in INBOX. Measured on the predecessor: a release that asked INBOX for the
+quarantine's number found another message, hit EEXIST (success) and reported "released
+to 3 mailboxes" having linked nothing; had the receivers not held that other message
+already, it would have linked somebody else's mail into all three.
 
-⛔ NO UID IS READ OF A FOLDER DOVECOT NUMBERED AGAIN. A handler that links by UID
-- a connect, a top-up, a deliver-one, a release - first holds each folder it reads to
-the UIDVALIDITY its cursor row keeps and to the cursor's own UID still being there, as
-the pass's tick does, and fails with nothing linked when either changed: the row's
-number may name another message's file.
+⛔ A HANDLER LINKS BY THE ROW'S BASE NAME, NEVER BY ITS UID (`0100`). A connect, a top-up, a
+deliver-one and a release find a message's file from the base name its row carries,
+which names that one file whatever Dovecot's numbering does: no `doveadm` is asked
+and no numbering checked. A row the pass has not named yet (written by the previous
+release, its folder not ticked since) fails the request, saying so.
 
 ⛔ THE RANGE'S END BOUND LIVES IN THE QUERY, SPELT ONCE. `SELECTOR` below is
 shared word for word by the set a top-up delivers and by the number a screen states
@@ -134,12 +133,6 @@ WIDE_UNTIL = "9999-12-31"
 
 AUTH_TIMEOUT = 600       # four commands with a provider that may answer slowly
 REFETCH_TIMEOUT = 1800   # a whole mailbox may be retrieved
-# ⛔ One `doveadm fetch` a batch wherever its numbers fit one UID set of this many bytes:
-# every `doveadm` asked for a storage id reads the folder's whole `dovecot-uidlist`, 0.4 s
-# of it at 400,000 messages, whatever it is asked (measured). Imported history is runs of
-# consecutive numbers, a few bytes a batch; 10,000 scattered seven-digit numbers are five
-# sets. The kernel's bound on one argument is 128 KiB.
-UID_SET_BYTES = 16 * 1024
 SESSIONS_END = 15        # seconds a deletion waits for the sessions it ended to go
 # ⛔ The pass's drain claims no new request once it has drained this long: every
 # domain's fan-out waits for the drain to end, since the next tick of the pass's timer
@@ -313,7 +306,7 @@ SELECTOR = """
 # ⛔ A page at a time, after the last id of the page before: the selection of an
 # archive of millions is never held whole. The conditions are still `SELECTOR`'s alone.
 AFTER = " AND m.id > %s ORDER BY m.id LIMIT %s"
-SELECT_FOR = "SELECT m.id, m.archive_uid, m.state" + SELECTOR + AFTER
+SELECT_FOR = "SELECT m.id, m.archive_base, m.state" + SELECTOR + AFTER
 COUNT_FOR = "SELECT count(*)" + SELECTOR
 
 # ⛔ NAMED, NOT WRITTEN INLINE, because the acceptance tests plan these exact texts at a
@@ -321,7 +314,7 @@ COUNT_FOR = "SELECT count(*)" + SELECTOR
 # `message (report_of)` the third. A copy in a test would prove nothing about these.
 MAILBOX_NAMES = "SELECT count(*) FROM delivery WHERE mailbox_id = %s"
 MAILBOX_UNLINK = "DELETE FROM delivery WHERE mailbox_id = %s"
-REPORTS_OF = "SELECT id, archive_uid FROM message WHERE report_of = %s ORDER BY id"
+REPORTS_OF = "SELECT id, archive_base, archive_uid FROM message WHERE report_of = %s ORDER BY id"
 
 
 def selector_params(mailbox_id, domain_id, since, until):
@@ -428,69 +421,33 @@ def make_maildir(home, root):
     return store.make_maildir(store.maildir(home), root)
 
 
-def numbered(cur, domain_id, label, folder):
-    """Fail the request unless the folder still numbers its files as the ledger does."""
-    try:
-        ledger.same_numbering(cur, domain_id, label, folder)
-    except ledger.Renumbered as err:
-        raise RequestFailed(str(err)) from None
+def unnamed(message_id, label):
+    """A row with an archive number and no base name: the previous release's, in a folder
+    the pass has not ticked since the upgrade (`0100`)."""
+    return RequestFailed(f"message {message_id} of {label} has no archive name yet: the pass "
+                         "gives it on its next tick of the folder; ask again after it")
 
 
-def archive_file(label, folder, uid, context):
-    """One archived message's file, asked of Dovecot by UID."""
-    try:
-        return doveadm.message_file(label, store.ARCHIVE, folder, uid, root=context.store_root)
-    except doveadm.DoveadmError as err:
-        raise RequestFailed(f"UID {uid} is not in {store.ARCHIVE}@{label}'s "
-                            f"{folder} any more: {err}") from None
+def archive_file(label, folder, base, context):
+    """One archived message's file, from its base name (`0100`): no `doveadm`, and the
+    same file whatever Dovecot's numbering."""
+    folder_maildir = store.maildir(store.archive_home(label, context.store_root), folder)
+    path = store.resolve(folder_maildir, base)
+    if path is None:
+        raise RequestFailed(f"{base} is not in {store.ARCHIVE}@{label}'s {folder} any more")
+    return path
 
 
-def uid_sets(uids):
-    """The UIDs as IMAP sequence sets, as `doveadm fetch ... uid <set>` reads them: runs of
-    consecutive numbers as `first:last`, joined by commas, each set at most `UID_SET_BYTES`
-    long. Every UID is in exactly one set."""
-    runs = []
-    for uid in sorted({int(uid) for uid in uids}):
-        if runs and uid == runs[-1][1] + 1:
-            runs[-1][1] = uid
-        else:
-            runs.append([uid, uid])
-    sets, parts, size = [], [], 0
-    for first, last in runs:
-        part = str(first) if first == last else f"{first}:{last}"
-        if parts and size + 1 + len(part) > UID_SET_BYTES:
-            sets.append(",".join(parts))
-            parts, size = [], 0
-        size += len(part) + bool(parts)
-        parts.append(part)
-    if parts:
-        sets.append(",".join(parts))
-    return sets
-
-
-def archive_files(label, folder, uids, root):
-    """`{uid: file}` for many messages of one archive folder, one `doveadm fetch` for each
-    of `uid_sets`: one for a batch, unless its numbers are scattered.
-
-    A UID Dovecot does not answer, or whose name is not there, is left out, and
-    `link_message` asks for it alone, which looks twice and fails the request with its
-    reason. A lookup per message was two doveadm processes a message: tens of thousands
-    for a connect over a year of one domain.
-    """
-    login = f"{store.ARCHIVE}@{label}"
+def archive_files(label, folder, bases, root):
+    """`{base name: file}` for many messages of one archive folder, each found by its
+    name alone (`0100`). One whose name is not there is left out, and `link_name` asks for
+    it alone, which looks again and fails the request with its reason."""
     folder_maildir = store.maildir(store.archive_home(label, root), folder)
     found = {}
-    for uid_set in uid_sets(uids):
-        try:
-            records = doveadm.fetch(login, folder, ["uid", "storageid"], "uid", uid_set)
-        except doveadm.DoveadmError as err:
-            raise RequestFailed(f"{login}'s {folder} could not be read: {err}") from None
-        for record in records:
-            if not record.get("storageid"):
-                continue  # asked for again alone, which says why
-            path = store.resolve(folder_maildir, record["storageid"])
-            if path is not None:
-                found[int(record["uid"])] = path
+    for base in bases:
+        path = store.resolve(folder_maildir, base)
+        if path is not None:
+            found[base] = path
     return found
 
 
@@ -541,7 +498,7 @@ def link_name(row, mailbox, context, source=None):
     `source` is the file as a lookup of many found it; a name renamed since (a flag set
     on the archive copy) is asked for again, alone.
     """
-    _, archive_uid, state = row
+    _, base, state = row
     touched = None
     if source is not None:
         try:
@@ -549,7 +506,7 @@ def link_name(row, mailbox, context, source=None):
         except FileNotFoundError:
             touched = None
     if touched is None:
-        source = archive_file(mailbox.label, ledger.folder_of(state), archive_uid, context)
+        source = archive_file(mailbox.label, ledger.folder_of(state), base, context)
         touched = name_in(source, mailbox, context)
     return touched
 
@@ -562,19 +519,19 @@ def link_message(cur, row, mailbox, context, relink=False, source=None):
 
 def link_messages(cur, rows, mailbox, context):
     """One batch into one mailbox: every name, each folder's files looked up
-    together, then their directories' fsync, then every row. The names are durable before
-    a row says so, and the folder is listed for this batch's numbers alone."""
-    uids = {}
-    for _, archive_uid, state in rows:
-        uids.setdefault(ledger.folder_of(state), []).append(archive_uid)
-    for folder in uids:
-        numbered(cur, mailbox.domain_id, mailbox.label, folder)
-    files = {folder: archive_files(mailbox.label, folder, numbers, context.store_root)
-             for folder, numbers in uids.items()}
+    together by their base names, then their directories' fsync, then every row. The names
+    are durable before a row says so."""
+    bases = {}
+    for message_id, base, state in rows:
+        if base is None:
+            raise unnamed(message_id, mailbox.label)
+        bases.setdefault(ledger.folder_of(state), []).append(base)
+    files = {folder: archive_files(mailbox.label, folder, names, context.store_root)
+             for folder, names in bases.items()}
     touched = set()
     for row in rows:
         touched.update(link_name(row, mailbox, context,
-                                 source=files[ledger.folder_of(row[2])].get(int(row[1]))))
+                                 source=files[ledger.folder_of(row[2])].get(row[1])))
     store.fsync_dirs(sorted(touched))
     for row in rows:
         cur.execute(ledger.LINK, (row[0], mailbox.id))
@@ -1005,11 +962,13 @@ def deliver_one(cur, request, context):
     """
     mailbox = mailbox_row(cur, need_int(request.payload, "mailbox_id"))
     message_id = need_int(request.payload, "message_id")
-    row = one(cur, "SELECT id, archive_uid, state, domain_id FROM message WHERE id = %s",
-              (message_id,), f"no message {message_id}")
+    row = one(cur, "SELECT id, archive_base, state, domain_id, archive_uid FROM message "
+                   "WHERE id = %s", (message_id,), f"no message {message_id}")
     if row[3] != mailbox.domain_id:
         raise RequestFailed(f"message {message_id} is not a message of {mailbox.label}, "
                             f"which is the domain {mailbox.login}'s mailbox is in")
+    if row[1] is None and row[4] is not None:
+        raise unnamed(message_id, mailbox.label)
     if row[1] is None:
         raise RequestFailed(f"message {message_id} has no archive number: nothing of it "
                             "is in the archive to give a name to")
@@ -1018,7 +977,6 @@ def deliver_one(cur, request, context):
         # release is the only act that gives a withheld message to anybody.
         raise RequestFailed(f"message {message_id} is {row[2]}; only a release gives a "
                             "withheld message to anybody")
-    numbered(cur, mailbox.domain_id, mailbox.label, ledger.folder_of(row[2]))
     link_message(cur, row[:3], mailbox, context, relink=True)
     journal(cur, request, "deliver_one", mailbox.login, {"message": message_id})
     return f"delivered message {message_id} to {mailbox.login}"
@@ -1034,33 +992,31 @@ def release(cur, request, context):
     moment the original is out. It carries no spam condition.
     """
     message_id = need_int(request.payload, "message_id")
-    row = one(cur, "SELECT id, archive_uid, state, domain_id FROM message WHERE id = %s",
-              (message_id,), f"no message {message_id}")
-    _, archive_uid, state, domain_id = row
+    row = one(cur, "SELECT id, archive_base, state, domain_id, archive_uid FROM message "
+                   "WHERE id = %s", (message_id,), f"no message {message_id}")
+    _, base, state, domain_id, archive_uid = row
     if state != "withheld":
         raise RequestFailed(f"message {message_id} is {state}, not withheld; only a "
                             "withheld message is released")
-    if archive_uid is None:
-        raise RequestFailed(f"message {message_id} has no archive number: nothing of it "
-                            "is in the archive to release")
     (label,) = one(cur, "SELECT label FROM domain WHERE id = %s", (domain_id,),
                    f"no domain {domain_id}")
+    if base is None and archive_uid is not None:
+        raise unnamed(message_id, label)
+    if base is None:
+        raise RequestFailed(f"message {message_id} has no archive number: nothing of it "
+                            "is in the archive to release")
     cur.execute(REPORTS_OF, (message_id,))
     reports = cur.fetchall()
-    # the original's folder, and INBOX, where its reports' numbers count
-    numbered(cur, domain_id, label, ledger.folder_of(state))
-    if reports:
-        numbered(cur, domain_id, label, INBOX)
     # ⛔ Every report's file found before anything is linked or removed: a fault
     # finding one fails the release with nothing changed, never a report left standing.
-    reports = [(report_id, report_file(report_id, report_uid, label, context))
-               for report_id, report_uid in reports]
+    reports = [(report_id, report_file(report_id, report_base, report_uid, label, context))
+               for report_id, report_base, report_uid in reports]
 
     cur.execute(RECEIVERS, (domain_id,))
     receivers = cur.fetchall()
-    source = archive_file(label, ledger.folder_of(state), archive_uid, context) if receivers else None
+    source = archive_file(label, ledger.folder_of(state), base, context) if receivers else None
     for mailbox_id, account in receivers:
-        link_message(cur, (message_id, archive_uid, state),
+        link_message(cur, (message_id, base, state),
                      Mailbox(mailbox_id, account, label, None, domain_id), context,
                      source=source)
 
@@ -1076,38 +1032,22 @@ def release(cur, request, context):
             f"{removed} report name(s) removed")
 
 
-def report_file(report_id, report_uid, label, context):
-    """`(inode or None, base name)` of a report in the archive's INBOX, or None when the
-    archive holds it no more: it has no number, or its number answers no record.
+def report_file(report_id, base, uid, label, context):
+    """`(inode or None, base name)` of a report in the archive's INBOX, or None when its
+    row has neither a base name nor a number: nothing of it was ever in the archive. A
+    row with a number and no name yet fails the release (`0100`).
 
-    ⛔ ONLY THOSE TWO ARE "GONE". Any other failure - doveadm refusing or timing
-    out, the record's file unreadable - fails the release: read as gone, the release
-    deleted the report's rows and the report stayed in every mailbox for good, saying the
-    message is withheld beside the released message. A record whose file is not there any
-    more still names the base name, which is enough to find the names by.
+    ⛔ A FILE THAT IS NOT THERE STILL NAMES ITS BASE NAME, which is enough to find
+    the names in people's mailboxes by; any failure reading it fails the release: read as
+    gone, the release deleted the report's rows and the report stayed in every mailbox for
+    good, saying the message is withheld beside the released message.
     """
-    gone = None
-    if report_uid is None:
-        gone = "it has no number in the archive"
-    else:
-        login = f"{store.ARCHIVE}@{label}"
-        try:
-            records = doveadm.fetch(login, INBOX, ["uid", "storageid"], "uid",
-                                    str(int(report_uid)))
-        except doveadm.DoveadmError as err:
-            raise RequestFailed(f"the report {report_id} of {label} could not be looked up, "
-                                f"so nothing was released: {err}") from None
-        if not records:
-            gone = f"UID {report_uid} answered no record"
-    if gone is not None:
-        sys.stderr.write(f"maildivvy-pass: the report {report_id} of {label} is not in the "
-                         f"archive any more ({gone}); its names could not be found\n")
+    if base is None and uid is not None:
+        raise unnamed(report_id, label)
+    if base is None:
+        sys.stderr.write(f"maildivvy-pass: the report {report_id} of {label} has no archive "
+                         "name; its names could not be found\n")
         return None
-    base = records[0].get("storageid") if len(records) == 1 else None
-    if not base:
-        raise RequestFailed(f"the report {report_id} of {label}: UID {report_uid} answered "
-                            f"{len(records)} record(s) and no one storage id, so nothing was "
-                            "released")
     try:
         path = store.resolve(store.maildir(store.archive_home(label, context.store_root)), base)
         return (path.stat().st_ino if path is not None else None), base

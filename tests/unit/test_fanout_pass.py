@@ -24,9 +24,11 @@ from maildivvy.lib import headers, messageid, store
 
 
 def record(**fields):
-    """A doveadm answer for one message, with the keys the pass asks for."""
+    """A doveadm answer for one message, with the keys the pass asks for; its storage id a
+    delivery agent's name of its own UID unless one is given."""
     answer = {"uid": "1"}
     answer.update(fields)
+    answer.setdefault("storageid", f"1795000000.M{answer['uid']}P1.example,S=10,W=10")
     return answer
 
 
@@ -198,11 +200,11 @@ class Ledger:
     BTREE_LIMIT = 2704
 
     def __init__(self, receivers=(), refused=(), refused_links=()):
-        self.messages = []   # (id, withheld_id, state, report_of, archive_uid, message_id_header)
+        # (id, withheld_id, state, report_of, archive_uid, message_id_header, archive_base)
+        self.messages = []
         self.cursors = {}
         self.numbering = {}  # folder -> the UIDVALIDITY its cursor row keeps (None: none)
-        self.folder_rows = []  # what the way back reads of a folder's rows
-        self.renumbered = {}
+        self.bases = {}      # folder -> the base name its cursor row keeps (`0100`)
         self.answer = None
         self.receivers = list(receivers)
         self.refused = set(refused)
@@ -234,22 +236,25 @@ class Ledger:
         sql = " ".join(sql.split())
         if sql.startswith("SELECT last_uid"):
             self.answer = (self.cursors.get(params[1], 0),)
-        elif sql.startswith("SELECT uidvalidity, last_uid FROM pass_cursor"):
-            self.answer = ((self.numbering[params[1]], self.cursors.get(params[1], 0))
-                           if params[1] in self.numbering else None)
+        elif sql.startswith("SELECT uidvalidity, last_uid, last_base FROM pass_cursor"):
+            self.answer = ((self.numbering[params[1]], self.cursors.get(params[1], 0),
+                            self.bases.get(params[1])) if params[1] in self.numbering else None)
         elif sql.startswith("UPDATE pass_cursor SET uidvalidity"):
             if self.numbering.get(params[2]) is None:
                 self.numbering[params[2]] = params[0]
-        elif sql.startswith("UPDATE pass_cursor SET last_uid = %s, uidvalidity"):
-            self.cursors[params[3]], self.numbering[params[3]] = params[0], params[1]
-        elif sql.startswith("SELECT id, archive_uid, message_id_header"):
-            self.answer = list(self.folder_rows)
-        elif sql == " ".join(pass_.UNNUMBER.split()):
-            self.renumbered.update({row[0]: None for row in self.folder_rows})
-        elif sql.startswith("UPDATE message SET archive_uid"):
-            self.renumbered[params[1]] = params[0]
-        elif sql.startswith("UPDATE pass_cursor"):
-            self.cursors[params[2]] = params[0]
+        elif sql.startswith("UPDATE pass_cursor SET last_base"):
+            if self.bases.get(params[2]) is None:
+                self.bases[params[2]] = params[0]
+        elif sql.startswith("UPDATE pass_cursor SET last_uid = %s, last_base = %s, uidvalidity"):
+            self.cursors[params[4]], self.bases[params[4]] = params[0], params[1]
+            self.numbering[params[4]] = params[2]
+        elif sql.startswith("UPDATE pass_cursor SET last_uid = %s, last_base = %s"):
+            self.cursors[params[3]], self.bases[params[3]] = params[0], params[1]
+        elif "archive_base IS NULL" in sql and sql.startswith("SELECT 1 FROM message"):
+            delivered = params[1]
+            self.answer = (1,) if any(m[4] is not None and m[6] is None
+                                      and (m[2] == "delivered") == delivered
+                                      for m in self.messages) else None
         elif sql.startswith("SELECT id FROM message"):
             found = [m[0] for m in self.messages
                      if m[1] == params[1] and m[2] != "delivered"]
@@ -264,7 +269,7 @@ class Ledger:
             if params[2] in self.refused:
                 raise RuntimeError(f"invalid value in UID {params[2]}\nDETAIL: a second line")
             self.next_id += 1  # a sequence: a rolled-back row's id is never given again
-            row = (self.next_id, params[4], params[3], params[5], params[2], params[1])
+            row = (self.next_id, params[4], params[3], params[5], params[2], params[1], params[11])
             self.messages.append(row)
             self.answer = (row[0],)
         elif sql.startswith("SELECT r.mailbox_id"):
@@ -520,7 +525,7 @@ def test_by_hand_the_command_names_one_domain_and_a_refusal_is_one_line_and_exit
     assert pass_.main(["--only", "nowhere", "--uid", "2"]) == 1
 
 
-# --- no UID under another UIDVALIDITY, and the way back -------------------------------
+# --- a renumbered folder is set right by base name (`0100`) ---------------------------
 
 
 def numbered(monkeypatch, now, uids=None):
@@ -531,12 +536,13 @@ def numbered(monkeypatch, now, uids=None):
 
     def run(verb, login, fields, _, folder, __, uid):
         assert verb == ("fetch",) and fields == "uid storageid"
-        return [{"uid": uid, "storageid": f"{uid}.M1P1.host"}] if uids is None or int(uid) in uids else []
+        return [{"uid": uid, "storageid": record(uid=uid)["storageid"]}] if uids is None or int(uid) in uids else []
 
     monkeypatch.setattr(ledger_module.doveadm, "run", run)
 
 
-def test_a_tick_takes_the_folders_uidvalidity_when_its_row_keeps_none(monkeypatch, tmp_path):
+def test_a_tick_takes_the_folders_uidvalidity_and_cursor_base_when_its_row_keeps_none(
+        monkeypatch, tmp_path):
     archive(monkeypatch, [ordinary(1)])
     linking(monkeypatch, tmp_path)
     numbered(monkeypatch, 111)
@@ -545,54 +551,17 @@ def test_a_tick_takes_the_folders_uidvalidity_when_its_row_keeps_none(monkeypatc
     pass_.fan_out(ledger, DOMAIN, pass_.parse_args([]))
     assert ledger.numbering == {pass_.INBOX: 111, store.QUARANTINE: 111}
     assert ledger.cursors[pass_.INBOX] == 1 and ledger.links == [(1, 7)]
+    # the row and the cursor both carry the file's base name
+    assert ledger.messages[0][6] == ordinary(1)["storageid"] == ledger.bases[pass_.INBOX]
 
 
-def test_a_renumbered_folder_fails_the_domains_tick_with_nothing_recorded_or_linked(
-        monkeypatch, tmp_path, capsys):
-    archive(monkeypatch, [ordinary(4)])
-    made = linking(monkeypatch, tmp_path)
-    numbered(monkeypatch, 222)
+def test_a_record_with_no_storage_id_fails_the_tick_and_is_no_messages_fault(monkeypatch, tmp_path):
+    archive(monkeypatch, [ordinary(1, storageid=None)])
+    linking(monkeypatch, tmp_path)
     ledger = Ledger(receivers=[(7, "ivan")])
-    ledger.cursors = {pass_.INBOX: 3}
-    ledger.numbering = {pass_.INBOX: 111, store.QUARANTINE: 222}
-    monkeypatch.setattr(pass_, "connect", lambda args: ledger)
-    monkeypatch.setattr(pass_, "drain", lambda *a: (0, 0))
-    assert pass_.main([]) == 1
-    assert ledger.messages == [] and ledger.links == [] and made == []
-    assert ledger.cursors == {pass_.INBOX: 3} and ledger.numbering[pass_.INBOX] == 111
-    lines = capsys.readouterr().err.splitlines()
-    assert [line for line in lines if line.startswith(pass_.RENUMBERED)] == [
-        f"{pass_.RENUMBERED} example INBOX: the archive's UIDVALIDITY is 222, the ledger's UIDs "
-        "are 111's, so a UID may name another message: nothing is linked from it until "
-        f"`{ledger_module.RENUMBER} --only example --folder INBOX --renumber` gives the rows "
-        "their new numbers"], lines
-    # both folders renumbered: one line each, from one run
-    ledger.numbering = {pass_.INBOX: 111, store.QUARANTINE: 111}
-    assert pass_.main([]) == 1
-    lines = capsys.readouterr().err.splitlines()
-    assert [line.split(":")[1:3] for line in lines if line.startswith(pass_.RENUMBERED)] == [
-        [" renumbered", " example INBOX"], [" renumbered", " example Quarantine"]], lines
-    # by hand too: a skipped UID is not recorded under another numbering
-    with pytest.raises(ledger_module.Renumbered):
-        pass_.record_one(ledger, DOMAIN, pass_.INBOX, 2, by_hand("--uid", "2"))
-
-
-def test_a_folder_that_lost_its_uidlist_alone_fails_the_tick_under_the_same_uidvalidity(
-        monkeypatch, tmp_path):
-    """With `ctl/` gone and the index kept, Dovecot numbers every file again above the old
-    numbers and keeps the UIDVALIDITY, so the old UIDs are simply not there."""
-    archive(monkeypatch, [ordinary(6), ordinary(7)])  # the old 1 and 2, numbered again
-    made = linking(monkeypatch, tmp_path)
-    numbered(monkeypatch, 111, uids={6, 7})
-    ledger = Ledger(receivers=[(7, "ivan")])
-    ledger.cursors, ledger.numbering = {pass_.INBOX: 2}, {pass_.INBOX: 111}
-    with pytest.raises(pass_.Stopped, match="holds no UID 2, the cursor's"):
+    with pytest.raises(pass_.doveadm.DoveadmError, match="no storage id"):
         pass_.fan_out(ledger, DOMAIN, pass_.parse_args([]))
-    assert ledger.messages == [] and made == [] and ledger.cursors == {pass_.INBOX: 2}
-    # the control: the same folder still holding the cursor's UID is a tick like any other
-    numbered(monkeypatch, 111, uids={2, 6, 7})
-    pass_.fan_out(ledger, DOMAIN, pass_.parse_args([]))
-    assert ledger.cursors[pass_.INBOX] == 7 and len(made) == 2
+    assert ledger.messages == [] and pass_.INBOX not in ledger.bases
 
 
 def test_the_cursors_uid_is_asked_by_its_files_name_and_a_first_failure_once_more(monkeypatch):
@@ -610,111 +579,328 @@ def test_the_cursors_uid_is_asked_by_its_files_name_and_a_first_failure_once_mor
         return answer
 
     monkeypatch.setattr(ledger_module.doveadm, "run", run)
-    assert ledger_module.holds_uid("example", pass_.INBOX, 4) is False
+    assert ledger_module.storage_at("example", pass_.INBOX, 4) is None
     assert asked == ["uid storageid", "uid storageid"]
     answers[:] = [pass_.doveadm.DoveadmError("one", 75), pass_.doveadm.DoveadmError("two", 75)]
     with pytest.raises(pass_.doveadm.DoveadmError, match="two"):
-        ledger_module.holds_uid("example", pass_.INBOX, 4)
+        ledger_module.storage_at("example", pass_.INBOX, 4)
     answers[:] = [[{"uid": "4", "storageid": "base"}]]
-    assert ledger_module.holds_uid("example", pass_.INBOX, 4) is True
+    assert ledger_module.storage_at("example", pass_.INBOX, 4) == "base"
 
 
-def row(row_id, old_uid, uid, **fields):
-    """A folder's row as the way back reads it, and the file it was written from."""
-    message = ordinary(uid, **fields)
-    read = pass_.read(message)
-    return (row_id, old_uid, *pass_.row_key(read)), message
+class Archive:
+    """Dovecot's view of one domain archive, for the pass on the unit tier's real database:
+    each folder's UIDVALIDITY and its records by UID. Renumbering it is giving the same
+    records other UIDs, as Dovecot does when an index tree is lost."""
+
+    def __init__(self, monkeypatch, uidvalidity=111):
+        self.folders = {pass_.INBOX: {}, store.QUARANTINE: {}}
+        self.uidvalidity = {pass_.INBOX: uidvalidity, store.QUARANTINE: uidvalidity}
+        self.calls = []
+        monkeypatch.setattr(pass_.doveadm, "fetch", self.fetch)
+        monkeypatch.setattr(pass_.doveadm, "run", self.run)
+        monkeypatch.setattr(pass_.doveadm, "mailbox_status", self.status)
+
+    def add(self, folder, message):
+        uid = max(self.folders[folder], default=0) + 1
+        self.folders[folder][uid] = {**message, "uid": str(uid)}
+        return uid
+
+    def renumber(self, folder, order, uidvalidity=None, start=1):
+        """The folder's records numbered again from `start`, in `order` (old UIDs)."""
+        old = self.folders[folder]
+        self.folders[folder] = {start + i: {**old[uid], "uid": str(start + i)}
+                                for i, uid in enumerate(order)}
+        if uidvalidity is not None:
+            self.uidvalidity[folder] = uidvalidity
+
+    def status(self, login, folder, *fields):
+        if not self.folders[folder]:
+            raise pass_.doveadm.DoveadmError("no such mailbox", pass_.doveadm.EX_NOUSER)
+        return {"uidvalidity": str(self.uidvalidity[folder])}
+
+    def matching(self, folder, uid_set):
+        held = self.folders[folder]
+        found = set()
+        for part in uid_set.split(","):
+            first, _, last = part.partition(":")
+            top = max(held, default=0) if last == "*" else int(last or first)
+            found.update(uid for uid in held if int(first) <= uid <= top)
+        return [held[uid] for uid in sorted(found)]
+
+    def fetch(self, login, folder, fields, *search):
+        self.calls.append((folder, search))
+        if not self.folders[folder]:
+            raise pass_.doveadm.DoveadmError("no such mailbox", pass_.doveadm.EX_NOUSER)
+        if search == ("all",):
+            return [self.folders[folder][uid] for uid in sorted(self.folders[folder])]
+        return self.matching(folder, search[1])
+
+    def run(self, verb, login, fields, _, folder, __, uid):
+        assert verb == ("fetch",) and fields == "uid storageid"
+        return self.matching(folder, uid)
 
 
-def test_the_way_back_pairs_each_row_with_the_file_it_was_written_from():
-    # UID 3 was expunged by hand before the rebuild: 4 and 5 are 3 and 4 now
-    first, file_1 = row(11, 1, 1)
-    second, file_2 = row(12, 2, 2)
-    fourth, file_3 = row(14, 4, 3)
-    fifth, file_4 = row(15, 5, 4)
-    found, lost = pass_.matched([first, second, fourth, fifth],
-                                [pass_.read(f) for f in (file_4, file_3, file_2, file_1)])
-    assert found == {11: 1, 12: 2, 14: 3, 15: 4} and lost == []
-    # two copies of one message pair in order; a row with no file is lost
-    same = {"hdr.message-id": "<twice@example.org>"}
-    a, copy_a = row(21, 6, 7, **same)
-    b, copy_b = row(22, 8, 9, **same)
-    gone, _ = row(23, 10, 99)
-    found, lost = pass_.matched([a, b, gone], [pass_.read(copy_b), pass_.read(copy_a)])
-    assert found == {21: 7, 22: 9} and lost == [(23, 10)]
+def archive_world(database):
+    """One domain with one receiver, on the unit tier's real database: `(domain id, the
+    mailbox id)`."""
+    domain = database.value("INSERT INTO domain (label, archive_password_hash) VALUES "
+                            "('example', %s) RETURNING id", ("{SHA512-CRYPT}$6$x$" + "x" * 86,))
+    database.sql("INSERT INTO account (login, password_hash) VALUES ('ivan', %s)",
+                 ("{SHA512-CRYPT}$6$x$" + "x" * 86,))
+    mailbox = database.value("INSERT INTO mailbox (account_id, domain_id) SELECT id, %s FROM "
+                             "account WHERE login = 'ivan' RETURNING id", (domain,))
+    return domain, mailbox
 
 
-def test_the_way_back_renumbers_the_rows_and_takes_the_new_uidvalidity(monkeypatch):
-    first, file_2 = row(11, 1, 2)
-    fourth, file_4 = row(14, 4, 4)
-    # delivered into the folder with no uidlist: the agent numbered it first
-    delivered = ordinary(1, **{"hdr.message-id": "<delivered@example.org>"})
-    later = ordinary(5)  # numbered above the newest row's file: the next tick's
-    monkeypatch.setattr(pass_.doveadm, "fetch", lambda login, folder, fields, *search: (
-        [delivered, file_2, file_4, later] if search == ("all",) else pytest.fail(search)))
-    numbered(monkeypatch, 222)
-    ledger = Ledger()
-    ledger.cursors, ledger.numbering = {pass_.INBOX: 5}, {pass_.INBOX: 111}
-    ledger.folder_rows = [first, fourth]
-    assert pass_.renumber(ledger, DOMAIN, pass_.INBOX, pass_.parse_args([])) == (2, [], 1, [])
-    assert ledger.renumbered == {11: 2, 14: 4}
-    assert [(m[4], m[5]) for m in ledger.messages] == [(1, "<delivered@example.org>")]
-    assert ledger.cursors[pass_.INBOX] == 4 and ledger.numbering[pass_.INBOX] == 222
-    assert ledger.calls == ["commit"]
-    # once is enough: the same numbering again is refused
-    with pytest.raises(pass_.Refused, match="nothing to renumber"):
-        pass_.renumber(ledger, DOMAIN, pass_.INBOX, pass_.parse_args([]))
+def tick_as_the_pipeline(database, domain, argv=()):
+    conn = database.connect("pipeline")
+    try:
+        pass_.fan_out(conn, pass_.Domain(domain, "example", True), pass_.parse_args(list(argv)))
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def test_a_row_the_way_back_cannot_match_leaves_every_file_with_no_row_unrecorded(
-        monkeypatch, capsys):
-    """A row that finds no file may be one of the files with no row, read otherwise today:
-    recorded again it would reach every receiver twice. Nothing is recorded, both lists are
-    printed, and the command exits 1; the rows it matched are renumbered all the same."""
-    first, file_2 = row(11, 1, 2)
-    fourth, file_4 = row(14, 4, 4)
-    gone, _ = row(16, 3, 99)
-    rowless = ordinary(1, **{"hdr.subject": "read otherwise today"})
-    monkeypatch.setattr(pass_.doveadm, "fetch", lambda *a: [rowless, file_2, file_4])
-    numbered(monkeypatch, 222)
-    ledger = Ledger()
-    ledger.cursors, ledger.numbering = {pass_.INBOX: 5}, {pass_.INBOX: 111}
-    ledger.folder_rows = [first, fourth, gone]
-    monkeypatch.setattr(pass_, "connect", lambda args: ledger)
-    assert pass_.main(["--only", "example", "--renumber"]) == 1
-    assert ledger.messages == [], "a file with no row was recorded beside an unmatched row"
-    assert ledger.renumbered == {11: 2, 14: 4, 16: None}
-    assert ledger.cursors[pass_.INBOX] == 4 and ledger.numbering[pass_.INBOX] == 222
+def ledger_rows(database):
+    """`{base name: (UID, state)}` and how many delivery rows each has."""
+    return {base: (uid, state, links) for base, uid, state, links in database.sql(
+        "SELECT archive_base, archive_uid, state, "
+        "(SELECT count(*) FROM delivery d WHERE d.message_id = m.id) FROM message m")}
+
+
+def cursor_row(database, folder=pass_.INBOX):
+    return database.sql("SELECT last_uid, uidvalidity, last_base FROM pass_cursor "
+                        "WHERE mailbox = %s", (folder,))[0]
+
+
+def test_a_folder_numbered_again_from_one_is_set_right_by_base_name_in_the_same_tick(
+        database, monkeypatch, tmp_path, capsys):
+    """Both index trees lost: a new UIDVALIDITY, the files numbered from 1 by name,
+    closing the gap a message expunged by hand left. Every row takes its file's new UID,
+    the row whose file is gone keeps none, a message delivered meanwhile (numbered first)
+    is recorded and linked once, and nothing linked before is linked again."""
+    domain, mailbox = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    for uid in (1, 2, 3, 4):
+        world.add(pass_.INBOX, ordinary(uid))
+    tick_as_the_pipeline(database, domain)
+    before = ledger_rows(database)
+    assert len(made) == 4 and {links for _, _, links in before.values()} == {1}
+    # UID 2 expunged by hand; both trees lost; a message delivered into the rebuilt folder
+    world.folders[pass_.INBOX].pop(2)
+    world.add(pass_.INBOX, ordinary(5))
+    world.renumber(pass_.INBOX, [5, 1, 3, 4], uidvalidity=222)
+    tick_as_the_pipeline(database, domain)
+    after = ledger_rows(database)
+    base = {uid: ordinary(uid)["storageid"] for uid in (1, 2, 3, 4, 5)}
+    assert after == {base[5]: (1, "delivered", 1), base[1]: (2, "delivered", 1),
+                     base[2]: (None, "delivered", 1), base[3]: (3, "delivered", 1),
+                     base[4]: (4, "delivered", 1)}, after
+    assert len(made) == 5, "a message linked before was linked again"
+    assert cursor_row(database) == (4, 222, base[4])
     err = capsys.readouterr().err
-    assert "message 16 (UID 3) has no file in the folder any more" in err
-    assert "UID 1 has no row and was NOT recorded" in err and "--uid 1`" in err
-    assert "2 message(s) renumbered, 1 without a file, 0 recorded, 1 left unrecorded" in err
+    assert (f"{pass_.RENUMBERED} example INBOX: its numbering changed (UIDVALIDITY 222); 3 row(s) "
+            "given their files' new UIDs by base name, 1 file(s) with no row recorded, "
+            "1 row(s) with no file") in err, err
+    # the next tick is a tick like any other
+    world.add(pass_.INBOX, ordinary(6))
+    tick_as_the_pipeline(database, domain)
+    assert ledger_rows(database)[ordinary(6)["storageid"]] == (5, "delivered", 1)
+    assert cursor_row(database) == (5, 222, ordinary(6)["storageid"])
 
 
-def test_a_row_written_with_a_control_character_still_finds_its_file():
-    """A row written before the headers were read without control characters keeps them;
-    its file is read without them now, and the two are still paired."""
-    fields = {"hdr.subject": "Invoice\x01 March\x07", "hdr.message-id": "<a\x02b@example.org>",
-              "hdr.from": "Olga <olga@example.org>"}
-    file = pass_.read(ordinary(3, **fields))
-    assert file.subject == "Invoice March" and file.message_id == "<ab@example.org>"
-    old = (11, 1, "<a\x02b@example.org>", "olga@example.org", "Invoice\x01 March\x07", None)
-    assert pass_.matched([old], [file]) == ({11: 3}, [])
+def test_a_folder_that_lost_its_uidlist_alone_is_set_right_under_the_same_uidvalidity(
+        database, monkeypatch, tmp_path):
+    """With `ctl/` gone and the index kept, every file is numbered again above the old
+    numbers under the same UIDVALIDITY: read as new mail, the whole folder would be
+    recorded and linked a second time."""
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    for uid in (1, 2):
+        world.add(pass_.INBOX, ordinary(uid))
+    tick_as_the_pipeline(database, domain)
+    world.renumber(pass_.INBOX, [1, 2], start=3)
+    tick_as_the_pipeline(database, domain)
+    assert ledger_rows(database) == {ordinary(1)["storageid"]: (3, "delivered", 1),
+                                     ordinary(2)["storageid"]: (4, "delivered", 1)}
+    assert len(made) == 2 and cursor_row(database) == (4, 111, ordinary(2)["storageid"])
 
 
-def test_the_way_back_refuses_a_folder_none_of_whose_rows_it_finds(monkeypatch, capsys):
-    first, _ = row(11, 1, 1)
-    monkeypatch.setattr(pass_.doveadm, "fetch", lambda *a: [ordinary(1, **{"hdr.subject": "other"})])
-    numbered(monkeypatch, 222)
-    ledger = Ledger()
-    ledger.cursors, ledger.numbering = {pass_.INBOX: 1}, {pass_.INBOX: 111}
-    ledger.folder_rows = [first]
-    monkeypatch.setattr(pass_, "connect", lambda args: ledger)
-    assert pass_.main(["--only", "example", "--renumber"]) == 1
-    assert "none of its 1 rows matches" in capsys.readouterr().err
-    assert ledger.renumbered == {} and ledger.calls == ["rollback", "close"]
+def test_an_older_uidlist_put_back_is_told_by_the_base_name_at_the_cursor(
+        database, monkeypatch, tmp_path):
+    """The case left uncovered: the same UIDVALIDITY and the cursor's UID still
+    there, naming another file. A file numbered below the cursor would never be read."""
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    for uid in (1, 2):
+        world.add(pass_.INBOX, ordinary(uid))
+    tick_as_the_pipeline(database, domain)
+    world.add(pass_.INBOX, ordinary(3))
+    world.renumber(pass_.INBOX, [3, 1, 2])   # the new file numbered first
+    tick_as_the_pipeline(database, domain)
+    assert ledger_rows(database) == {ordinary(3)["storageid"]: (1, "delivered", 1),
+                                     ordinary(1)["storageid"]: (2, "delivered", 1),
+                                     ordinary(2)["storageid"]: (3, "delivered", 1)}
+    assert len(made) == 3 and cursor_row(database) == (3, 111, ordinary(2)["storageid"])
+
+
+def test_a_renumbered_folder_records_an_imported_file_with_no_row_and_links_it_to_nobody(
+        database, monkeypatch, tmp_path):
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    world.add(pass_.INBOX, ordinary(1))
+    tick_as_the_pipeline(database, domain)
+    world.add(pass_.INBOX, imported(2))   # its epoch is years old: it sorts first by name
+    world.renumber(pass_.INBOX, [2, 1], uidvalidity=222)
+    tick_as_the_pipeline(database, domain)
+    rows = ledger_rows(database)
+    assert rows[imported(2)["storageid"]] == (1, "delivered", 0)
+    assert rows[ordinary(1)["storageid"]] == (2, "delivered", 1) and len(made) == 1
+
+
+def test_a_renumbered_quarantine_keeps_its_withheld_rows_and_its_reports_pointing_at_them(
+        database, monkeypatch, tmp_path):
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    world.add(store.QUARANTINE, ordinary(7, **{WITHHELD: "c" * 32, REASON: report.NONE}))
+    world.add(pass_.INBOX, ordinary(8, **{WITHHELD: "c" * 32, REASON: "infected"}))
+    tick_as_the_pipeline(database, domain)
+    world.add(store.QUARANTINE, ordinary(9, **{WITHHELD: "d" * 32, REASON: report.NONE}))
+    world.renumber(store.QUARANTINE, [2, 1], uidvalidity=333)
+    tick_as_the_pipeline(database, domain)
+    rows = ledger_rows(database)
+    assert rows[ordinary(7)["storageid"]] == (2, "withheld", 0)
+    assert rows[ordinary(9)["storageid"]] == (1, "withheld", 0)
+    assert rows[ordinary(8)["storageid"]] == (1, "delivered", 1) and len(made) == 1
+    assert database.value("SELECT count(*) FROM message WHERE report_of IS NOT NULL") == 1
+    assert cursor_row(database, store.QUARANTINE)[:2] == (2, 333)
+
+
+def previous_release_rows(database, domain, uids, cursor):
+    """The rows and the cursor the previous release left: archive numbers and no base names."""
+    for uid in uids:
+        database.sql("INSERT INTO message (domain_id, message_id_header, archive_uid, state) "
+                     "VALUES (%s, %s, %s, 'delivered')", (domain, f"<m{uid}@example.org>", uid))
+    database.sql("INSERT INTO pass_cursor (domain_id, mailbox, last_uid, uidvalidity) "
+                 "VALUES (%s, 'INBOX', %s, 111)", (domain, cursor))
+
+
+def test_the_previous_releases_rows_are_named_by_their_uids_while_the_numbering_holds(
+        database, monkeypatch, tmp_path, capsys):
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    for uid in (1, 2, 3, 4):
+        world.add(pass_.INBOX, ordinary(uid))
+    world.folders[pass_.INBOX].pop(2)          # expunged by hand: its row has no file
+    previous_release_rows(database, domain, (1, 2, 3), cursor=3)
+    tick_as_the_pipeline(database, domain)
+    rows = ledger_rows(database)
+    assert rows[ordinary(1)["storageid"]] == (1, "delivered", 0)
+    assert rows[ordinary(3)["storageid"]] == (3, "delivered", 0)
+    assert rows[None] == (None, "delivered", 0), "the row of the expunged file"
+    assert rows[ordinary(4)["storageid"]] == (4, "delivered", 1) and len(made) == 1
+    assert cursor_row(database) == (4, 111, ordinary(4)["storageid"])
+    assert "example INBOX: 2 row(s) given their archive names, 1 whose file is gone" in \
+        capsys.readouterr().err
+    assert database.value("SELECT count(*) FROM message WHERE archive_uid IS NOT NULL "
+                          "AND archive_base IS NULL") == 0
+
+
+def test_a_folder_renumbered_before_its_rows_were_named_stops_and_names_the_way_back(
+        database, monkeypatch, tmp_path, capsys):
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    for uid in (1, 2):
+        world.add(pass_.INBOX, ordinary(uid))
+    previous_release_rows(database, domain, (1, 2), cursor=2)
+    world.renumber(pass_.INBOX, [2, 1], uidvalidity=222)
+    monkeypatch.setattr(pass_, "connect", lambda args: database.connect("pipeline"))
+    monkeypatch.setattr(pass_, "drain", lambda *a: (0, 0))
+    assert pass_.main([]) == 1
+    assert made == [] and database.value("SELECT count(*) FROM message WHERE archive_base "
+                                         "IS NOT NULL") == 0
+    assert cursor_row(database) == (2, 111, None)
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith(pass_.UNNAMED)]
+    assert len(lines) == 1 and "example INBOX: the archive's UIDVALIDITY is 222" in lines[0]
+    assert "--only example --folder INBOX --renumber" in lines[0], lines
+
+
+def the_previous_release_ran_again(database, domain, world, uids):
+    """The upgrade's way back: the previous release's pass recorded these files with their
+    numbers and no base names, and moved the cursor without its base name."""
+    for uid in uids:
+        world.add(pass_.INBOX, ordinary(uid))
+        database.sql("INSERT INTO message (domain_id, message_id_header, archive_uid, state) "
+                     "VALUES (%s, %s, %s, 'delivered')", (domain, f"<m{uid}@example.org>", uid))
+    database.sql("UPDATE pass_cursor SET last_uid = %s WHERE mailbox = 'INBOX'", (max(uids),))
+
+
+def test_the_rows_of_a_previous_release_run_again_are_named_and_taken_for_no_renumbering(
+        database, monkeypatch, tmp_path, capsys):
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    linking(monkeypatch, tmp_path)
+    for uid in (1, 2):
+        world.add(pass_.INBOX, ordinary(uid))
+    tick_as_the_pipeline(database, domain)
+    the_previous_release_ran_again(database, domain, world, (3, 4))
+    for _ in range(2):   # the naming, and the tick after it
+        tick_as_the_pipeline(database, domain)
+    assert pass_.RENUMBERED not in capsys.readouterr().err
+    assert cursor_row(database) == (4, 111, ordinary(4)["storageid"])
+    assert {base: uid for base, (uid, _, _) in ledger_rows(database).items()} == {
+        ordinary(uid)["storageid"]: uid for uid in (1, 2, 3, 4)}
+
+
+def test_an_older_uidlist_put_back_before_the_previous_releases_rows_are_named_stops(
+        database, monkeypatch, tmp_path, capsys):
+    """Named by their UIDs under a numbering whose cursor UID is still there, the rows would
+    take other files' names, and a top-up would link the wrong messages."""
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    made = linking(monkeypatch, tmp_path)
+    for uid in (1, 2):
+        world.add(pass_.INBOX, ordinary(uid))
+    tick_as_the_pipeline(database, domain)
+    the_previous_release_ran_again(database, domain, world, (3, 4))
+    world.renumber(pass_.INBOX, [2, 1, 4, 3])   # the same UIDVALIDITY, other files
+    monkeypatch.setattr(pass_, "connect", lambda args: database.connect("pipeline"))
+    monkeypatch.setattr(pass_, "drain", lambda *a: (0, 0))
+    assert pass_.main([]) == 1
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith(pass_.UNNAMED)]
+    assert len(lines) == 1 and "names another file than its rows say" in lines[0], lines
+    assert database.value("SELECT count(*) FROM message WHERE archive_base IS NULL") == 2
+    assert len(made) == 2
+
+
+def test_a_uid_is_not_recorded_by_hand_while_its_folders_cursor_means_something_else(
+        database, monkeypatch, tmp_path):
+    domain, _ = archive_world(database)
+    world = Archive(monkeypatch)
+    linking(monkeypatch, tmp_path)
+    world.add(pass_.INBOX, ordinary(1))
+    tick_as_the_pipeline(database, domain)
+    world.renumber(pass_.INBOX, [1], uidvalidity=222)
+    conn = database.connect("pipeline")
+    try:
+        with pytest.raises(pass_.Refused, match="numbering changed"):
+            pass_.record_one(conn, pass_.Domain(domain, "example", True), pass_.INBOX, 1,
+                             by_hand("--uid", "1"))
+    finally:
+        conn.close()
+
+
+def test_the_way_back_by_hand_is_gone():
     with pytest.raises(SystemExit):
-        pass_.parse_args(["--renumber"])  # one domain's folder
+        pass_.parse_args(["--only", "example", "--renumber"])
 
 
 # --- which messages get names --------------------------------------------------
@@ -1081,21 +1267,6 @@ def test_an_imported_uid_recorded_by_hand_links_nobody(monkeypatch, tmp_path):
     assert [m[4] for m in ledger.messages] == [2] and ledger.links == [] and made == []
 
 
-def test_the_way_back_over_imported_files_renumbers_them_and_links_nobody(monkeypatch, tmp_path):
-    first, file_2 = row(11, 1, 2, storageid=store.import_base(RECEIVED, SHA, 1234, 1260))
-    rowless = imported(1, received=RECEIVED - 86400)  # below the newest matched: recorded here
-    monkeypatch.setattr(pass_.doveadm, "fetch", lambda login, folder, fields, *search: (
-        [rowless, file_2] if search == ("all",) else pytest.fail(search)))
-    numbered(monkeypatch, 222)
-    made = linking(monkeypatch, tmp_path)
-    ledger = Ledger(receivers=[(7, "ivan")])
-    ledger.cursors, ledger.numbering = {pass_.INBOX: 1}, {pass_.INBOX: 111}
-    ledger.folder_rows = [first]
-    assert pass_.renumber(ledger, DOMAIN, pass_.INBOX, pass_.parse_args([])) == (1, [], 1, [])
-    assert ledger.renumbered == {11: 2} and [m[4] for m in ledger.messages] == [1]
-    assert ledger.links == [] and made == []
-
-
 def test_an_imported_row_arrived_when_its_name_says_and_was_recorded_now(database, monkeypatch, tmp_path):
     """On the unit tier's real database, as the pipeline: the two moments, and no delivery."""
     domain = database.value("INSERT INTO domain (label, archive_password_hash) VALUES "
@@ -1202,8 +1373,8 @@ def test_a_withheld_message_recorded_after_its_report_is_what_the_report_points_
     then at it, so a release takes the report away."""
     domain = example(database)
     report_of = {"hdr.message-id": "<w1@example>", REASON: "Eicar-Signature", WITHHELD: "w1"}
-    withheld = record(uid="1", **{"hdr.message-id": "<virus@example.org>", WITHHELD: "w1",
-                                  REASON: "none"})
+    withheld = record(uid="1", storageid="1795000001.M9P1.example,S=10,W=10",
+                      **{"hdr.message-id": "<virus@example.org>", WITHHELD: "w1", REASON: "none"})
     archive(monkeypatch, [ordinary(1, **report_of)])
     linking(monkeypatch, tmp_path)
     numbered(monkeypatch, 111)

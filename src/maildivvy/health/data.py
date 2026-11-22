@@ -451,8 +451,9 @@ def judge_ledger(reading, name="daily ledger"):
     renumbered = [f"{label} {folder}" for label, d in domains.items()
                   for folder in d.get("renumbered", ())]
     if renumbered:
-        # the fan-out check reads that state, and it is not read twice
-        reading_ += f" ({'; '.join(renumbered)} not counted: its numbering changed)"
+        # the pass's next tick repairs it, and the fan-out check reads that (`0100`)
+        reading_ += (f" ({'; '.join(renumbered)} not counted: its cursor is not what it was, "
+                     "which the pass's next tick sets right)")
     if deliveries == 0 and not unrecorded:
         return Check(name, UNKNOWN, reading_, "no delivery row yet: the check has nothing to "
                                               "hold the store to")
@@ -607,13 +608,15 @@ def daily_ledger(ctx):
     return judge_pass(probe.load_json(settings.LEDGER_PASS), ctx.now, ctx.settings)
 
 
-def renumbered_folders(lines):
-    """The archive folders the pass stopped at because Dovecot renumbered them,
-    from its own lines, each once, in the order first named."""
+def renumbered_folders(lines, marker=None):
+    """The archive folders the pass named with `marker` (by default the stop of a folder
+    renumbered before its rows were named, `0100`), from its own lines, each once, in the
+    order first named."""
+    marker = marker or pass_.UNNAMED
     folders = []
     for line in lines:
-        if line.startswith(pass_.RENUMBERED):
-            folder = " ".join(line[len(pass_.RENUMBERED):].split(":", 1)[0].split())
+        if line.startswith(marker):
+            folder = " ".join(line[len(marker):].split(":", 1)[0].split())
             if folder and folder not in folders:
                 folders.append(folder)
     return folders
@@ -667,10 +670,11 @@ def judge_fanout(active, paused, shown, now, conf, lines=(), previous=None):
         found.append(Check("fan-out", UNKNOWN, reading, "the pass has not run yet"))
     elif not succeeded(shown) and renumbered:
         found.append(Check("fan-out", FAIL, reading,
-                           "the archive's numbering changed under the ledger, and nothing is "
-                           f"linked from {'; '.join(renumbered)} until `maildivvy-pass "
-                           "--renumber` gives its rows the new numbers: read "
-                           f"`journalctl -u {PASS_UNIT} -g '{pass_.RENUMBERED}'`"))
+                           "the archive's numbering changed before the ledger's rows had their "
+                           f"archive names, and nothing is linked from {'; '.join(renumbered)}: "
+                           "go back to the previous release and run its `maildivvy-pass "
+                           f"--renumber`, as `journalctl -u {PASS_UNIT} -g '{pass_.UNNAMED}'` "
+                           "says, then upgrade again"))
     elif not succeeded(shown):
         found.append(Check("fan-out", FAIL, reading, f"the pass's last run failed: read "
                                                      f"`journalctl -u {PASS_UNIT}`"))
@@ -748,18 +752,31 @@ def provider_requests(ctx):
 
 def judge_skipped(lines, hours):
     """Messages the pass could not record and moved past: one line each,
-    counted. Nobody has such a message until it is recorded by hand.
+    counted. Nobody has such a message until it is recorded by hand. And the archive
+    folders whose numbering the pass found changed and set right (`0100`): nothing is
+    lost by it, but an index tree went missing or was put back, which is the operator's
+    to know of.
     ⛔ The control: the window holds the pass unit's own lines at all."""
     if not lines:
         return Check("fan-out skips", UNKNOWN, f"no pass line in the last {hours} h",
                      "the pass has not run in the window: there is nothing to read")
     skipped = sum(1 for line in lines if pass_.SKIPPED in line)
+    renumbered = renumbered_folders(lines, pass_.RENUMBERED)
     reading = f"{skipped} message(s) skipped in the last {hours} h ({len(lines)} pass lines read)"
+    if renumbered:
+        reading += f", {len(renumbered)} archive folder(s) renumbered"
+    problems = []
     if skipped:
-        return Check("fan-out skips", WARN, reading,
-                     "the pass could not record these and reached nobody with them; each line "
-                     "names the command that records it: read "
-                     f"`journalctl -u {PASS_UNIT} -g '{pass_.SKIPPED}'`")
+        problems.append("the pass could not record these and reached nobody with them; each "
+                        "line names the command that records it: read "
+                        f"`journalctl -u {PASS_UNIT} -g '{pass_.SKIPPED}'`")
+    if renumbered:
+        problems.append(f"Dovecot numbered {'; '.join(renumbered)} again (an index tree lost or "
+                        "put back) and the pass gave the rows their files' new numbers by base "
+                        "name, recording any file no row named: read "
+                        f"`journalctl -u {PASS_UNIT} -g '{pass_.RENUMBERED}'`")
+    if problems:
+        return Check("fan-out skips", WARN, reading, "; ".join(problems))
     return passed("fan-out skips", reading)
 
 
