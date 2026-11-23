@@ -1,4 +1,4 @@
-# Maildivvy 0.4.0. The unit tests, the Python lint and the Ansible lint run locally, in seconds, and need no
+# Maildivvy 0.4.1. The unit tests, the Python lint and the Ansible lint run locally, in seconds, and need no
 # mail machine. A local .venv is used when present, otherwise the distribution's python3.
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 BIN ?= $(if $(wildcard .venv/bin/python),.venv/bin/,)
