@@ -9,8 +9,8 @@ maildivvy_docker_packages: [docker.io, docker-compose-v2]
 # together. Repinning is an act of the upgrade path, which this step performs and
 # verifies - it never happens on a timer.
 maildivvy_rspamd_repository: docker.io/rspamd/rspamd
-maildivvy_rspamd_tag: "4.3.0"                # read from the registry 2026-11-20
-maildivvy_rspamd_digest: "sha256:0d89891908f93ab1ce53c17fa90430130b48ad720216192ec44e646997c0a8e1"
+maildivvy_rspamd_tag: "4.3.1"                # read from the registry 2026-11-23
+maildivvy_rspamd_digest: "sha256:48abfb002120face66eab1f43bd1a22d98cbe058749a412fb3e9403449a022c7"
 
 # The image's own gid, and the name its passwd entry gives that id. The host group
 # `maildivvy-rspamd` (the programs role, made with this number) exists only to name this

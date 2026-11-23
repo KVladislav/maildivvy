@@ -36,6 +36,8 @@ hand the word back.
 """
 
 import contextlib
+import email
+import email.policy
 import grp
 import json
 import os
@@ -48,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 
 from maildivvy.health.probe import Unreadable
@@ -73,7 +76,14 @@ MILTER_SOCKET = Path("/var/spool/postfix/maildivvy/milter.sock")
 RSPAMD_CONTAINER = "maildivvy-rspamd-1"   # <project>-<service>-<n>
 UFW = Path("/etc/ufw")
 SEARCH_CANDIDATES = 20
-WORD = re.compile(r"\b[a-z]{6,24}\b")
+# A word as Dovecot's index holds it (`20-fts.conf`: the generic tokenizer's `simple`
+# algorithm): every ASCII character but a letter, a digit, `_` and `'` ends a word, so one
+# touching any of those, or a character beyond ASCII, is part of a longer one. A word here
+# stands between spaces or plain punctuation, a full stop only at a sentence's end. Six
+# letters or more is also longer than any of Dovecot's English stopwords, which a search
+# drops from its query.
+WORD = re.compile(r"(?<![^\s,;:!?()\[\]\"<>])[a-z]{6,24}(?=[\s,;:!?()\[\]\"<>]|\.(?:\s|$)|$)",
+                  re.ASCII | re.IGNORECASE)
 
 
 # --- the client: maildivvy-health asking ---------------------------------------------------
@@ -369,12 +379,65 @@ def read_fetch_state():
     return {"listed": True, "configs": configs}
 
 
-def search_word(body):
-    """A whole word of the body whose inner part is not itself a word of it, or None."""
-    every = set(re.findall(r"[a-z0-9]+", body.lower()))
-    for word in sorted(set(WORD.findall(body.lower()))):
+class HtmlText(HTMLParser):
+    """An HTML part's text as Dovecot's index reads it: tags, comments, scripts and styles
+    dropped, character references decoded, a space where a tag was."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.chunks, self.hidden = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        self.hidden += tag in ("script", "style")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self.hidden:
+            self.hidden -= 1
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.chunks.append(data)
+
+
+def search_word(message):
+    """A word of the message's text and an inner part of it no word of the message begins
+    with, or None.
+
+    ⛔ THE WORD IS ONE THE INDEX HOLDS. Dovecot indexes a letter's text decoded: its parts
+    out of base64 and quoted-printable, in their charsets, an HTML part as text. A word of
+    the raw letter - a part's header, a tag, a style, a comment - is not in the index, and a
+    search for it rightly finds nothing: health read FAIL on a healthy index whenever the
+    newest letter was HTML. So the word comes from the inline text/plain and text/html
+    parts as decoded, and a letter with a text part Python cannot decode is skipped.
+
+    The part must not begin any word of the letter, decoded or raw: the index answers a
+    search by prefix, and with the word's stem as well, so the part's first three letters
+    begin none of them.
+    """
+    parsed = email.message_from_bytes(message.encode("utf-8", "surrogateescape"),
+                                      policy=email.policy.default)
+    texts, held = [], [message]
+    for part in parsed.walk():
+        if part.get_content_maintype() != "text":
+            continue
+        try:
+            content = part.get_content()
+        except (LookupError, UnicodeError, ValueError):
+            return None
+        held.append(content)
+        if part.get_content_disposition() == "attachment":
+            continue
+        if part.get_content_subtype() == "plain":
+            texts.append(content)
+        elif part.get_content_subtype() == "html":
+            html = HtmlText()
+            html.feed(content)
+            html.close()
+            texts.append(" ".join(html.chunks))
+    starts = {token[:3] for token in re.findall(r"[a-z0-9]{3,}", " ".join(held).lower())}
+    for word in sorted({m.group().lower() for text in texts for m in WORD.finditer(text)}):
         part = word[1:-1]
-        if len(part) >= 4 and part not in every:
+        if part[:3] not in starts:
             return word, part
     return None
 
@@ -395,10 +458,10 @@ def read_search():
     for label, uid in candidates:
         login = f"{store.ARCHIVE}@{label}"
         try:
-            records = doveadm.fetch(login, "INBOX", ["body"], "uid", str(int(uid)))
+            records = doveadm.fetch(login, "INBOX", ["text"], "uid", str(int(uid)))
         except doveadm.DoveadmError:
             continue   # a message the archive no longer holds: the next candidate
-        chosen = search_word(records[0].get("body", "")) if records else None
+        chosen = search_word(records[0].get("text", "")) if records else None
         if chosen is None:
             continue
         word, part = chosen

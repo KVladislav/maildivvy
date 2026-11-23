@@ -5,6 +5,33 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.3.2 - 2026-11-23
+
+### Fixed
+
+- Health's search check no longer fails on a healthy index when the newest archived
+  message is HTML. It searched for a word read from the message as stored, which could
+  be one that only its markup or a MIME header holds, and the index rightly holds the
+  message's text alone; the installer's health step stopped on that FAIL, so an install
+  or upgrade on such a machine could not finish. The word is now read from the message's
+  text as the index holds it: its plain and HTML parts decoded, the HTML as text. A
+  machine whose upgrade to 0.3.1 stopped there is upgraded by running this release's
+  installer: the version file still names the release it came from, and the migrations
+  that run applied are not applied again.
+- rspamd is repinned to 4.3.1 from 4.3.0, by digest, with its tag. Upstream's release
+  changes scoring: one DKIM signature that cannot be verified no longer hides the
+  others, SPF reads a malformed domain as none rather than a DNS failure (a spoofed
+  sender then meets the domain's DMARC reject policy), and a link showing the sender's
+  own authenticated domain scores as PHISHING_OWN_DOMAIN. It also makes forked workers
+  draw their own random numbers, fixes crashes in its Lua network and timer code, and
+  parses time intervals strictly; Maildivvy's configuration has none, and no dynamic
+  configuration, which moves to a new mechanism in this release.
+- lego is repinned to 5.7.0 from 5.6.0, by version and sha256 for each architecture,
+  checked against the release's checksums file. Upstream's release adds DNS providers,
+  manages ACME server errors and nonce retries better, and spreads the renewal point a
+  little around a third of the certificate's lifetime; the commands Maildivvy runs and
+  deSEC's credential names are unchanged.
+
 ## 0.3.1 - 2026-11-21
 
 ### Fixed

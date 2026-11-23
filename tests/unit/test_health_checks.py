@@ -577,6 +577,45 @@ def test_the_word_searched_for_has_an_inner_part_that_is_no_word_of_the_message(
     assert helper.search_word("short words only") is None
 
 
+HTML_LETTER = """\
+MIME-Version: 1.0
+Subject: Pudding
+Content-Type: multipart/alternative; boundary="b1"
+
+--b1
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: base64
+
+QSBub3RlIGFib3V0IHJodWJhcmIgY3J1bWJsZS4K
+
+--b1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<html><head><style>.aardvarks { color: black }</style></head><body>
+<p class=3D"aardvarks" style=3D"background:white">A note about rhubarb crum=
+ble.</p><!-- abacuses --></body></html>
+
+--b1--
+"""
+
+
+def test_the_word_searched_for_is_one_the_index_holds_not_one_of_the_markup():
+    # The index holds the decoded text of a letter, its HTML as text: a word that sits only
+    # in a tag, a style or a comment is rightly not found, and the check read FAIL on a
+    # healthy index whenever the newest letter was HTML. Here the first such word of the
+    # raw letter is `aardvarks`, and `crumble` is base64 in one part and split by a soft
+    # line break in the other.
+    assert helper.search_word(HTML_LETTER) == ("crumble", "rumbl")
+    markup_only = HTML_LETTER.replace("A note about rhubarb crum=\nble.", "")
+    assert helper.search_word(markup_only.replace("QSBub3RlIGFib3V0IHJodWJhcmIgY3J1bWJsZS4K", "")) is None
+    # Dovecot puts a space where a tag was, so `crum` and `ble` are two words of the index,
+    # and a word touching a digit, an underscore or an at sign is part of a longer one
+    assert helper.search_word("Subject: x\n\n<b>crum</b>ble note_rhubarb rhubarb2 rhubarb@x.example\n") is None
+    # a letter whose charset Python cannot read is skipped, never guessed at
+    assert helper.search_word("Content-Type: text/plain; charset=x-unknown\n\nrhubarb crumble\n") is None
+
+
 # --- antivirus ---------------------------------------------------------------------
 
 
