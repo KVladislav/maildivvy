@@ -52,6 +52,11 @@ class DoveadmError(Exception):
         self.returncode = returncode
 
 
+class Cut(DoveadmError):
+    """doveadm exited 0 with a JSON list that stops short: Dovecot 2.4.2's formatter ends
+    its output where an escaped character falls on its output buffer's edge."""
+
+
 def is_archive(login):
     """A domain archive's login, `archive@<domain>`; no person may have that login."""
     local, at, domain = login.partition("@")
@@ -95,10 +100,12 @@ def _json(argv, command, input=None, timeout=TIMEOUT):
     stderr = done.stderr.decode("utf-8", "replace").strip()
     if done.returncode != 0:
         raise DoveadmError(f"doveadm {command} exited {done.returncode}: {stderr}", done.returncode)
+    text = done.stdout.decode("utf-8", "replace")
     try:
-        answer = json.loads(done.stdout.decode("utf-8", "replace"))
+        answer = json.loads(text)
     except ValueError as err:
-        raise DoveadmError(f"doveadm {command} printed no JSON: {err}") from None
+        error = Cut if text.lstrip().startswith("[") else DoveadmError
+        raise error(f"doveadm {command} printed no JSON ({len(done.stdout)} bytes): {err}") from None
     if not isinstance(answer, list):
         raise DoveadmError(f"doveadm {command} printed JSON that is not a list")
     return answer
@@ -133,12 +140,73 @@ def mailbox_status(login, mailbox, *fields):
 
 
 def fetch(login, mailbox, fields, *search):
-    """The records of the messages matching `search` in one mailbox, one dict each."""
+    """The records of the messages matching `search` in one mailbox, one dict each.
+
+    ⛔ A CUT ANSWER TO A UID SEARCH IS FETCHED AGAIN IN HALVES. Dovecot 2.4.2 (and 2.4.3,
+    whose formatter is the same) can end a fetch's JSON in the middle of a string, exit 0
+    and log nothing: when a character it escapes (a tab, a quote) falls where its output
+    buffer fills. Where that falls depends on everything printed before it, so the same
+    `uid <cursor+1>:*` cut the same way every minute and held a domain's pass for good,
+    while every message fetched alone read whole. A half starting where the cut range
+    started is cut again until it ends before the message, and the rest then start
+    elsewhere. Only a single UID still cut raises; it is the first fetch to fail on the
+    way down, so a doveadm that never answers whole costs a few dozen runs, not one per UID.
+    """
     for field in fields:
         if not isinstance(field, str) or not FIELD.match(field):
             raise ValueError(f"fetch field {field!r} is not one lowercase word")
     mailbox_status(login, mailbox)  # raises for a mailbox that does not exist
-    return run(("fetch",), login, " ".join(fields), "mailbox", mailbox, *search)
+    try:
+        return run(("fetch",), login, " ".join(fields), "mailbox", mailbox, *search)
+    except Cut:
+        if len(search) != 2 or search[0] != "uid":
+            raise
+        runs = _runs(search[1], lambda: int(mailbox_status(login, mailbox, "uidnext")["uidnext"]) - 1)
+        if _single(runs):
+            raise
+    return [record for half in _halves(runs) for record in _fetch_runs(login, mailbox, fields, half)]
+
+
+def _fetch_runs(login, mailbox, fields, runs):
+    """`fetch` of the UIDs in `runs`, already known to exist; a cut answer split again."""
+    try:
+        return run(("fetch",), login, " ".join(fields), "mailbox", mailbox, "uid", _uid_set(runs))
+    except Cut:
+        if _single(runs):
+            raise
+    return [record for half in _halves(runs) for record in _fetch_runs(login, mailbox, fields, half)]
+
+
+def _runs(uid_set, newest):
+    """An IMAP UID set as ascending `[first, last]` runs; `*` is `newest()`, asked once."""
+    runs, top = [], None
+    for part in uid_set.split(","):
+        ends = []
+        for end in part.split(":"):
+            if end == "*":
+                top = newest() if top is None else top
+                ends.append(top)
+            else:
+                ends.append(int(end))
+        runs.append([min(ends), max(ends)])  # `5:*` past the newest is the newest, as in IMAP
+    return runs
+
+
+def _single(runs):
+    return len(runs) == 1 and runs[0][0] == runs[0][1]
+
+
+def _halves(runs):
+    """Two halves of the runs: by run where there are several, else the one run by number."""
+    if len(runs) > 1:
+        return runs[:len(runs) // 2], runs[len(runs) // 2:]
+    first, last = runs[0]
+    middle = (first + last) // 2
+    return [[first, middle]], [[middle + 1, last]]
+
+
+def _uid_set(runs):
+    return ",".join(str(first) if first == last else f"{first}:{last}" for first, last in runs)
 
 
 # ⛔ One `doveadm fetch` for as many UIDs as fit one UID set of this many bytes: every

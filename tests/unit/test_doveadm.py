@@ -268,3 +268,83 @@ def test_a_who_that_fails_raises_rather_than_reading_as_no_session(fake):
     with pytest.raises(DoveadmError) as raised:
         doveadm.sessions("ivan@example")
     assert raised.value.returncode == 75
+
+
+# --- a cut answer, fetched again in halves -------------------------------------
+
+def test_a_json_list_that_stops_short_with_exit_0_is_a_cut_answer(fake):
+    fake.answer({"out": '[{"messages":"2"}]'}, {"out": '[\n{"uid":"1","hdr.subject":"ok"},\n{"uid":"2","hdr.subject":"ends in a'})
+    with pytest.raises(doveadm.Cut, match="printed no JSON"):
+        doveadm.fetch("ivan@example", "INBOX", ["uid", "hdr.subject"], "all")
+    fake.answer({"out": "uid: 1\n"})
+    with pytest.raises(DoveadmError) as raised:
+        doveadm.run(("mailbox", "list"), "ivan@example")
+    assert not isinstance(raised.value, doveadm.Cut)
+
+
+class Cutting:
+    """doveadm as measured on 2.4.2 (2026-11-24): every fetch that starts at `start` and
+    reaches `at` is cut, exit 0; every other range, and `at` alone, reads whole."""
+
+    def __init__(self, monkeypatch, uids, start, at):
+        self.uids, self.start, self.at, self.fetched, self.statuses = sorted(uids), start, at, [], []
+        monkeypatch.setattr(doveadm, "run", self.run)
+
+    def run(self, verb, login, *args, **kwargs):
+        if verb == ("mailbox", "status"):
+            self.statuses.append(args[0])
+            return [{"messages": str(len(self.uids)), "uidnext": str(self.uids[-1] + 1)}]
+        assert verb == ("fetch",) and args[3] == "uid"
+        self.fetched.append(args[4])
+        wanted = sorted(set(self.matching(args[4])))
+        if wanted and wanted[0] == self.start and self.at in wanted and wanted != [self.at]:
+            raise doveadm.Cut(f"doveadm fetch -u {login} printed no JSON: Unterminated string")
+        if wanted == [self.at] and self.start == self.at:
+            raise doveadm.Cut(f"doveadm fetch -u {login} printed no JSON: Unterminated string")
+        return [{"uid": str(uid), "storageid": f"b{uid}"} for uid in wanted]
+
+    def matching(self, uid_set):
+        for part in uid_set.split(","):
+            first, _, last = part.partition(":")
+            top = self.uids[-1] if last == "*" else int(last or first)
+            low, high = sorted((int(first), top))
+            yield from (uid for uid in self.uids if low <= uid <= high)
+
+
+def test_a_cut_range_is_fetched_again_in_halves_and_every_record_comes_back_once(monkeypatch):
+    # the reported domain: `uid 276165:*` cut in UID 276197's subject every minute
+    doveadm_ = Cutting(monkeypatch, range(276165, 278165), start=276165, at=276197)
+    records = doveadm.fetch("archive@example", "INBOX", ["uid", "storageid"], "uid", "276165:*")
+    assert [int(r["uid"]) for r in records] == list(range(276165, 278165))
+    assert doveadm_.statuses == ["messages", "uidnext"]  # `*` resolved once, on the cut
+    assert len(doveadm_.fetched) < 30, doveadm_.fetched
+
+
+def test_a_cut_uid_set_of_several_runs_is_split_by_run(monkeypatch):
+    uids = [3, 4, 5, 9, 10, 20, 31, 32]
+    doveadm_ = Cutting(monkeypatch, uids, start=3, at=10)
+    records = doveadm.fetch("archive@example", "INBOX", ["uid", "storageid"], "uid", "3:5,9:10,20,31:32")
+    assert [int(r["uid"]) for r in records] == uids
+    assert doveadm_.fetched[:2] == ["3:5,9:10,20,31:32", "3:5,9:10"]
+
+
+def test_a_single_uid_still_cut_raises_after_a_few_runs_and_not_one_per_uid(monkeypatch):
+    doveadm_ = Cutting(monkeypatch, range(1, 100_001), start=1, at=1)
+    with pytest.raises(doveadm.Cut):
+        doveadm.fetch("archive@example", "INBOX", ["uid", "storageid"], "uid", "1:*")
+    assert doveadm_.fetched[-1] == "1" and len(doveadm_.fetched) <= 20, doveadm_.fetched
+
+
+def test_a_cut_answer_to_a_search_that_is_not_by_uid_raises_without_fetching_again(monkeypatch):
+    doveadm_ = Cutting(monkeypatch, range(1, 10), start=1, at=5)
+
+    def run(verb, login, *args, **kwargs):
+        if verb == ("fetch",):
+            doveadm_.fetched.append(args[3:])
+            raise doveadm.Cut("doveadm fetch printed no JSON")
+        return doveadm_.run(verb, login, *args, **kwargs)
+
+    monkeypatch.setattr(doveadm, "run", run)
+    with pytest.raises(doveadm.Cut):
+        doveadm.fetch("archive@example", "INBOX", ["uid"], "all")
+    assert doveadm_.fetched == [("all",)]

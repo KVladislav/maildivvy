@@ -5,6 +5,20 @@ in 0.x, a minor version may change settings or behaviour, and says how here.
 
 ## Unreleased
 
+## 0.4.2 - 2026-11-24
+
+### Fixed
+
+- A domain's fan-out no longer stops for good when Dovecot cuts its answer short. Dovecot
+  2.4.2 can end `doveadm fetch`'s JSON in the middle of a header, exit 0 and log nothing,
+  when a character it escapes (a tab ending a Subject, measured) falls on its output
+  buffer's edge. Where that falls depends on everything printed before it, so the pass,
+  which asks for every message above its cursor, was cut the same way every minute and
+  recorded nothing more for that domain, neither imported nor newly collected mail, while
+  the other domains went on. A cut answer to a fetch by UID is now fetched again in
+  halves until every part reads whole; only one message cut on its own still fails the
+  domain, as before. A stuck domain resumes on the first pass after the upgrade.
+
 ## 0.4.1 - 2026-11-23
 
 ### Fixed
